@@ -197,6 +197,9 @@ impl HostAdapter for Hosts {
     async fn rerun_check(&self, pr: &PrRef, check: &Check) -> HostResult<()> {
         self.for_pr(pr)?.rerun_check(pr, check).await
     }
+    async fn check_log(&self, pr: &PrRef, check: &Check) -> HostResult<Option<String>> {
+        self.for_pr(pr)?.check_log(pr, check).await
+    }
     async fn repo_info(&self, repo: &RepoRef) -> HostResult<HostRepo> {
         self.for_repo(repo)?.repo_info(repo).await
     }

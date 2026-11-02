@@ -2,7 +2,8 @@
  * Settings → Labs → Global config: the global config file (open it in the
  * editor) and, per project, the merged config read-only — which files it
  * comes from, every effective value with its layer, unknown keys, and
- * whether the repo's commands are allowed.
+ * whether the repo's commands are allowed. Also `SpaceSetupAssistHint`,
+ * the space page's "no `spaces:` commands yet" nudge.
  */
 import { useEffect, useState } from 'react';
 
@@ -10,6 +11,7 @@ import {
   ChevronDown,
   ChevronRight,
   Folder,
+  Sparkles,
   TriangleExclamation,
 } from '@gravity-ui/icons';
 import { Button, Card, Chip, Typography } from '@heroui/react';
@@ -19,6 +21,8 @@ import type {
   EffectiveConfig,
   GlobalConfigInfo,
   Project,
+  Space,
+  SpaceConfigView,
 } from '../../gen/contract';
 import { api } from '../../core/api';
 import { useWorkspaces } from '../../stores/context';
@@ -39,6 +43,55 @@ function LayerBadge({ layer }: { layer: ConfigLayer }) {
     </Chip>
   );
 }
+
+/** The space page's empty-state nudge: no `spaces:` commands are
+ *  configured for this project yet, so there's nothing to run or check.
+ *  "Set up with agent" sends the space's own agent a turn to look at the
+ *  repo and write them (docs/config.md §2, §8); the normal trust prompt
+ *  applies to whatever it proposes, same as any other repo config. */
+export const SpaceSetupAssistHint = observer(function SpaceSetupAssistHint({
+  space,
+  config,
+}: {
+  space: Pick<Space, 'id' | 'status'>;
+  config: Pick<SpaceConfigView, 'commands'> | null;
+}) {
+  const [busy, setBusy] = useState(false);
+  if (
+    space.status === 'archived' ||
+    config == null ||
+    config.commands.length > 0
+  ) {
+    return null;
+  }
+  const run = async () => {
+    setBusy(true);
+    try {
+      await api.spaceSetupAssist(space.id);
+    } catch {
+      // toasted by api.ts
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="space-setup-assist-hint flex items-center gap-2 text-xs text-muted">
+      <span className="flex-1">
+        This project has no setup, run or check commands yet.
+      </span>
+      <Button
+        size="sm"
+        variant="secondary"
+        className="space-setup-assist shrink-0"
+        isPending={busy}
+        onPress={() => void run()}
+      >
+        <Sparkles className="size-3.5" />
+        Set up with agent
+      </Button>
+    </div>
+  );
+});
 
 export const GlobalConfigSection = observer(function GlobalConfigSection() {
   const ws = useWorkspaces();

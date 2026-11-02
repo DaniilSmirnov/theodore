@@ -53,10 +53,11 @@ fn err(e: theodore_grouping::GroupingPipelineError) -> GrouperError {
 }
 
 /// Whether a grouping run on `agent` streams its groups as they are
-/// written: Claude Code only — the other CLIs report the answer whole, so
-/// their runs stay as they were.
+/// written: Claude Code and Gemini, whose runners emit `TextDelta`s. Codex
+/// reports the answer whole (`codex exec --json` has no deltas), so its
+/// runs stay as they were.
 fn streams(agent: AgentId) -> bool {
-    agent == AgentId::Claude
+    matches!(agent, AgentId::Claude | AgentId::Gemini)
 }
 
 /// Hands each provisional grouping on, logging the first one at info (time
@@ -218,11 +219,11 @@ mod tests {
         assert!(matches!(e, GrouperError::Agent(_)), "{e:?}");
     }
 
-    /// The app streams Claude groupings (each group handed on as it is
-    /// written, marked in progress); a Codex run publishes nothing and
-    /// asks for no deltas.
+    /// The app streams Claude and Gemini groupings (each group handed on
+    /// as it is written, marked in progress); a Codex run publishes nothing
+    /// and asks for no deltas.
     #[tokio::test]
-    async fn claude_runs_stream_their_groups_and_other_agents_do_not() {
+    async fn claude_and_gemini_runs_stream_their_groups_and_codex_does_not() {
         use theodore_domain::{PrRef, RepoRef, Sha};
         use theodore_grouping::testing::FakeAgentPort;
         let (base, head) = (Sha::new("base000"), Sha::new("head111"));
@@ -243,7 +244,11 @@ mod tests {
                 {{"id": "b", "title": "B", "why": "b", "hunks": ["{}"]}}]}}"#,
             ids[0], ids[1]
         );
-        for (agent, streamed) in [(AgentId::Claude, 2), (AgentId::Codex, 0)] {
+        for (agent, streamed) in [
+            (AgentId::Claude, 2),
+            (AgentId::Gemini, 2),
+            (AgentId::Codex, 0),
+        ] {
             let fake = Arc::new(FakeAgentPort::new([answer.clone()]));
             let grouper = GroupingGrouper::new(fake.clone());
             let seen = std::sync::Mutex::new(Vec::new());
@@ -269,5 +274,46 @@ mod tests {
             assert_eq!(out.groups.len(), 2);
             assert_eq!(fake.requests()[0].stream_text, streamed > 0, "{agent:?}");
         }
+    }
+    /// Gemini's runner output, unchanged, feeds the grouping stream: its
+    /// chunks split the answer anywhere (here mid-key and mid-object), and
+    /// each group still comes out as soon as it closes.
+    #[test]
+    fn gemini_deltas_feed_the_group_stream() {
+        use theodore_agents::gemini::GeminiParser;
+        use theodore_grouping::stream::GroupStream;
+        use theodore_ports::agent::AgentEvent;
+        let answer = r#"Here: {"groups": [{"id": "a", "title": "A", "why": "a", "hunks": ["h1"]}, {"id": "b", "title": "B", "why": "b", "hunks": ["h2"]}]}"#;
+        let mut parser = GeminiParser::new(true);
+        let mut stream = GroupStream::new();
+        let mut ids = Vec::new();
+        let mut lines: Vec<String> = answer
+            .as_bytes()
+            .chunks(7)
+            .map(|c| {
+                serde_json::json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": std::str::from_utf8(c).unwrap(),
+                    "delta": true,
+                })
+                .to_string()
+            })
+            .collect();
+        lines.push(r#"{"type":"result","status":"success","stats":{}}"#.into());
+        let mut final_text = None;
+        for line in &lines {
+            for ev in parser.parse_line(line) {
+                match ev {
+                    AgentEvent::TextDelta { text } => {
+                        ids.extend(stream.push(&text).into_iter().map(|g| g.id));
+                    }
+                    AgentEvent::Done { final_text: t, .. } => final_text = Some(t),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(ids, ["a", "b"]);
+        assert_eq!(final_text.as_deref(), Some(answer));
     }
 }

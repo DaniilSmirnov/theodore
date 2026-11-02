@@ -30,6 +30,7 @@ serde_yaml = "0.9"
 sha2.workspace = true
 hex.workspace = true
 base64 = "0.22"
+regex.workspace = true
 tracing.workspace = true
 tempfile = { workspace = true, optional = true }
 

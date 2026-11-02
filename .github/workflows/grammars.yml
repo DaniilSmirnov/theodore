@@ -1,0 +1,118 @@
+name: Grammars
+
+# Builds the tree-sitter grammar dylibs pinned in grammars.toml
+# (docs/code-intel.md §4.1) and publishes them as a GitHub release's
+# assets, plus the generated manifest fragment (grammars.json) as a
+# workflow artifact.
+#
+#   grammars.toml ─▶ scripts/build-grammars.sh ─▶ dylibs + *.tags.scm
+#     ─▶ release "grammars-<content hash of grammars.toml>" (prerelease)
+#     ─▶ grammars.json (workflow artifact only — a human commits it,
+#        in crates/code-intel-toolchain/manifest/, once this release exists)
+#
+# Manual (workflow_dispatch), or automatically when grammars.toml changes
+# on staging (a grammar bump merged like anything else). Never on main or a
+# PR: this never needs to run twice for the same pin, and the release tag
+# is content-addressed so a re-run of the same pin republishes the same
+# tag's assets rather than piling up releases.
+#
+# The release this makes is always `--prerelease` and `--latest=false`, and
+# its tag never matches what the updater polls (`releases/latest/...`,
+# `channel-staging`, `channel-beta` — docs/releasing.md "Branch flow" /
+# "Staging channel"), so it can never be picked up as an app update.
+#
+# Secrets (optional, the same ones build.yml uses for Developer ID
+# signing): APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD,
+# APPLE_SIGNING_IDENTITY. Unset: dylibs are ad-hoc signed, same as the app
+# is today (docs/code-intel.md §4.1, docs/releasing.md "Optional: Developer
+# ID signing").
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [staging]
+    paths:
+      - grammars.toml
+
+concurrency:
+  group: grammars-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Matches build.yml / ci.yml's macOS runner, so the dylibs are built on
+    # the same SDK the app itself ships against.
+    runs-on: macos-26
+    env:
+      HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Same pattern as build.yml's DMG-signing step: the cert only lives
+      # in a throwaway keychain for this job.
+      - name: import Developer ID certificate
+        if: env.HAS_APPLE_CERT == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/grammars-signing.keychain-db"
+          pass=$(uuidgen)
+          security create-keychain -p "$pass" "$keychain"
+          security set-keychain-settings -lut 900 "$keychain"
+          security unlock-keychain -p "$pass" "$keychain"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$pass" "$keychain" >/dev/null
+          echo "GRAMMARS_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: build grammars
+        env:
+          CODESIGN_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          CODESIGN_KEYCHAIN: ${{ env.GRAMMARS_KEYCHAIN }}
+        run: sh scripts/build-grammars.sh
+
+      - name: delete signing keychain
+        if: always() && env.HAS_APPLE_CERT == 'true'
+        run: security delete-keychain "$GRAMMARS_KEYCHAIN" || true
+
+      - name: read the release tag grammars.json was generated for
+        id: tag
+        run: |
+          tag=$(python3 -c "import json; print(json.load(open('target/grammars/grammars.json'))['release_tag'])")
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # A content-addressed tag (grammars-<hash of grammars.toml>): re-running
+      # on an unchanged pin republishes the same tag's assets instead of
+      # creating a new release every time.
+      - name: publish the grammars release (prerelease, never "latest")
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --target "${{ github.sha }}" \
+              --title "Grammars ($TAG)" \
+              --notes "tree-sitter grammar dylibs built from grammars.toml at ${{ github.sha }}. Not an app release: never polled by the updater (docs/releasing.md)." \
+              --prerelease \
+              --latest=false
+          fi
+          shopt -s nullglob
+          assets=(target/grammars/*.dylib target/grammars/*.tags.scm)
+          gh release upload "$TAG" --repo "${{ github.repository }}" --clobber "${assets[@]}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grammars-manifest
+          path: target/grammars/grammars.json
+          if-no-files-found: error

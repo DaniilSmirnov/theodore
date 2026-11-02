@@ -215,6 +215,52 @@ export async function ask(_store: RootStore, req: AskRequest): Promise<string> {
   return api.ask(req);
 }
 
+/** A question with no diff-line chip — the composer's plain send, or a
+ *  hunk's fixed "Ask agent": the AI panel opens at once with a pending
+ *  bubble (the question, then the agent's streaming text), which gives way
+ *  to the real reply once it lands. Throws (already toasted by `api.ts`)
+ *  on a rejected `ask`, same as calling `ask` directly — the caller decides
+ *  what "failed to ask" means for it (e.g. not clearing its composer). */
+export async function askPending(
+  store: RootStore,
+  req: AskRequest,
+): Promise<void> {
+  store.ui.toggleAside(true);
+  const startedAt = Date.now();
+  const message = await ask(store, req);
+  const run = askRunId(message);
+  store.ephemeral.setChatPending(req.pr, {
+    run,
+    startedAt,
+    question: req.question,
+    agent: req.agent,
+  });
+  store.ephemeral.focusAsk(req.pr, null);
+  // Three states: `undefined` — no longer this ask's to track (cleared or
+  // replaced elsewhere), stop watching; `false` — still pending; `true` —
+  // the reply landed, clear it.
+  const stop = reaction(
+    (): boolean | undefined => {
+      const cur = store.ephemeral.chatPending.get(req.pr);
+      if (!cur || cur.run !== run) return undefined;
+      return store.models.chatMessages
+        .byPr(req.pr)
+        .some((m) => m.author.kind !== 'me' && m.at >= startedAt);
+    },
+    (landed) => {
+      if (landed === undefined) {
+        stop();
+        return;
+      }
+      if (landed) {
+        stop();
+        store.ephemeral.clearChatPending(req.pr);
+      }
+    },
+    { fireImmediately: true },
+  );
+}
+
 /** The run behind a chat question: core names it after the question's
  *  message id (what `ask` returns), and streams/cancels under this id. */
 export const askRunId = (message: string) => `ask:${message}`;
@@ -326,6 +372,7 @@ export async function askAboutLine(
     status: 'asking',
     message: null,
     reply: null,
+    startedAt: Date.now(),
   });
   store.ephemeral.focusAsk(pr, null);
   // `mine`: still this very ask (not dismissed, not re-asked since).
@@ -443,15 +490,19 @@ export function assignTask(
 
 /** Hands a task to an agent CLI, which fixes it in the PR worktree (Edit
  *  mode). The task's own status moves to `progress`/`review` via sync, not
- *  locally — this only kicks the run off. Returns the run id, or `null` on
- *  a graceful failure (toast, no crash). */
+ *  locally — this only kicks the run off and remembers its run id for the
+ *  row's live view. Returns the run id, or `null` on a graceful failure
+ *  (toast, no crash). */
 export async function delegateTask(
-  _store: RootStore,
+  store: RootStore,
   task: string,
   agent: AgentId | null = null,
 ): Promise<string | null> {
   try {
-    return await api.delegateTask({ task, agent });
+    const run = await api.delegateTask({ task, agent });
+    // The task's row shows this run's output while the fix runs.
+    store.ephemeral.setTaskRun(task, run);
+    return run;
   } catch {
     return null; // toasted by api.ts
   }

@@ -304,3 +304,62 @@ async fn reap_orphans_is_async_and_cleans_up_stale_markers() {
         "the stale marker must be removed regardless"
     );
 }
+
+// ── stdin input (steerable runs) ─────────────────────────────────────────
+
+fn steerable(
+    work_secs: &str,
+) -> (
+    theodore_ports::agent::AgentRun,
+    theodore_ports::agent::Steer,
+) {
+    use theodore_agents::claude::{ClaudeParser, user_message_line};
+    let (steer, messages) = theodore_ports::agent::Steer::channel();
+    let input = theodore_agents::process::Input {
+        first: user_message_line("first"),
+        messages,
+        encode: user_message_line,
+    };
+    let spec = SpawnSpec {
+        program: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake_claude_stream.sh"),
+        args: vec![work_secs.to_string()],
+        ..spec("normal", 5_000)
+    };
+    let run = theodore_agents::process::spawn_with_input(
+        spec,
+        Box::new(ClaudeParser::with_stdin_input()),
+        input,
+    )
+    .unwrap();
+    (run, steer)
+}
+
+fn final_text(events: &[AgentEvent]) -> String {
+    match events.last() {
+        Some(AgentEvent::Done { final_text, .. }) => final_text.clone(),
+        other => panic!("expected Done last, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_steered_message_joins_the_running_turn() {
+    let (run, steer) = steerable("1");
+    assert!(steer.send("second".into()).await, "the run took it");
+    let events = tokio::time::timeout(Duration::from_secs(10), collect(run.events))
+        .await
+        .expect("the run ends once both are answered");
+    assert_eq!(final_text(&events), "turn 1 took 2");
+    assert!(
+        !steer.send("too late".into()).await,
+        "a finished run refuses"
+    );
+}
+
+#[tokio::test]
+async fn an_unsteered_run_ends_after_its_one_turn() {
+    let (run, _steer) = steerable("1");
+    let events = tokio::time::timeout(Duration::from_secs(10), collect(run.events))
+        .await
+        .expect("stdin closes after the result");
+    assert_eq!(final_text(&events), "turn 1 took 1");
+}

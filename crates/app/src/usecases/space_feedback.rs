@@ -4,8 +4,11 @@
 //! `path:line`, so the agent knows where to look and the transcript shows
 //! what was asked.
 
-use theodore_contract::{SpaceFeedback, SpaceFeedbackRequest, SpaceSendRequest, models};
+use theodore_contract::{
+    SentFeedback, SpaceFeedback, SpaceFeedbackRequest, SpaceSendRequest, models,
+};
 use theodore_domain::{Anchor, Draft, Finding, PrDetail, PrId, Severity, Side, Thread};
+use theodore_ports::{NewAction, SyncActionCode};
 
 use crate::core::Core;
 use crate::error::{AppError, AppResult};
@@ -37,15 +40,34 @@ impl Core {
         for item in &req.items {
             quotes.push(self.feedback_quote(&prs, item).await?);
         }
-        self.space_send(SpaceSendRequest {
-            space: space.id,
-            text: feedback_prompt(&quotes),
-            agent: None,
-            model: None,
-            mode: None,
-            attachments: None,
-        })
-        .await
+        // The turn that is about to start: `space_send` only bumps `turns`
+        // once it ends, so this is the number it will carry.
+        let turn = space.turns + 1;
+        let message_id = self
+            .space_send(SpaceSendRequest {
+                space: space.id.clone(),
+                text: feedback_prompt(&quotes),
+                agent: None,
+                model: None,
+                mode: None,
+                attachments: None,
+            })
+            .await?;
+        let mut sent = space.sent_feedback.clone();
+        sent.extend(
+            req.items
+                .iter()
+                .cloned()
+                .map(|item| SentFeedback { item, turn }),
+        );
+        self.apply(vec![NewAction {
+            model: models::SPACE.into(),
+            model_id: space.id,
+            action: SyncActionCode::C,
+            data: Some(serde_json::json!({ "sent_feedback": sent })),
+        }])
+        .await?;
+        Ok(message_id)
     }
 
     async fn feedback_quote(&self, prs: &[PrId], item: &SpaceFeedback) -> AppResult<Quote> {

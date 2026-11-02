@@ -31,8 +31,12 @@ fn later_layers_win_key_by_key_and_lists_replace() {
         ),
     ]);
     let s = &m.config.spaces;
-    assert_eq!(s.copy, vec![".env.team".to_string()], "lists replace");
-    assert_eq!(s.ports, 3);
+    assert_eq!(
+        s.effective_copy(),
+        vec![".env.team".to_string()],
+        "lists replace"
+    );
+    assert_eq!(s.port_count(), 3);
     assert_eq!(s.env["A"], "global");
     assert_eq!(s.env["B"], "repo");
     assert_eq!(s.env["C"], "local");
@@ -49,7 +53,10 @@ fn later_layers_win_key_by_key_and_lists_replace() {
 fn defaults_when_nothing_is_set() {
     let m = merge(&[]);
     let s = &m.config.spaces;
-    assert_eq!(s.port_count(), 0);
+    // Nothing in any layer: a space still copies `.env*` and reserves 2
+    // ports, so it works with zero config.
+    assert_eq!(s.port_count(), 2);
+    assert_eq!(s.effective_copy(), vec![".env*".to_string()]);
     assert_eq!(s.command(SpaceCommandKind::Setup), None);
     assert_eq!(
         s.timeout(SpaceCommandKind::Setup),
@@ -60,6 +67,28 @@ fn defaults_when_nothing_is_set() {
         Some(std::time::Duration::from_secs(120))
     );
     assert_eq!(s.timeout(SpaceCommandKind::Run), None);
+}
+
+#[test]
+fn explicit_zero_and_empty_turn_the_defaults_off() {
+    let m = merge(&[layer(
+        ConfigLayer::Repo,
+        "spaces:\n  copy: []\n  ports: 0\n",
+    )]);
+    let s = &m.config.spaces;
+    assert_eq!(s.effective_copy(), Vec::<String>::new());
+    assert_eq!(s.port_count(), 0);
+}
+
+#[test]
+fn a_set_copy_or_ports_replaces_the_default_without_adding_to_it() {
+    let m = merge(&[layer(
+        ConfigLayer::Repo,
+        "spaces:\n  copy: [.env.team]\n  ports: 1\n",
+    )]);
+    let s = &m.config.spaces;
+    assert_eq!(s.effective_copy(), vec![".env.team".to_string()]);
+    assert_eq!(s.port_count(), 1);
 }
 
 #[test]
@@ -147,7 +176,7 @@ fn unknown_keys_are_reported_with_their_file() {
     let keys: Vec<&str> = m.unknown.iter().map(|(_, k)| k.as_str()).collect();
     assert_eq!(keys, ["budget.usd", "spaces.setpu"]);
     assert_eq!(m.unknown[0].0, "/Repo.yaml");
-    assert_eq!(m.config.spaces.ports, 1, "known keys still apply");
+    assert_eq!(m.config.spaces.port_count(), 1, "known keys still apply");
 }
 
 #[test]
@@ -158,7 +187,7 @@ fn a_bad_file_is_skipped_and_a_bad_section_is_dropped() {
         layer(ConfigLayer::Local, "review: {hide: 5}"),
     ]);
     assert!(m.files[1].error.is_some());
-    assert_eq!(m.config.spaces.ports, 2);
+    assert_eq!(m.config.spaces.port_count(), 2);
     assert_eq!(m.errors.len(), 1);
     assert_eq!(m.errors[0].0, "review");
 }
@@ -228,11 +257,12 @@ async fn read_layers_takes_the_local_file_from_the_checkout_only() {
     std::fs::write(checkout.path().join(LOCAL_FILE), "spaces: {ports: 2}").unwrap();
     let layers = read_layers(data.path(), Some(repo.path()), Some(checkout.path())).await;
     let m = merge(&layers);
-    assert_eq!(m.config.spaces.ports, 2);
+    assert_eq!(m.config.spaces.port_count(), 2);
     assert_eq!(m.layer_of("spaces.ports"), Some(ConfigLayer::Local));
     let without = merge(&read_layers(data.path(), Some(repo.path()), None).await);
     assert_eq!(
-        without.config.spaces.ports, 1,
+        without.config.spaces.port_count(),
+        1,
         "no local layer without a checkout"
     );
 }

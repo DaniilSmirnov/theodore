@@ -136,6 +136,28 @@ editable.
 | 修复登录 | `space` (other scripts only break words) |
 | a second "исправить логин" in the project | `ispravit-login-2`, and so its branch |
 
+That slug is only the instant placeholder. Without delaying turn 1, the
+chat agent (`agents.chat`, its fastest, cheapest model — Claude's `haiku`)
+proposes a better one from the goal, in the background:
+
+```
+create_space ─▶ slug name, turn 1 sent ──▶ page opens at once
+                      │
+                      └─▶ space_naming::apply (background)
+                              chat agent, cheap model ─▶ "NAME: … / TITLE: …"
+                              name/branch ─▶ applied, deduped          (unless you typed one, or it shipped)
+                              title       ─▶ applied                   (always, once a valid answer lands)
+                              anything else (offline, no CLI, a bad
+                              answer) ─▶ nothing changes, silently
+```
+
+`Space::title` is what the sidebar, palette, tab and notifications show
+(`spaceTitle`) instead of the goal's raw first line — the fix for chats
+that otherwise read as a run-on sentence ("For LIN-145, I dont agree with
+the proposed solution…", GitHub #78). Open PR / Merge locally's own title
+field still defaults to the goal's first line (`defaultTitle`), on
+purpose: that one is the commit message, not the chat's name.
+
 ### Space page — drafting
 
 Chat left, changes right. The diff is the whole branch vs its base, the same
@@ -206,6 +228,33 @@ turn 1 ─▶ ckpt A ─▶ turn 2 ─▶ ckpt B          Undo: worktree + ref �
                                 └─ shipped? ── refused
 ```
 
+**Update from base**: when the base branch has commits the space doesn't,
+the header shows *Base moved: 3 commits behind · Update* (counted from the
+copy on this Mac, re-read after each turn and each project fetch; no
+network). Update merges the base into the space (§6): clean, the space is on
+the new base at once; on conflicts a banner *Resolving conflicts with main:
+a.ts, b.ts* replaces the button and the agent gets a turn to resolve them.
+
+```
+┌ ○ retry-429 ──────── [⎇ Base moved: 3 commits behind · Update] [Review] [Open PR ▾] ┐
+                    after Update, on conflicts:
+┌ ○ retry-429 ──────────────────────────────────────────── [Review] [Open PR ▾] ──────┐
+│ ⚠ Resolving conflicts with main: src/retry.rs. Theodore commits    [Complete merge] │
+│   the merge once no conflict markers are left.                     [Abort]          │
+```
+
+| Banner action | Does |
+| --- | --- |
+| (the agent's turn ends) | Theodore checks the files; none has markers left → it commits the merge |
+| Complete merge | the same check now, for files fixed by hand; says which files still have markers |
+| Abort | `merge --abort`, worktree and ref back to where the update started, old base |
+
+While it resolves: Ship and Undo are refused ("finish or abort the update
+from base first"), a plain message is a normal turn whose end tries the
+merge again. Undo of the turn that completed the merge takes the merge back
+too, base included; a clean update is not a turn, so Undo stops at it. The
+PR's own "Update branch" on the host is a separate action and stays as is.
+
 ### Space page — in review
 
 The header gains the PR; the right pane gains Threads and Checks tabs
@@ -245,6 +294,24 @@ Several items (`space_send_feedback` takes a list) are numbered in one
 message. Removed lines read `path:7 (old side, removed lines)`; outdated
 comments say so; `<!-- … -->` metadata is dropped. The draft or thread itself
 is left as it was.
+
+**Fix CI**: "Fix with agent" next to the Checks tab heading, once a check on
+`space.pr` has failed. It fetches each failing check's log (GitHub Actions
+today; a host without one gets a bare link) and starts the space's next turn
+with the list, each check's log attached or linked, and the project's
+`spaces.check` command if one is configured:
+
+```
+space.pr ─▶ fresh checks ─▶ failing ones ─▶ check_log (GitHub Actions)
+                                                │
+                              save_attachment ◀─┴─▶ no log: name + url
+                                    │
+                                    ▼
+                              space_send (one turn, attachments)
+```
+
+Refused without a PR, with nothing failing, or while a turn is running — same
+rules as any other turn.
 
 ### Review of a space
 
@@ -307,7 +374,42 @@ counts as seen while the window has focus.
 
 A space can be set up for its project by the `spaces:` section of the project
 config — files copied in, free ports, env, and `setup` / `run` / `check` /
-`archive` commands. See `docs/config.md`.
+`archive` commands. Nothing configured gets `.env*` and 2 ports anyway, so a
+space works with zero config; a project with no commands at all offers "Set
+up with agent" instead, and a failed setup offers "Fix with agent" next to
+Retry. See `docs/config.md`.
+
+### Terminal
+
+An interactive shell in the space's worktree, next to the agent's turns —
+for `git log`, a one-off script, poking at something the agent just wrote.
+Toggled from the header (and `⌃\``), it opens as a drawer under the page;
+`+` starts another tab, × closes one.
+
+```
+⌃`   ──▶ drawer ── [Terminal 1] [Terminal 2] [+] ────────────────┐
+           tab = one xterm.js view over one real PTY             │
+           $SHELL -l, cwd = worktree, env = the space's own ◀────┘
+```
+
+- **Shell**: `$SHELL -l` (the user's login shell), so `.zshrc`/`.bashrc`
+  aliases and prompt apply, same as a terminal app.
+- **Env**: the parent process's env minus Theodore's own `THEODORE_*`
+  secrets, plus the space's variables and `spaces.env` — the same
+  `space_command_env` a space's `setup`/`run`/`check` commands get
+  (docs/config.md).
+- **Several per space, outlive the page.** Each tab is a real PTY the core
+  owns, not the component; navigating away from the space page and back
+  re-lists and re-attaches whatever is still running, scrollback included.
+  Closed on archive (before the worktree is removed) and on a clean app
+  quit — never left running past the space, or past Theodore itself.
+- **Bounded, twice.** The core keeps a raw tail (ANSI intact) per terminal
+  to reseed the view on reattach, and a separate ANSI-stripped line tail
+  (`space_terminal_tail`, 2,000 lines) for a later agent tool to read as
+  plain text — not wired up yet.
+- **Flow control**: output is batched (16 ms or 64 KB, whichever first)
+  before it reaches the UI, so a chatty shell can't flood the event bus.
+- Follows the app's light/dark tokens, not a terminal palette of its own.
 
 ## 4. What makes it Theodore's
 
@@ -338,7 +440,8 @@ is unchanged from before: Claude's Edit already pre-approves Bash, Codex's
 remaining prompts and limits.
 
 - **Stop** cancels the run (SIGTERM → 5 s → SIGKILL, existing lifecycle), then
-  checkpoints whatever was edited as "turn N (stopped)". Nothing is lost.
+  checkpoints whatever was edited as "turn N (stopped)". Nothing is lost;
+  messages queued behind it are held, not sent (§8).
 - **Resume** = send another message. The space keeps one agent session and
   each turn continues it (below), so the agent still has the files it read,
   the commands it ran and its todo list; a different agent picks up from the
@@ -355,16 +458,32 @@ remaining prompts and limits.
   - The agent's cwd is `~/.theodore/spaces/<id>`, a worktree of Theodore's own
     cache. The user's checkout and its `.git` are never written. A local
     folder project uses the existing mirror.
-  - Theodore never pushes, opens a PR or writes into a local folder without
-    an explicit click.
-  - The prompt tells the agent to stay in its directory and not to push or
-    switch branches. After each turn Theodore points the space ref at
+  - Theodore never pushes, opens a PR or writes into a local folder unless
+    you ask: a click, or asking the agent, which calls the `ship` tool
+    (below). Either way it is the same ship, with the same guarantees.
+  - The prompt tells the agent to stay in its directory, to ship only
+    through `ship`, and never to run `git push`, `gh pr create` or switch
+    branches itself. After each turn Theodore points the space ref at
     whatever `HEAD` is; a `HEAD` that no longer descends from the base is
     flagged instead of silently recorded.
   - Theodore's secrets are stripped from the agent env (existing).
-  - Not an OS sandbox: a CLI with shell access can still leave its directory.
-    Later: run agents under a macOS sandbox profile that only allows writes
-    inside the space (open question 4).
+  - Every git command Theodore runs in the worktree first checks that git
+    resolves exactly that worktree (§6 "Worktree guard"); otherwise nothing
+    runs, so a lost `.git` never turns into `add -A` / `reset --hard` on a
+    parent repository.
+  - File-edit tools stay inside the worktree and the turn's attachment dirs
+    (Edit and Run; Ask can't edit at all):
+
+    | Agent | How | Verified |
+    | --- | --- | --- |
+    | Claude Code | no blanket `Edit`/`Write` allow; `--settings` with `Edit(//<dir>/**)` rules (Edit) and a `PreToolUse` hook on `Edit\|Write\|MultiEdit\|NotebookEdit` (Edit and Run): Theodore's own binary run as `--theodore-edit-guard <dir>…` exits 2 for a path outside, symlinks resolved, `..` refused. The hook holds under `bypassPermissions` too | live, 2.1.312 |
+    | Codex | its own `workspace-write` sandbox: writes only in cwd (plus `/tmp` and `$TMPDIR`), for shell and patches alike | flags only |
+    | Gemini | its file tools refuse paths outside the workspace (the CLI's own check); nothing added | not installed here |
+
+  - Not an OS sandbox: in Edit and Run, a shell command (Claude's Bash,
+    Gemini's shell) can still write outside its directory. Later: run agents
+    under a macOS sandbox profile that only allows writes inside the space
+    (open question 4).
 
 ### One session per space
 
@@ -398,6 +517,24 @@ gone?  ─▶ "No conversation found" / "no rollout found"
   one: the conversation moved on without it.
 - Review runs (AI panel, grouping, skills, fixes) don't keep sessions.
 
+**The replayed transcript, once a space outgrows it.** The last 12 messages
+carry the conversation across a switch, but a space with more history than
+that would otherwise lose everything before them. The first time a turn
+can't resume hits that case, the chat agent's cheap model summarizes
+whatever falls outside the window (goal, decisions, files touched, what's
+left) once; the summary is cached on the space (`handoff_summary`) and
+prepended ahead of the replayed window on every switch after that — no
+second call:
+
+```
+history > 12 messages, can't resume
+  cached already?      ──yes──▶ prepend it
+  no  ──▶ chat agent, cheap model ─▶ summary ─▶ cached ─▶ prepend it
+          fails (offline, no CLI) ─▶ today's plain replay, nothing cached
+```
+
+A short space (≤ 12 messages total) never asks for one.
+
 ### Tools the agent gets
 
 Every turn, in every mode, gets the `space-tools` MCP server: the space's
@@ -409,15 +546,31 @@ configured commands, never a shell of the agent's choosing.
 | `start_app` / `stop_app` / `app_status` | the `run` command: start, stop, running?, ports, `http://localhost:<port>` |
 | `read_logs` | the tail of `setup`, `run`, `check` or `archive` output (bounded) |
 | `space_info` | name, branch, base, worktree, ports, env variable names (not values), which commands are set |
+| `ship` | Open PR / Open as draft / Push / Merge locally / Keep as branch, as the Ship menu does (§6): PR number and URL, or why it was refused |
+| `get_space_diff` | the change vs the merge-base with the base, uncommitted edits included; one `file`, or `stat` for +/− per file |
+| `get_review_comments` | drafts, findings and threads on the space's review and its PR: `path:line`, who (you, an agent, a reviewer), state |
+| `add_review_comment` | a finding on a line of the space's review: shows in Review, "Send to agent" sends it back |
+| `set_base` | a new base branch: fetched, the diff is vs the merge-base from then on |
+| `update_progress` | the turn's plan as steps (pending · active · done) above the composer |
 
 ```
 turn ─▶ token for this space ─▶ agent ─▶ run_check ─▶ check ─▶ result ─▶ agent fixes ─▶ …
-  │                                  └─▶ start_app ─▶ run   ─▶ URLs   ─▶ agent tries it
-  └─ agent exits ─▶ token revoked
+  │                                  ├─▶ start_app ─▶ run   ─▶ URLs   ─▶ agent tries it
+  │                                  └─▶ ship ─▶ ship_space (as the turn) ─▶ PR #n ─▶ agent tells you
+  └─ agent exits ─▶ token revoked, progress cleared
 ```
 
 - The system prompt names them: use `run_check` after changes, `start_app`
-  to try the app.
+  to try the app, `ship` only when you ask to push, open a PR or merge.
+- `ship` from the turn runs while that turn holds the space; any other
+  caller still waits for the turn. It checkpoints the edits so far first,
+  so they ship too; the turn's own checkpoint follows when it ends.
+- `get_space_diff` snapshots the worktree through a temporary index: no
+  ref moves, the worktree's own index stays as it was.
+- `set_base` keeps the worktree and the turns; a PR that is already open
+  keeps its target (the tool says so). Undo doesn't move the base back.
+- The tracker is the turn's: each call replaces it, no steps clears it,
+  and it goes when the turn ends.
 - Trust holds: a repo command not allowed yet is refused with "not allowed
   by the user yet" and never runs.
 - The turn lists its tool calls while it runs and after (this session),
@@ -438,9 +591,10 @@ Details, limits and errors: `docs/config.md` §7.
 ~/.theodore/spaces/<id>/          detached worktree at the checkpoint + live edits
 
 turn ends ─▶ git add -A ─▶ commit "turn N" ─▶ update-ref refs/theodore/spaces/<id> HEAD
+Update    ─▶ fetch ─▶ checkpoint ─▶ git merge <base tip> in the worktree ─▶ base_sha = tip
 Ship      ─▶ commit-tree <checkpoint tree> -p <base> (author: you) ─▶ refs/theodore/shipped/<id>
 Open PR   ─▶ git push origin <shipped>:refs/heads/<login>/<slug>   (never forced)
-Push      ─▶ commit-tree <checkpoint tree> -p <last shipped> ─▶ push (fast-forward)
+Push      ─▶ commit-tree <checkpoint tree> -p <last shipped> [-p <base tip merged since>] ─▶ push (fast-forward)
 Merge     ─▶ (local folder) fetch <cache> <shipped ref> ─▶ git merge into its checked-out branch
 Keep      ─▶ (local folder) fetch <cache> <shipped ref>:refs/heads/space/<slug>
 Keep      ─▶ (local folder) git -C <folder> fetch <cache> <ref>:refs/heads/<branch>
@@ -458,6 +612,76 @@ PR's revisions), "undo last turn" is a ref move plus `reset --hard` and
 `clean -fd` in the worktree (ignored files such as installed deps stay), and the agent's own
 `git commit`s are simply kept. Checkpoints are authored by Theodore and never
 leave the cache; what ships is one squashed commit authored by you (§12 #2).
+
+**Worktree guard** (checkpoint, Undo, the busy check, reopen, archive):
+
+```
+git in ~/.theodore/spaces/<id>   GIT_CEILING_DIRECTORIES=~/.theodore/spaces, no inherited GIT_DIR
+  ├─ real dir, `.git` is a file, rev-parse --show-toplevel == the dir (symlinks resolved),
+  │  common dir under ~/.theodore/repos                         ─▶ run the command
+  └─ anything else (`.git` gone, a `git init` in its place, …)  ─▶ NotAWorktree, nothing run
+```
+
+The ceiling alone already makes git fail instead of walking up into a
+git-controlled home; the guard says why. A directory that fails it is never
+deleted: reopening the space (next turn, Undo, unarchive) or archiving it
+moves it to `~/.theodore/spaces/.moved-aside/<id>-<millis>` and recreates the
+worktree from `refs/theodore/spaces/<id>`.
+
+**Busy worktree**: before a checkpoint or Undo Theodore asks git what is
+unfinished there (`GitPort::worktree_busy`, one `WorktreeBusy`):
+
+| Found (`rev-parse --git-path`, `ls-files -u`) | Busy |
+| --- | --- |
+| `rebase-merge/`, `rebase-apply/` | rebase (also `git am`) |
+| `MERGE_HEAD` | merge |
+| `CHERRY_PICK_HEAD` | cherry-pick |
+| `REVERT_HEAD` | revert |
+| unmerged index entries, none of the above | unresolved conflicts |
+
+| While busy | |
+| --- | --- |
+| a turn ends | answer kept, no checkpoint, no `turn_log` entry; space `failed` with "checkpoint skipped: rebase in progress" |
+| Undo | refused: "can't undo: … finish or abort it first" |
+| Archive, Ship | refused with the same reason; nothing half-done is committed |
+| next turn after it's finished | checkpoints as usual |
+
+That is for an operation nobody told Theodore about (the agent ran `git
+rebase` itself). A merge Theodore started for Update from base is recorded
+on the space (`space.updating`), and its flow owns the end of it.
+
+**Update from base** (owner, 2026-10-31: merge the base in, never rebase or
+force-push, so pushed history and reviewers' comments stay put; shipping
+still squashes):
+
+```
+Update ─▶ fetch the base ─▶ tip == base_sha? ─▶ "already up to date"
+  └─▶ checkpoint "edits before updating from main" (= from)
+      └─▶ git merge --no-edit --ff <tip>   (Theodore's identity, no hooks, merge.conflictStyle=diff3)
+            ├─ clean ─────▶ merge commit = checkpoint "merge main" ─▶ base_sha = tip ─▶ diff vs tip
+            └─ conflicts ─▶ merge left in progress, space.updating = { base_tip, from, conflicts, started_at }
+                              └─▶ agent turn (Edit; an Ask space switches to Edit): the files,
+                                  "resolve the markers, keep both intents, run_check, leave git to Theodore"
+                                  turn ends ─▶ space_merge_finish instead of the checkpoint:
+                                    ├─ no file it listed has a marker line ─▶ add -A, commit = checkpoint,
+                                    │     base_sha = tip, updating cleared, turn_log.base_before = old base
+                                    ├─ markers left ─▶ no checkpoint, failed "conflicts left in b.ts; …"
+                                    ├─ the agent committed the merge itself ─▶ that commit is checkpointed
+                                    └─ the agent aborted it ─▶ checkpoint, old base, updating cleared
+            Abort ─▶ merge --abort, reset --hard <from>, clean -fd, ref → from, updating cleared
+```
+
+- A file counts as resolved when no line starts with `<<<<<<<`, `|||||||`
+  or `>>>>>>>` (or it is deleted): the agent needn't `git add`, which its
+  sandbox may not allow (the index lives in the cache).
+- Shipping after an update: the base is a real parent of the space's head,
+  so the squashed commit stays correct.
+
+  | Ship | the new commit |
+  | --- | --- |
+  | Open PR / first Merge locally | parent = the new `base_sha`, tree = the merged checkpoint: one commit vs the new base |
+  | Push (PR open) | parents = last push + the base tip merged since (dropped when already in its history), tree = the merged checkpoint: fast-forward, and the host's PR diff (vs the merge base) is still the change alone |
+  | Merge locally again | the same second parent |
 
 **Shipping, step by step**
 
@@ -512,10 +736,16 @@ New synced model `space` (core-owned, written only by commands):
 | `shipped` | the last ship: `how` (`pr · merged_locally · branch`), `branch`, `sha` (the squashed commit), `head` (the checkpoint it came from — later turns are "not pushed"), `pushes`, `at` |
 | `done_at` | set when the PR merges (seen by the poller's spaces sweep) or on Merge locally / Keep as branch |
 | `turn_log` | per turn: your message and the reply (`chat_message` ids), checkpoint `before` / `after`, `undone` |
+| `title` | the chat agent's proposed title (§3 "New space"); `None` until it lands |
+| `handoff_summary` | the earlier conversation, summarized once and cached (§5 "One session per space") |
+| `progress` | the running turn's tracker (`update_progress`): `steps` (label, `pending · active · done`), `note`, `at`; `null` once the turn ends |
+| `turn_log` | per turn: your message and the reply (`chat_message` ids), messages steered into it (`steered`), checkpoint `before` / `after`, `undone` |
+| `turn_log` | per turn: your message and the reply (`chat_message` ids), checkpoint `before` / `after`, `undone`; `base_before` when the turn completed an Update from base (Undo puts that base back) |
+| `updating` | an Update from base resolving its conflicts: `base_tip`, `from` (the checkpoint it started at), `conflicts`, `started_at` (§6) |
 
 | Data | Where |
 | --- | --- |
-| Transcript | `chat_message` rows with `pr = "space:<id>"` — the chat model, bootstrap and UI already work on it |
+| Transcript | `chat_message` rows with `pr = "space:<id>"` — the chat model, bootstrap and UI already work on it. A message waiting for its turn carries `queued` (§8) |
 | Streaming text, tool lines | `Ephemeral::AgentDelta` / `RunLog` with run id `space:<id>:<msg>`; not persisted |
 | A turn | on the space row: `status`, `turns`, `head_sha`, and an entry in `turn_log` (what undo moves back to). Later: `space_run` rows (agent, mode, usage, session id) for per-turn diffs and native resume |
 | Code | the worktree and `refs/theodore/spaces/<id>` |
@@ -542,15 +772,78 @@ Not built yet: **Delete** (archive plus deleting the ref and the chat rows);
 | Found on start | Action |
 | --- | --- |
 | `status = running` | → `failed` "interrupted: Theodore was closed" |
+| queued messages | kept, held: each waits for its Send (§8) |
 | dirty worktree | kept; the next turn (or archive) checkpoints it first |
 | worktree dir missing | recreated from `refs/theodore/spaces/<id>` |
+| dir there, but not the space's worktree (`.git` gone or foreign) | git refuses to run in it (§6 "Worktree guard"); on reopen or archive it is moved to `spaces/.moved-aside/`, never deleted, and recreated from the ref |
+| a rebase, merge or conflict left in the worktree | no checkpoint or Undo until it is finished or aborted (§6 "Busy worktree") |
+| `updating` set (an Update from base was resolving) | kept: the merge is still in the worktree; Complete merge or Abort from the banner, or send the agent a message |
 | ref missing too | `failed`, transcript kept, "Restart from base" offered |
 
 ---
 
 ## 8. Concurrency
 
-One run per space at a time; a send while running is refused (v2: queued).
+One run per space at a time. A send while it runs is **queued**: stored as
+your `chat_message` with `queued` (`seq`, the agent / model / mode picked,
+`held`) and shown under the running turn, not in the transcript yet.
+Attachments go with it; a `/skill` is expanded when it runs, from the
+worktree as it is then.
+
+```
+send ─▶ running? ── no ──▶ turn now
+           └─ yes ─▶ queued #n ──▶ turn ends ─┬─ on its own ─▶ #1 runs, then #2 …
+                                              └─ stopped · failed · restart
+                                                   └─▶ held: Send · Edit · Cancel
+```
+
+| Turn ended | The queue |
+| --- | --- |
+| on its own (a failing `check` included: the next turn hears it) | the first waiting message runs as the next turn, then the next |
+| stopped (also during its `check`) | held: nothing is sent, nothing dropped |
+| failed, or a queued one couldn't start | held |
+| Theodore restarted | held (§7 Crash recovery) |
+
+- **Edit** changes a queued message's text, **Cancel** deletes it; both
+  only while it is queued.
+- **Send** on a held message runs it now when the space is free; while a
+  turn runs it goes back in line. Held ones never send on their own, and a
+  new message while some are held runs at once.
+- A queued message's picks win over the space's when it runs; `None` means
+  whatever the space has then. Its turn is a normal one: undo, session
+  resume and the replayed transcript treat it like any other.
+- **Undo** and **Archive** leave the queue as it is. An archived space sends
+  nothing (Send is refused); after Unarchive the held messages can be sent.
+- A per-space lock covers "send now or queue" and "turn ends → next queued
+  starts", so a send never slips in between and the order holds.
+
+**Send now (steer).** For a Claude Code turn the composer also offers
+*Send now* (⌘⏎; ⏎ still queues): the message goes into the running turn and
+the agent takes it at its next step. Claude Code reads messages from stdin
+while it runs (`--input-format stream-json --replay-user-messages`, checked
+on 2.1.312): one written mid-run joins the turn after the current tool call
+and is echoed back when taken; one that lands just as the turn ends starts
+another turn in the same process and session. The run ends — stdin closed —
+once every message was taken and answered; the reply is all the answers.
+
+```
+claude -p --input-format stream-json …   stdin ◀─ goal
+   tool call … ◀────────────────────────── stdin ◀─ "also handle 404s"  (Send now)
+   echo: taken ─▶ … ─▶ result ─▶ all taken? ─▶ close stdin ─▶ exit ─▶ checkpoint
+```
+
+| | Send now |
+| --- | --- |
+| Claude Code, same agent and mode, no attachments | into the running turn; listed in the turn's `steered`, undone with it |
+| Codex, Gemini (one prompt per process) | queued |
+| another agent / mode, attachments (`--add-dir` is per process) | queued |
+| the run just ended, or hasn't started taking input yet | queued |
+
+The runner exposes it as an optional capability (`AgentPort::run_steerable`
+returns a `Steer` handle or none). A message written but never taken within
+30 s of the run's last result closes stdin anyway, so a run never waits on
+input forever.
+
 Spaces run in parallel, each in its own worktree. v2: `spaces.max_parallel`
 (default 3) queues the rest. Git writes into the shared bare cache (fetch,
 `update-ref`, `worktree add/remove`) and into one space's worktree
@@ -569,8 +862,10 @@ downloaded to this Mac yet".
 | --- | --- |
 | `create_space` | worktree + ref at the base, `space` row; sends `goal` as turn 1 when given |
 | `list_spaces` | rows of one project or all (the UI reads the synced rows) |
-| `space_send` | chat row, then an Edit-mode turn in the worktree; checkpoint; refresh the diff |
-| `space_stop` | cancels the running turn |
+| `space_send` | chat row, then a turn in the worktree; checkpoint; refresh the diff. While a turn runs: a queued chat row (§8) |
+| `space_send_now` | into the running Claude turn when it can take it (§8 "Send now"), else as `space_send` |
+| `space_queued` | `send` · `cancel` · `edit` one queued message |
+| `space_stop` | cancels the running turn; the queue is held |
 | `save_attachment` | stores a file (≤ 25 MB) for a message; `attachment_data` reads it back as a `data:` URL |
 | `space_skills` | skills `/<id>` can run: `~/.claude/skills` plus the worktree's `.claude/skills`, no built-ins |
 | `space_review` | opens (or refreshes) the space's branch review; `group: true` also groups it |
@@ -578,7 +873,18 @@ downloaded to this Mac yet".
 | `unarchive_space` | recreate the worktree from the ref, reopen the live diff |
 | `undo_space_turn` | worktree and ref back to the last live turn's `before`; the turn is marked undone |
 | `space_send_feedback` | threads / drafts / findings of the space's PR or own review, quoted as one turn |
+| `space_base_status` | the base's tip in the copy on this Mac and how many commits the space is behind it; no network |
+| `update_space_from_base` | merge the base's tip into the space (§6); while `updating`, complete that merge if no markers are left |
+| `abort_space_update` | `merge --abort`, back to `updating.from` on the old base |
 | `ship_space` | `open_pr` · `open_draft_pr` · `push` (host project) or `merge_locally` · `keep_branch` (local folder), with an optional title (§6) |
+| `space_setup_assist` | "Set up with agent": no `spaces:` commands at all — a turn asking the agent to look at the repo and write them (`docs/config.md` §2, §8) |
+| `space_fix_setup` | "Fix with agent": setup failed — a turn with the command, its exit status and the log tail, asking the agent to fix the cause |
+| `open_space_terminal` | a new PTY in the worktree (§3 "Terminal"), `$SHELL -l`, given `cols`/`rows` |
+| `write_space_terminal` | bytes typed or pasted into it |
+| `resize_space_terminal` | a new `cols`/`rows` (`SIGWINCH`) |
+| `close_space_terminal` | kills its process group |
+| `list_space_terminals` | a space's open (or just-exited) terminals, each with scrollback to reseed the view |
+| `space_fix_ci` | "Fix with agent" on the Checks tab: the space PR's failing checks' logs (or links), as one turn |
 
 ## 10. The flag
 
@@ -597,7 +903,13 @@ no row, or `true`, means on. The flag forces them on and locks the switch.
 
 | Phase | Scope |
 | --- | --- |
-| **Built** | `space` model; create / send / stop / review / archive; transcript in chat rows; checkpoint per turn; sidebar section; space page with chat + diff; Review opens the grouped review; crash → failed. Shipping: squash into one commit by you; Open PR / Open as draft (`HostAdapter::create_pr` + `find_open_pr` on GitHub, GitLab, Bitbucket, sandbox and fixtures, through the outbox, idempotent by head branch) and Push (never forced); branch `<login>/<slug>`; Merge locally and Keep as branch for local folders; modes Ask / Edit / Run; Archive button and `spaces.auto_archive_days`. "Send to agent" on a space PR's / own review's threads, drafts and findings; Undo last turn (`turn_log`); Unarchive; one agent session per space (Claude Code `--resume`, Codex `exec resume`); background notifications and the dock badge (`spaces.notify`); names transliterated from Cyrillic and accented goals, `-2` for repeats; `setup` / `run` / `check` / `archive` from the project config (`docs/config.md`) with logs and Open app |
+| **Built** | `space` model; create / send / stop / review / archive; transcript in chat rows; checkpoint per turn; sidebar section; space page with chat + diff; Review opens the grouped review; crash → failed. Shipping: squash into one commit by you; Open PR / Open as draft (`HostAdapter::create_pr` + `find_open_pr` on GitHub, GitLab, Bitbucket, sandbox and fixtures, through the outbox, idempotent by head branch) and Push (never forced); branch `<login>/<slug>`; Merge locally and Keep as branch for local folders; modes Ask / Edit / Run; Archive button and `spaces.auto_archive_days`. "Send to agent" on a space PR's / own review's threads, drafts and findings; Undo last turn (`turn_log`); Unarchive; one agent session per space (Claude Code `--resume`, Codex `exec resume`); background notifications and the dock badge (`spaces.notify`); names transliterated from Cyrillic and accented goals, `-2` for repeats; a chat-agent-proposed name and title in the background, never delaying turn 1 (`space_naming`); a cached, once-generated handoff summary for a space that outgrows the replayed window (`space_handoff`); `setup` / `run` / `check` / `archive` from the project config (`docs/config.md`) with logs and Open app; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; the agent's `space-tools` for the change: `ship`, `get_space_diff`, `get_review_comments`, `add_review_comment`, `set_base`, `update_progress` (the tracker above the composer) |
+| **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel`; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent" |
+| **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel`; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent" |
+| **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel`; interactive terminal tabs (§3 "Terminal") over a real PTY, surviving navigation, closed on archive / app quit |
+| **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel`; an agent tool over `space_terminal_tail`; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent" |
+| **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel`; sends while running are queued (held after Stop / a failure / a restart; Send · Edit · Cancel) and Send now steers a running Claude Code turn |
+| **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; `max_parallel`; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; Update from base (merge, never rebase): "Base moved: N commits behind", conflicts resolved by an agent turn, Complete merge / Abort; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent" for setup; "Fix with agent" on the Checks tab, sending a failing check's log (GitHub Actions) or link as one turn |
 | **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel` |
 | **Later** | OS sandbox for agents; live diff during a turn (snapshot the working tree through a temporary index); signed shipped commits; spaces started from an issue or a failing check; several agents racing one goal, pick the best diff |
 

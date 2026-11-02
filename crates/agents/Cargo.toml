@@ -18,6 +18,9 @@ tracing.workspace = true
 which.workspace = true
 dirs.workspace = true
 tempfile.workspace = true
+# The space terminal's PTY (docs/spaces.md "Terminal"): only this adapter
+# needs it.
+portable-pty = "0.9"
 
 [dev-dependencies]
 pretty_assertions.workspace = true

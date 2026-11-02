@@ -239,6 +239,27 @@ fn workos_account() -> Arc<dyn theodore_ports::AccountPort> {
     Arc::new(account)
 }
 
+/// Code intelligence over `<data dir>/code-intel` (docs/code-intel.md).
+/// Off in sandbox and fixture runs: they have no real worktrees to index.
+/// A facade that fails to start leaves the feature off, never the app.
+fn code_intel(cfg: &RuntimeConfig) -> Option<Arc<dyn theodore_ports::CodeIntelPort>> {
+    if cfg.sandbox.is_some() || cfg.fixtures.is_some() {
+        return None;
+    }
+    let options = theodore_code_intel::CodeIntelOptions::new(cfg.data_dir.join("code-intel"));
+    match theodore_code_intel::CodeIntel::new(options) {
+        Ok(ci) => Some(Arc::new(ci)),
+        Err(e) => {
+            tracing::warn!(
+                error.code = "code_intel.start_failed",
+                error = %e,
+                "code intelligence is off: it couldn't start"
+            );
+            None
+        }
+    }
+}
+
 /// Build every adapter, start the MCP server and the core.
 pub async fn start(cfg: &RuntimeConfig) -> anyhow::Result<Runtime> {
     let (a, sandbox) = match (&cfg.sandbox, &cfg.fixtures) {
@@ -253,7 +274,8 @@ pub async fn start(cfg: &RuntimeConfig) -> anyhow::Result<Runtime> {
         (None, None) => (real_adapters(cfg)?, None),
     };
     let backend = Arc::new(CoreTools::default());
-    let mcp = Arc::new(McpRunTools::start(backend.clone(), backend.clone()).await?);
+    let mcp =
+        Arc::new(McpRunTools::start(backend.clone(), backend.clone(), backend.clone()).await?);
     let claude_home = skills_dir(cfg.sandbox.is_some(), &cfg.data_dir, dirs::home_dir());
 
     let worktree_locks = WorktreeLocks::new();
@@ -275,10 +297,12 @@ pub async fn start(cfg: &RuntimeConfig) -> anyhow::Result<Runtime> {
         account_client_id: BUILT_IN_CLIENT_ID.map(str::to_string),
         claude_home,
         commands: Arc::new(theodore_agents::ShellRunner::new()),
+        terminals: Arc::new(theodore_agents::PtyRunner::new()),
         data_dir: cfg.data_dir.clone(),
         worktree_lease: Arc::new(worktree_gc::WorktreeLeaseAdapter::new(
             worktree_locks.clone(),
         )),
+        code_intel: code_intel(cfg),
     };
     let (core, receivers) = Core::start(deps);
     if let Some(sb) = &sandbox {

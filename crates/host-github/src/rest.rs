@@ -250,6 +250,19 @@ pub(crate) async fn rerun_workflow_failed_jobs(
     Ok(())
 }
 
+/// `GET .../actions/jobs/{job_id}/logs`: a 302 to a time-limited plain-text
+/// log file, which `reqwest`'s default redirect policy follows — the body
+/// here is already the log text, not JSON.
+pub(crate) async fn job_log(
+    http: &HttpClient,
+    owner: &str,
+    repo: &str,
+    job_id: &str,
+) -> HostResult<String> {
+    let path = format!("repos/{owner}/{repo}/actions/jobs/{job_id}/logs");
+    Ok(http.get_raw(&path, &[]).await?.body)
+}
+
 /// The bits of a REST pull-request object `create_pr`/`find_open_pr` read.
 #[derive(Debug, Deserialize)]
 pub(crate) struct GhPull {

@@ -347,6 +347,9 @@ impl Secrets for FakeSecrets {
 
 pub struct FakeGit {
     pub repo_path: PathBuf,
+    /// What `grep` returns for any pattern; `None`: `Unsupported`, like
+    /// the trait's default.
+    pub grep_hits: Mutex<Option<Vec<theodore_ports::GrepHit>>>,
     /// Parent of every PR worktree `worktree()` hands out: private to this
     /// fake, so files a test plants (or an earlier run left) never leak
     /// into another test.
@@ -380,6 +383,8 @@ pub struct FakeGit {
     /// Heads the next `space_checkpoint` calls return, in order; when empty
     /// a checkpoint leaves the space where it was (nothing changed).
     checkpoint_heads: Mutex<VecDeque<Sha>>,
+    /// Errors the next `space_checkpoint` calls fail with, before any head.
+    checkpoint_errors: Mutex<VecDeque<GitError>>,
     /// `(space, message)` of every `space_checkpoint`.
     pub checkpoints: Mutex<Vec<(String, String)>>,
     removed_spaces: Mutex<Vec<String>>,
@@ -388,6 +393,12 @@ pub struct FakeGit {
     space_root: Mutex<Option<PathBuf>>,
     /// `(space, to)` of every `space_reset`.
     pub resets: Mutex<Vec<(String, Sha)>>,
+    /// Update from base: what the next `space_merge` / `space_merge_finish`
+    /// calls return, in order (empty: `Merged("merged-<tip>")`), and
+    /// `(call, space, sha)` of each — `merge` / `finish` with the tip,
+    /// `abort` with the checkpoint.
+    merge_results: Mutex<VecDeque<theodore_ports::SpaceMerge>>,
+    pub merge_calls: Mutex<Vec<(&'static str, String, Sha)>>,
     /// Shipping a space: identity, squashed commits, pushes, folder ops.
     pub ship: Mutex<FakeShip>,
     // ── offline (a PR opened from its local copy) ──────────────────────
@@ -439,6 +450,11 @@ pub struct FakeShip {
     pub dirty: Option<Vec<String>>,
     /// `(folder, paths, message)` of every `commit_paths`.
     pub folder_commits: Vec<(PathBuf, Vec<String>, String)>,
+    /// `space_snapshot`'s answer (uncommitted edits); `None`: the space's
+    /// checkpoint, as with a clean worktree.
+    pub snapshot: Option<Sha>,
+    /// `(base, head)` of every `diff`.
+    pub diff_calls: Vec<(Sha, Sha)>,
 }
 
 /// `GitResult` isn't `Clone` (`GitError` holds a `std::io::Error`); a fake
@@ -487,10 +503,14 @@ impl FakeGit {
             working_state_calls: Mutex::new(Vec::new()),
             removed_worktrees: Mutex::new(Vec::new()),
             checkpoint_heads: Mutex::new(VecDeque::new()),
+            checkpoint_errors: Mutex::new(VecDeque::new()),
             checkpoints: Mutex::new(Vec::new()),
             removed_spaces: Mutex::new(Vec::new()),
             space_root: Mutex::new(None),
+            grep_hits: Mutex::new(None),
             resets: Mutex::new(Vec::new()),
+            merge_results: Mutex::new(VecDeque::new()),
+            merge_calls: Mutex::new(Vec::new()),
             ship: Mutex::new(FakeShip {
                 identity: Some(theodore_ports::Identity {
                     name: "Ada Lovelace".into(),
@@ -641,6 +661,39 @@ impl FakeGit {
         self.checkpoint_heads.lock().unwrap().push_back(head);
     }
 
+    /// The next `space_checkpoint` fails with `e`.
+    pub fn push_checkpoint_error(&self, e: GitError) {
+        self.checkpoint_errors.lock().unwrap().push_back(e);
+    }
+
+    /// The next `space_merge` / `space_merge_finish` returns `r`.
+    pub fn push_merge_result(&self, r: theodore_ports::SpaceMerge) {
+        self.merge_results.lock().unwrap().push_back(r);
+    }
+
+    fn merge_call(&self, call: &'static str, space: &str, sha: &Sha) -> theodore_ports::SpaceMerge {
+        self.merge_calls
+            .lock()
+            .unwrap()
+            .push((call, space.to_string(), sha.clone()));
+        let r = self
+            .merge_results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| {
+                theodore_ports::SpaceMerge::Merged(Sha::new(format!("merged-{sha}")))
+            });
+        if let theodore_ports::SpaceMerge::Merged(head) = &r {
+            self.resolve_refs
+                .lock()
+                .unwrap()
+                .insert(theodore_ports::space_ref(space), head.clone());
+            self.ensure_commit(head, call);
+        }
+        r
+    }
+
     /// Space worktrees become real directories under `root`.
     pub fn set_space_root(&self, root: &Path) {
         *self.space_root.lock().unwrap() = Some(root.to_path_buf());
@@ -695,6 +748,17 @@ impl GitPort for FakeGit {
         self.removed_worktrees.lock().unwrap().push(pr.clone());
         Ok(())
     }
+    async fn grep(
+        &self,
+        _worktree: &Path,
+        _pattern: &str,
+    ) -> GitResult<Vec<theodore_ports::GrepHit>> {
+        self.grep_hits
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(GitError::Unsupported("grep"))
+    }
     async fn gc_worktrees(&self, _keep: &[PrRef]) -> GitResult<u32> {
         Ok(0)
     }
@@ -704,10 +768,15 @@ impl GitPort for FakeGit {
     async fn diff(
         &self,
         _repo: &Path,
-        _base: &Sha,
-        _head: &Sha,
+        base: &Sha,
+        head: &Sha,
         _opts: &DiffOptions,
     ) -> GitResult<Revision> {
+        self.ship
+            .lock()
+            .unwrap()
+            .diff_calls
+            .push((base.clone(), head.clone()));
         Ok(self.revision.lock().unwrap().clone())
     }
     async fn show(&self, _repo: &Path, rev: &Sha, path: &str) -> GitResult<Option<Vec<u8>>> {
@@ -865,6 +934,9 @@ impl GitPort for FakeGit {
             .lock()
             .unwrap()
             .push((space.to_string(), message.to_string()));
+        if let Some(e) = self.checkpoint_errors.lock().unwrap().pop_front() {
+            return Err(e);
+        }
         let refname = theodore_ports::space_ref(space);
         let next = self.checkpoint_heads.lock().unwrap().pop_front();
         let mut refs = self.resolve_refs.lock().unwrap();
@@ -880,11 +952,61 @@ impl GitPort for FakeGit {
         Ok(head)
     }
 
+    async fn space_snapshot(&self, worktree: &Path) -> GitResult<Sha> {
+        if let Some(sha) = self.ship.lock().unwrap().snapshot.clone() {
+            return Ok(sha);
+        }
+        // The space is the worktree's last path component (`space_worktree`).
+        let name = worktree
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let space = name.strip_prefix("theodore-fake-space-").unwrap_or(name);
+        self.resolve_refs
+            .lock()
+            .unwrap()
+            .get(&theodore_ports::space_ref(space))
+            .cloned()
+            .ok_or_else(|| GitError::Parse(format!("no space {space}")))
+    }
+
     async fn space_reset(&self, _worktree: &Path, space: &str, to: &Sha) -> GitResult<()> {
         self.resets
             .lock()
             .unwrap()
             .push((space.to_string(), to.clone()));
+        self.resolve_refs
+            .lock()
+            .unwrap()
+            .insert(theodore_ports::space_ref(space), to.clone());
+        Ok(())
+    }
+
+    async fn space_merge(
+        &self,
+        _worktree: &Path,
+        space: &str,
+        tip: &Sha,
+        _message: &str,
+    ) -> GitResult<theodore_ports::SpaceMerge> {
+        Ok(self.merge_call("merge", space, tip))
+    }
+
+    async fn space_merge_finish(
+        &self,
+        _worktree: &Path,
+        space: &str,
+        tip: &Sha,
+        _message: &str,
+    ) -> GitResult<theodore_ports::SpaceMerge> {
+        Ok(self.merge_call("finish", space, tip))
+    }
+
+    async fn space_merge_abort(&self, _worktree: &Path, space: &str, to: &Sha) -> GitResult<()> {
+        self.merge_calls
+            .lock()
+            .unwrap()
+            .push(("abort", space.to_string(), to.clone()));
         self.resolve_refs
             .lock()
             .unwrap()
@@ -1065,6 +1187,9 @@ pub struct FakeHost {
     pub rerun_check_responses: Mutex<VecDeque<HostResult<()>>>,
     /// Every check id `rerun_check` was called with, for assertions.
     pub rerun_check_calls: Mutex<Vec<String>>,
+    pub check_log_responses: Mutex<VecDeque<HostResult<Option<String>>>>,
+    /// Every check id `check_log` was called with, for assertions.
+    pub check_log_calls: Mutex<Vec<String>>,
     pub repo_info_responses: Mutex<VecDeque<HostResult<HostRepo>>>,
     /// Open PRs `create_pr` made, by head branch.
     pub created_prs: Mutex<HashMap<String, PrRef>>,
@@ -1167,6 +1292,12 @@ impl FakeHost {
     }
     pub fn rerun_check_calls(&self) -> Vec<String> {
         self.rerun_check_calls.lock().unwrap().clone()
+    }
+    pub fn push_check_log(&self, r: HostResult<Option<String>>) {
+        self.check_log_responses.lock().unwrap().push_back(r);
+    }
+    pub fn check_log_calls(&self) -> Vec<String> {
+        self.check_log_calls.lock().unwrap().clone()
     }
     pub fn push_repo_info(&self, r: HostResult<HostRepo>) {
         self.repo_info_responses.lock().unwrap().push_back(r);
@@ -1460,6 +1591,18 @@ impl HostAdapter for FakeHost {
             .pop_front()
             .unwrap_or(Ok(()))
     }
+    async fn check_log(
+        &self,
+        _pr: &PrRef,
+        check: &theodore_domain::Check,
+    ) -> HostResult<Option<String>> {
+        self.check_log_calls.lock().unwrap().push(check.id.clone());
+        self.check_log_responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(None))
+    }
     async fn repo_info(&self, repo: &RepoRef) -> HostResult<HostRepo> {
         self.repo_info_responses
             .lock()
@@ -1475,16 +1618,45 @@ impl HostAdapter for FakeHost {
 
 // ── agents ────────────────────────────────────────────────────────────────
 
+/// A `push_tagged` entry: matched against a request, then spent.
+type TaggedScript = (Box<dyn Fn(&AgentRequest) -> bool + Send>, Vec<AgentEvent>);
+
 #[derive(Default)]
 pub struct FakeAgent {
     scripts: Mutex<VecDeque<Vec<AgentEvent>>>,
+    /// Checked before `scripts`, in push order: a one-shot utility call
+    /// (`space_naming`, `space_handoff` — always `stream_text: false`) a
+    /// test wants to control without racing a turn's own queued script
+    /// (`stream_text: true`, never matched here).
+    tagged: Mutex<Vec<TaggedScript>>,
     hang_next: Mutex<bool>,
     /// Keeps a run's sender alive forever so its `events.recv()` never
     /// resolves (used to test cancellation deterministically).
     kept_alive: Mutex<Vec<tokio::sync::mpsc::Sender<AgentEvent>>>,
-    /// Every request `run()` was called with, in order (assertions on the
-    /// prompt, mode, or agent a use case picked).
+    /// Every `stream_text: true` request `run()` was called with, in
+    /// order (assertions on the prompt, mode, or agent a use case
+    /// picked): a turn, a skill run, an ask — never a one-shot utility
+    /// call, which would otherwise race these with a background task a
+    /// test never asked about (`space_naming`, `space_handoff`).
     requests: Mutex<Vec<AgentRequest>>,
+    /// The `stream_text: false` calls (`one_shot::run`), separately: a
+    /// test that cares inspects these with `utility_requests`.
+    utility_requests: Mutex<Vec<AgentRequest>>,
+    /// `run_steerable` gives a steer handle (as Claude Code's runner does).
+    steerable: std::sync::atomic::AtomicBool,
+    /// Messages steered into runs, in order.
+    steered: Arc<Mutex<Vec<String>>>,
+    /// The next run waits for this before it plays its script (a dropped
+    /// sender: it never does).
+    paused: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+/// What an untagged, unscripted call gets: one plain, successful turn.
+fn default_done() -> Vec<AgentEvent> {
+    vec![AgentEvent::Done {
+        final_text: "ok".into(),
+        usage: theodore_domain::Usage::default(),
+    }]
 }
 
 impl FakeAgent {
@@ -1494,8 +1666,21 @@ impl FakeAgent {
     pub fn push_script(&self, events: Vec<AgentEvent>) {
         self.scripts.lock().unwrap().push_back(events);
     }
-    /// The next `run()` call never emits anything and never closes, until
-    /// the whole fake is dropped.
+    /// The next call whose request matches `matches` gets `events`
+    /// instead of the next one off the FIFO queue (or the default "ok"),
+    /// regardless of when it actually runs.
+    pub fn push_tagged(
+        &self,
+        matches: impl Fn(&AgentRequest) -> bool + Send + 'static,
+        events: Vec<AgentEvent>,
+    ) {
+        self.tagged
+            .lock()
+            .unwrap()
+            .push((Box::new(matches), events));
+    }
+    /// The next turn / skill / ask `run()` (`stream_text: true`) never
+    /// emits anything and never closes, until the whole fake is dropped.
     pub fn hang_next_run(&self) {
         *self.hang_next.lock().unwrap() = true;
     }
@@ -1504,6 +1689,29 @@ impl FakeAgent {
     }
     pub fn last_request(&self) -> Option<AgentRequest> {
         self.requests.lock().unwrap().last().cloned()
+    }
+    /// The one-shot utility calls (`stream_text: false`), in order.
+    pub fn utility_requests(&self) -> Vec<AgentRequest> {
+        self.utility_requests.lock().unwrap().clone()
+    }
+    pub fn last_utility_request(&self) -> Option<AgentRequest> {
+        self.utility_requests.lock().unwrap().last().cloned()
+    }
+    /// The next turn plays its script only once the returned sender fires:
+    /// a turn that is "running" for as long as a test needs. Utility
+    /// one-shots don't take it.
+    pub fn pause_next_run(&self) -> tokio::sync::oneshot::Sender<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.paused.lock().unwrap() = Some(rx);
+        tx
+    }
+    /// Runs take steered messages from now on ("Send now").
+    pub fn take_steering(&self) {
+        self.steerable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn steered(&self) -> Vec<String> {
+        self.steered.lock().unwrap().clone()
     }
 }
 
@@ -1521,19 +1729,52 @@ impl AgentPort for FakeAgent {
             .collect()
     }
     async fn run(&self, req: AgentRequest) -> Result<AgentRun, AgentError> {
-        self.requests.lock().unwrap().push(req);
+        let stream_text = req.stream_text;
+        let tagged = {
+            let mut tagged = self.tagged.lock().unwrap();
+            tagged
+                .iter()
+                .position(|(matches, _)| matches(&req))
+                .map(|i| tagged.remove(i).1)
+        };
+        if stream_text {
+            self.requests.lock().unwrap().push(req);
+        } else {
+            self.utility_requests.lock().unwrap().push(req);
+        }
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let hang = std::mem::take(&mut *self.hang_next.lock().unwrap());
+        // Only a turn / skill / ask hangs: a background one-shot call
+        // (naming, handoff) must not take the hang meant for it.
+        let hang = stream_text && std::mem::take(&mut *self.hang_next.lock().unwrap());
         if hang {
             self.kept_alive.lock().unwrap().push(tx);
         } else {
-            let events = self.scripts.lock().unwrap().pop_front().unwrap_or_else(|| {
-                vec![AgentEvent::Done {
-                    final_text: "ok".into(),
-                    usage: theodore_domain::Usage::default(),
-                }]
+            let events = tagged.unwrap_or_else(|| {
+                if stream_text {
+                    self.scripts
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or_else(default_done)
+                } else {
+                    // A one-shot utility call: never steals a turn's
+                    // queued script (see `tagged` above).
+                    default_done()
+                }
             });
+            // Like the hang: only a turn waits, never a background call.
+            let paused = stream_text
+                .then(|| self.paused.lock().unwrap().take())
+                .flatten();
             tokio::spawn(async move {
+                if let Some(go) = paused
+                    && go.await.is_err()
+                {
+                    // Never released: hang like `hang_next_run`.
+                    let _keep = tx;
+                    std::future::pending::<()>().await;
+                    return;
+                }
                 for e in events {
                     if tx.send(e).await.is_err() {
                         break;
@@ -1545,6 +1786,24 @@ impl AgentPort for FakeAgent {
             events: rx,
             cancel: CancellationToken::new(),
         })
+    }
+    async fn run_steerable(
+        &self,
+        req: AgentRequest,
+    ) -> Result<(AgentRun, Option<theodore_ports::Steer>), AgentError> {
+        let run = self.run(req).await?;
+        if !self.steerable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok((run, None));
+        }
+        let (steer, mut messages) = theodore_ports::Steer::channel();
+        let steered = self.steered.clone();
+        tokio::spawn(async move {
+            while let Some(m) = messages.recv().await {
+                steered.lock().unwrap().push(m.text);
+                let _ = m.delivered.send(());
+            }
+        });
+        Ok((run, Some(steer)))
     }
 }
 
@@ -2252,6 +2511,68 @@ impl theodore_ports::CommandPort for FakeCommands {
     }
 }
 
+// ── terminals ─────────────────────────────────────────────────────────────
+
+/// `TerminalPort` fake: records every spec; a spawned terminal echoes back
+/// whatever is written to it (enough to exercise write → output without a
+/// real shell) and exits once killed.
+#[derive(Default)]
+pub struct FakeTerminals {
+    specs: Mutex<Vec<theodore_ports::TerminalSpec>>,
+    /// The next `spawn`'s `TerminalHandle::pid`.
+    next_pid: Mutex<Option<u32>>,
+}
+
+impl FakeTerminals {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn specs(&self) -> Vec<theodore_ports::TerminalSpec> {
+        self.specs.lock().unwrap().clone()
+    }
+
+    pub fn set_next_pid(&self, pid: u32) {
+        *self.next_pid.lock().unwrap() = Some(pid);
+    }
+}
+
+#[async_trait]
+impl theodore_ports::TerminalPort for FakeTerminals {
+    async fn spawn(&self, spec: theodore_ports::TerminalSpec) -> theodore_ports::TerminalHandle {
+        use theodore_ports::{TerminalEvent, TerminalExit};
+        self.specs.lock().unwrap().push(spec);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let (input, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (resize, _resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    got = input_rx.recv() => {
+                        let Some(buf) = got else { return };
+                        if tx.send(TerminalEvent::Output(buf)).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ = token.cancelled() => {
+                        let _ = tx.send(TerminalEvent::Exit(TerminalExit::default())).await;
+                        return;
+                    }
+                }
+            }
+        });
+        theodore_ports::TerminalHandle {
+            events: rx,
+            input,
+            resize,
+            kill: cancel,
+            pid: self.next_pid.lock().unwrap().take(),
+        }
+    }
+}
+
 // ── run tools ─────────────────────────────────────────────────────────────
 
 /// One `RunTools` registration, as the fake saw it.
@@ -2263,6 +2584,8 @@ pub struct ToolRegistration {
     /// The PR of a review registration.
     pub pr: Option<theodore_domain::PrId>,
     pub space: Option<String>,
+    /// The code tools it lists.
+    pub code: crate::deps::CodeTools,
 }
 
 /// `RunTools` fake: records registrations, hands out one-off tokens.
@@ -2305,12 +2628,14 @@ impl crate::deps::RunTools for FakeRunTools {
         pr: &theodore_domain::PrId,
         _agent: AgentId,
         space: Option<&str>,
+        code: crate::deps::CodeTools,
     ) -> theodore_ports::McpEndpoint {
         self.add(ToolRegistration {
             run_id: run_id.into(),
             name: theodore_ports::REVIEW_TOOLS.into(),
             pr: Some(pr.clone()),
             space: space.map(str::to_string),
+            code,
         })
     }
 
@@ -2319,12 +2644,14 @@ impl crate::deps::RunTools for FakeRunTools {
         run_id: &str,
         space: &str,
         _agent: AgentId,
+        code: crate::deps::CodeTools,
     ) -> theodore_ports::McpEndpoint {
         self.add(ToolRegistration {
             run_id: run_id.into(),
             name: theodore_ports::SPACE_TOOLS.into(),
             pr: None,
             space: Some(space.into()),
+            code,
         })
     }
 
@@ -2333,6 +2660,204 @@ impl crate::deps::RunTools for FakeRunTools {
             .lock()
             .unwrap()
             .push(endpoint.token.clone());
+    }
+}
+
+// ── code intelligence ─────────────────────────────────────────────────────
+
+/// `CodeIntelPort` fake: records every call as one line (`open <root>
+/// <trust> [langs]`, `close <root>`, `install <lang>`, `file_changed <root>
+/// <path>`, `<query> <path>…`) and answers from what the test set.
+#[derive(Default)]
+pub struct FakeCodeIntel {
+    calls: Mutex<Vec<String>>,
+    /// `status()` for every root.
+    pub status: Mutex<Vec<theodore_ports::LanguageStatus>>,
+    /// `find_symbol` / `file_symbols` items; `symbol_body` picks the one
+    /// named in its path.
+    pub symbols: Mutex<Vec<theodore_ports::CodeSymbol>>,
+    /// `symbol_body`'s text per symbol name.
+    pub bodies: Mutex<HashMap<String, String>>,
+    /// `definition` / `references` hits.
+    pub hits: Mutex<Vec<theodore_ports::CodeHit>>,
+    pub diagnostics: Mutex<Vec<theodore_ports::Diagnostic>>,
+    pub renames: Mutex<Vec<theodore_ports::TextEdit>>,
+    /// Every query fails with this, when set.
+    pub fail: Mutex<Option<theodore_ports::CodeIntelError>>,
+}
+
+impl FakeCodeIntel {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn record(&self, call: String) {
+        self.calls.lock().unwrap().push(call);
+    }
+
+    fn check(&self) -> theodore_ports::CodeIntelResult<()> {
+        match self.fail.lock().unwrap().clone() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    fn answer<T>(items: Vec<T>) -> theodore_ports::Answer<T> {
+        theodore_ports::Answer {
+            items,
+            source: theodore_ports::Source::Syntax,
+            index_percent: 62,
+            note: Some("rust-analyzer warming up".into()),
+        }
+    }
+}
+
+#[async_trait]
+impl theodore_ports::CodeIntelPort for FakeCodeIntel {
+    async fn open(&self, ws: theodore_ports::Workspace) -> theodore_ports::CodeIntelResult<()> {
+        let langs: Vec<&str> = ws.languages.iter().map(|l| l.as_str()).collect();
+        self.record(format!(
+            "open {} {:?} [{}]",
+            ws.root.display(),
+            ws.trust,
+            langs.join(",")
+        ));
+        Ok(())
+    }
+    async fn close(&self, root: &Path) {
+        self.record(format!("close {}", root.display()));
+    }
+    async fn find_symbol(
+        &self,
+        _root: &Path,
+        name: &str,
+        _kind: Option<theodore_ports::CodeSymbolKind>,
+    ) -> theodore_ports::CodeIntelResult<theodore_ports::Answer<theodore_ports::CodeSymbol>> {
+        self.record(format!("find_symbol {name}"));
+        self.check()?;
+        let items = self
+            .symbols
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.name == name)
+            .cloned()
+            .collect();
+        Ok(Self::answer(items))
+    }
+    async fn file_symbols(
+        &self,
+        _root: &Path,
+        path: &str,
+    ) -> theodore_ports::CodeIntelResult<theodore_ports::Answer<theodore_ports::CodeSymbol>> {
+        self.record(format!("file_symbols {path}"));
+        self.check()?;
+        let items = self
+            .symbols
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.path == path)
+            .cloned()
+            .collect();
+        Ok(Self::answer(items))
+    }
+    async fn symbol_body(
+        &self,
+        _root: &Path,
+        path: &str,
+        name: &str,
+    ) -> theodore_ports::CodeIntelResult<(theodore_ports::CodeSymbol, String)> {
+        self.record(format!("symbol_body {path} {name}"));
+        self.check()?;
+        let sym = self
+            .symbols
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| s.path == path && s.name == name)
+            .cloned()
+            .ok_or_else(|| theodore_ports::CodeIntelError::NoSymbol {
+                path: path.into(),
+                name: name.into(),
+            })?;
+        let body = self
+            .bodies
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .unwrap_or_default();
+        Ok((sym, body))
+    }
+    async fn definition(
+        &self,
+        _root: &Path,
+        path: &str,
+        at: theodore_ports::Position,
+    ) -> theodore_ports::CodeIntelResult<theodore_ports::Answer<theodore_ports::CodeHit>> {
+        self.record(format!("definition {path}:{}:{}", at.line, at.col));
+        self.check()?;
+        let items = self
+            .hits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|h| h.is_definition)
+            .cloned()
+            .collect();
+        Ok(Self::answer(items))
+    }
+    async fn references(
+        &self,
+        _root: &Path,
+        path: &str,
+        at: theodore_ports::Position,
+    ) -> theodore_ports::CodeIntelResult<theodore_ports::Answer<theodore_ports::CodeHit>> {
+        self.record(format!("references {path}:{}:{}", at.line, at.col));
+        self.check()?;
+        Ok(Self::answer(self.hits.lock().unwrap().clone()))
+    }
+    async fn diagnostics(
+        &self,
+        _root: &Path,
+        path: Option<&str>,
+    ) -> theodore_ports::CodeIntelResult<theodore_ports::Answer<theodore_ports::Diagnostic>> {
+        self.record(format!("diagnostics {}", path.unwrap_or("*")));
+        self.check()?;
+        Ok(Self::answer(self.diagnostics.lock().unwrap().clone()))
+    }
+    async fn rename(
+        &self,
+        _root: &Path,
+        path: &str,
+        at: theodore_ports::Position,
+        new_name: &str,
+    ) -> theodore_ports::CodeIntelResult<Vec<theodore_ports::TextEdit>> {
+        self.record(format!("rename {path}:{}:{} {new_name}", at.line, at.col));
+        self.check()?;
+        Ok(self.renames.lock().unwrap().clone())
+    }
+    async fn install(
+        &self,
+        language: &theodore_ports::LanguageId,
+    ) -> theodore_ports::CodeIntelResult<()> {
+        self.record(format!("install {language}"));
+        Ok(())
+    }
+    async fn file_changed(&self, root: &Path, path: &str) {
+        self.record(format!("file_changed {} {path}", root.display()));
+    }
+    async fn status(
+        &self,
+        root: &Path,
+    ) -> theodore_ports::CodeIntelResult<Vec<theodore_ports::LanguageStatus>> {
+        self.record(format!("status {}", root.display()));
+        Ok(self.status.lock().unwrap().clone())
     }
 }
 
@@ -2354,11 +2879,15 @@ pub struct Fixtures {
     /// the fixture's lifetime, deleted on drop. Never the real home dir.
     pub claude_home: Arc<tempfile::TempDir>,
     pub commands: Arc<FakeCommands>,
+    pub terminals: Arc<FakeTerminals>,
     /// A throwaway `~/.theodore` (the global `config.yaml`).
     pub data_dir: Arc<tempfile::TempDir>,
     /// Wired only by [`Fixtures::deps_with_tools`]; `deps` runs agents
     /// without MCP.
     pub tools: Arc<FakeRunTools>,
+    /// Wired only by [`Fixtures::deps_with_code`]; `deps` has code
+    /// intelligence off.
+    pub code_intel: Arc<FakeCodeIntel>,
 }
 
 impl Fixtures {
@@ -2367,6 +2896,14 @@ impl Fixtures {
         Deps {
             tools: Some(self.tools.clone()),
             ..self.deps()
+        }
+    }
+
+    /// `deps_with_tools` with the [`FakeCodeIntel`] wired in.
+    pub fn deps_with_code(&self) -> Deps {
+        Deps {
+            code_intel: Some(self.code_intel.clone()),
+            ..self.deps_with_tools()
         }
     }
 
@@ -2387,7 +2924,9 @@ impl Fixtures {
             account: self.account.clone(),
             account_client_id: None,
             commands: self.commands.clone(),
+            terminals: self.terminals.clone(),
             data_dir: self.data_dir.path().to_path_buf(),
+            code_intel: None,
         }
     }
 }
@@ -2416,8 +2955,10 @@ pub fn fixtures() -> Fixtures {
         account: FakeAccount::new(),
         claude_home: Arc::new(tempfile::tempdir().expect("tempdir")),
         commands: FakeCommands::new(),
+        terminals: FakeTerminals::new(),
         data_dir: Arc::new(tempfile::tempdir().expect("tempdir")),
         tools: FakeRunTools::new(),
+        code_intel: FakeCodeIntel::new(),
     }
 }
 

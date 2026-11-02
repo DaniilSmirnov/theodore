@@ -1,31 +1,31 @@
 import { stripHtmlComments } from '../highlight';
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import {
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from 'react';
 import {
   ArrowUp,
   Check,
   CircleCheck,
-  CircleStop,
   CodeCommit,
   Comment as CommentIcon,
   Comments as CommentsIcon,
-  Copy,
   FileCode,
   Layers,
   ListCheck,
   Pencil,
   Plus,
   Sparkles,
-  ThumbsDown,
-  ThumbsUp,
   Xmark,
 } from '@gravity-ui/icons';
 import {
-  Alert,
   AvatarGroup,
   Button,
   Card,
   Chip,
-  Disclosure,
   EmptyState,
   Header,
   InputGroup,
@@ -33,7 +33,6 @@ import {
   Tabs,
   TextField,
   Tooltip,
-  Typography,
 } from '@heroui/react';
 import { observer } from 'mobx-react-lite';
 import type {
@@ -51,6 +50,7 @@ import { api } from '../core/api';
 import {
   ask,
   askAboutLine,
+  askPending,
   askRunId,
   cancelRun,
   commitSuggestions,
@@ -67,24 +67,27 @@ import {
 import { useRootStore, useUi } from '../stores/context';
 import type { LineAsk } from '../stores/EphemeralStore';
 import { Md, rich } from '../highlight';
+import { latinKey } from './keys';
 import { useContextMenu, type ContextMenuItem } from './ContextMenu';
 import { ago } from './List';
 import { AgentMenu } from './AgentMenu';
-import { SkillMenu, matchSkills, skillMenuKey } from './SkillMenu';
+import { matchSkills } from './SkillMenu';
+import { useAttachments } from './attachments';
 import {
-  AttachButton,
-  AttachmentStrip,
-  MessageAttachments,
-  fileHandlers,
-  useAttachments,
-} from './attachments';
+  ChatEmpty,
+  ChatLive,
+  ChatLog,
+  ChatMessage as ChatMessageView,
+  UserBubble,
+} from './ChatTurn';
+import { Composer } from './space/Composer';
 import { AgentTag, Avatar, Btn, Sev, Spinner } from './bits';
 import { PatchView } from './Patch';
 import { isAgentEnabled } from './Settings';
 import { SkillsManagerModal } from './Skills';
 import { TaskRow } from './Tasks';
 import { SendToAgent } from './space/SendToAgent';
-import { runningLine, summarizeTools, times, usedLine } from './toolSummary';
+import { ToolCalls } from './ToolCalls';
 
 export type SideTab = 'ai' | 'tasks' | 'threads';
 
@@ -173,71 +176,39 @@ export const SidePanel = observer(function SidePanel({ pr }: { pr: PrId }) {
   );
 });
 
-/** A line ask (asked from the diff) still running: the agent's live text,
- *  or dots until there is some. Its question shows above as a normal
- *  message once synced. */
+/** A line ask (asked from the diff) still running: its question with the
+ *  file:line chip until the stored message shows above (`asked`), then the
+ *  agent's live reply. Stop is the composer's; a stalled one offers Retry. */
 const LineAskBubble = observer(function LineAskBubble({
   askKey,
   a,
+  asked,
+  follow,
 }: {
   askKey: string;
   a: LineAsk;
+  asked: boolean;
+  follow: RefObject<HTMLDivElement | null>;
 }) {
   const store = useRootStore();
-  const run = a.message ? askRunId(a.message) : null;
-  const text = run ? store.ephemeral.agentText.get(run) : undefined;
-  const tools = run ? store.ephemeral.runLog.get(run) : undefined;
-  const stalled = run != null && store.ephemeral.stalled.has(run);
   return (
-    <div className="msg agent line-ask flex gap-3" data-line-ask={askKey}>
-      <div className="flex min-w-0 flex-1 flex-col gap-2 pt-1">
-        <div className="flex items-center gap-2">
-          <AgentTag id={a.agent} />
-          <Ref a={a.anchor} pr={a.pr} />
-        </div>
-        {stalled ? (
-          <Alert status="warning" className="agent-stalled">
-            <Alert.Indicator />
-            <Alert.Content>
-              <Alert.Description className="text-xs">
-                No response in a while — the agent may be stuck.
-              </Alert.Description>
-            </Alert.Content>
-          </Alert>
-        ) : text ? (
-          <div className="text-sm leading-relaxed">
-            <Md text={text} />
-          </div>
-        ) : (
-          <Dots />
-        )}
-        {tools && tools.length > 0 && <ToolCalls tools={tools} running />}
-        <div className="flex gap-1.5">
-          <Button
-            size="sm"
-            variant="ghost"
-            className="h-7 w-fit px-2 text-xs"
-            onPress={() => dismissLineAsk(store, askKey)}
-          >
-            <CircleStop className="size-3.5" />
-            Stop
-          </Button>
-          {stalled && (
-            <Button
-              size="sm"
-              variant="tertiary"
-              className="h-7 w-fit px-2 text-xs"
-              onPress={() => {
-                dismissLineAsk(store, askKey);
-                void askAboutLine(store, a);
-              }}
-            >
-              Retry
-            </Button>
-          )}
-        </div>
-      </div>
-    </div>
+    <>
+      {!asked && (
+        <UserBubble text={a.question} refs={<Ref a={a.anchor} pr={a.pr} />} />
+      )}
+      <ChatLive
+        run={a.message ? askRunId(a.message) : null}
+        agent={a.agent}
+        badges={<Ref a={a.anchor} pr={a.pr} />}
+        follow={follow}
+        className="line-ask"
+        data={{ 'data-line-ask': askKey }}
+        onRetry={() => {
+          dismissLineAsk(store, askKey);
+          void askAboutLine(store, a);
+        }}
+      />
+    </>
   );
 });
 
@@ -304,172 +275,6 @@ function Ref({
   );
 }
 
-/** Typing indicator: three dots, like a messenger. */
-function Dots() {
-  return (
-    <span
-      className="inline-flex h-5 items-center gap-1"
-      aria-label="Agent is thinking"
-    >
-      {[0, 150, 300].map((d) => (
-        <span
-          key={d}
-          className="size-1.5 animate-bounce rounded-full bg-muted"
-          style={{ animationDelay: `${d}ms` }}
-        />
-      ))}
-    </span>
-  );
-}
-
-/** Whether a turn's step list is open, by run id — kept across the remount
- *  when a running turn becomes a finished one. */
-const stepsOpen = new Map<string, boolean>();
-
-/** A turn's tool calls, folded: while the agent works, only the latest step
- *  and a count; once it's done, one `Used Bash ×12, Edit ×4` line. The full
- *  list — back-to-back calls of one tool grouped — opens behind
- *  `Show N steps`. */
-export function ToolCalls({
-  tools,
-  running,
-  turn,
-}: {
-  tools: readonly string[];
-  running: boolean;
-  /** Run id; keeps the list's open state for this turn. */
-  turn?: string;
-}) {
-  const [open, setOpen] = useState(() =>
-    turn ? (stepsOpen.get(turn) ?? false) : false,
-  );
-  const toggle = (next: boolean) => {
-    if (turn) stepsOpen.set(turn, next);
-    setOpen(next);
-  };
-  const s = summarizeTools(tools);
-  const head = running
-    ? s.latest
-      ? runningLine(s.latest)
-      : 'Working…'
-    : usedLine(s) || 'Done';
-  const count = s.steps
-    ? plural(s.steps, 'step', 'steps', 'steps')
-    : plural(s.groups.length, 'line', 'lines', 'lines');
-  return (
-    <Disclosure
-      isExpanded={open}
-      onExpandedChange={toggle}
-      className="rounded-2xl border border-separator"
-    >
-      <Disclosure.Heading>
-        <Disclosure.Trigger className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs">
-          {running ? (
-            <Spinner />
-          ) : (
-            <CircleCheck className="size-3.5 shrink-0 text-success" />
-          )}
-          <span className="min-w-0 flex-1 truncate font-medium" title={head}>
-            {head}
-          </span>
-          <span className="shrink-0 text-muted">
-            {open ? 'Hide' : 'Show'} {count}
-          </span>
-          <Disclosure.Indicator />
-        </Disclosure.Trigger>
-      </Disclosure.Heading>
-      <Disclosure.Content>
-        <Disclosure.Body className="runlog flex flex-col gap-1 px-3 pb-2.5 pt-0 font-mono text-xs text-muted">
-          {s.groups.map((g, i) =>
-            g.kind === 'note' ? (
-              <span key={i} className="italic">
-                {g.text}
-              </span>
-            ) : (
-              <span key={i} className="flex min-w-0 gap-1.5">
-                <span className="shrink-0 text-foreground">
-                  {times(g.tool, g.count)}
-                </span>
-                {g.target && (
-                  <span className="truncate" title={g.target}>
-                    · {g.target}
-                  </span>
-                )}
-                {g.failed > 0 && (
-                  <span className="shrink-0 text-danger">
-                    · {g.failed} failed
-                  </span>
-                )}
-              </span>
-            ),
-          )}
-        </Disclosure.Body>
-      </Disclosure.Content>
-    </Disclosure>
-  );
-}
-
-function MessageActions({
-  text,
-  onRetry,
-}: {
-  text: string;
-  onRetry?: () => void;
-}) {
-  const [vote, setVote] = useState<'up' | 'down' | null>(null);
-  const [copied, setCopied] = useState(false);
-  const act = (
-    label: string,
-    icon: ReactNode,
-    onPress: () => void,
-    on = false,
-  ) => (
-    <Tooltip key={label}>
-      <Button
-        isIconOnly
-        size="sm"
-        variant="ghost"
-        aria-label={label}
-        className={`size-7 min-w-7 ${on ? 'text-foreground' : 'text-muted'}`}
-        onPress={onPress}
-      >
-        {icon}
-      </Button>
-      <Tooltip.Content>{label}</Tooltip.Content>
-    </Tooltip>
-  );
-  return (
-    <div className="-ms-1.5 flex items-center gap-0.5">
-      {act(
-        copied ? 'Copied' : 'Copy',
-        copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />,
-        () => {
-          void navigator.clipboard?.writeText(text);
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1500);
-        },
-      )}
-      {act(
-        'Helpful',
-        <ThumbsUp className="size-3.5" />,
-        () => setVote(vote === 'up' ? null : 'up'),
-        vote === 'up',
-      )}
-      {act(
-        'Not helpful',
-        <ThumbsDown className="size-3.5" />,
-        () => setVote(vote === 'down' ? null : 'down'),
-        vote === 'down',
-      )}
-      {onRetry && (
-        <Btn tone="ghost" className="ms-1 h-7 px-2 text-xs" onPress={onRetry}>
-          Ask again
-        </Btn>
-      )}
-    </div>
-  );
-}
-
 type FeedItem =
   | { kind: 'run'; at: number; run: SkillRun }
   | { kind: 'message'; at: number; message: ChatMessage };
@@ -493,7 +298,7 @@ const RANK = { high: 0, warn: 1, info: 2 } as const;
 
 /** A skill run inside the chat: the live log, then its findings — with a
  *  severity filter and bulk actions so a long list turns into tasks or
- *  review comments in one go. */
+ *  review comments in one go. A running one stops from the composer. */
 const SkillRunView = observer(function SkillRunView({
   pr,
   run,
@@ -549,17 +354,6 @@ const SkillRunView = observer(function SkillRunView({
             </span>
           )}
         </span>
-        {(live || r.status === 'stalled') && (
-          <Button
-            size="sm"
-            variant="ghost"
-            className="cancel-run h-7 px-2 text-xs"
-            onPress={() => void cancelRun(store, run)}
-          >
-            <CircleStop className="size-3.5" />
-            Stop
-          </Button>
-        )}
       </div>
       {live && liveText && (
         <div className="text-sm leading-relaxed">
@@ -826,54 +620,24 @@ export function priorQuestion(
   return '';
 }
 
-/** An agent run that errored, crashed, hit its runtime cap, or was
- *  cancelled (`ChatMessage.failed` set): an inline "stopped" card instead
- *  of a normal reply, with Retry re-sending the question that led to it. */
-const AgentFailedCard = observer(function AgentFailedCard({
-  pr,
-  m,
-  messages,
-}: {
-  pr: PrId;
-  m: ChatMessage;
-  messages: ChatMessage[];
-}) {
-  const store = useRootStore();
-  const question = priorQuestion(messages, m);
-  return (
-    <Alert status="danger" className="agent-failed">
-      <Alert.Indicator />
-      <Alert.Content>
-        <Alert.Description className="text-xs">{m.failed}</Alert.Description>
-        {question && (
-          <div className="mt-2 flex gap-1.5">
-            <Button
-              size="sm"
-              variant="tertiary"
-              onPress={() => {
-                void ask(store, {
-                  pr,
-                  question,
-                  about: null,
-                  group: null,
-                  agent: m.author.kind === 'me' ? null : m.author.agent,
-                }).catch(() => {});
-              }}
-            >
-              Retry
-            </Button>
-          </div>
-        )}
-      </Alert.Content>
-    </Alert>
-  );
-});
+/** The message id behind a chat question's run (`askRunId`'s inverse). */
+const askMessageOf = (run: string) => run.replace(/^ask:/, '');
+
+/** A run going in the chat, for the composer's Stop. */
+interface LiveRun {
+  at: number;
+  stop: () => void;
+}
+
+/** The run the composer's Stop ends: the newest one still going. */
+export function newestRun<T extends { at: number }>(runs: T[]): T | null {
+  return runs.reduce<T | null>((a, b) => (!a || b.at >= a.at ? b : a), null);
+}
 
 const Chat = observer(function Chat({ pr }: { pr: PrId }) {
   const store = useRootStore();
   const [text, setText] = useState('');
   const files = useAttachments();
-  const drop = fileHandlers(files.add);
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [skillAgents, setSkillAgents] = useState<AgentId[]>(AGENTS);
   const [installed, setInstalled] = useState<AgentId[] | null>(null);
@@ -897,16 +661,12 @@ const Chat = observer(function Chat({ pr }: { pr: PrId }) {
       live = false;
     };
   }, [store]);
-  const [hi, setHi] = useState(0);
   const [managing, setManaging] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const [pending, setPending] = useState<{
-    run: string;
-    startedAt: number;
-    /** So a stalled run's Retry can resend the same question. */
-    question: string;
-    agent: AgentId | null;
-  } | null>(null);
+  // The composer's plain send and the hunk header's "Ask agent" (DiffPane)
+  // share this pending bubble via the store — `askPending` sets it,
+  // watches for the reply, and clears it once the real message lands.
+  const pending = store.ephemeral.chatPending.get(pr) ?? null;
   const end = useRef<HTMLDivElement>(null);
   const messages = [...store.models.chatMessages.byPr(pr)].sort(
     (a, b) => a.at - b.at,
@@ -960,19 +720,53 @@ const Chat = observer(function Chat({ pr }: { pr: PrId }) {
     el.setSelectionRange(el.value.length, el.value.length);
     store.ephemeral.consumeComposerFocus(composerFocus);
   }, [composerFocus, store]);
-  // Once an agent message lands after we fired the ask, the pending bubble
-  // has nothing left to show — the real message takes over.
-  useEffect(() => {
-    if (
-      pending &&
-      messages.some((m) => m.author.kind !== 'me' && m.at >= pending.startedAt)
-    ) {
-      setPending(null);
-    }
-  }, [messages, pending]);
+  // Once an agent message lands after the ask, the pending bubble has
+  // nothing left to show: hidden in that same render (never both at once
+  // for a frame); `askPending`'s reaction then clears it from the store.
+  const answered =
+    pending != null &&
+    messages.some((m) => m.author.kind !== 'me' && m.at >= pending.startedAt);
+  const stored = (id: string | null) =>
+    id != null && messages.some((m) => m.id === id);
 
-  const matches = matchSkills(skills, text);
-  useEffect(() => setHi(0), [text]);
+  const stopPending = () => {
+    if (!pending) return;
+    void cancelRun(store, pending.run).catch(() => {});
+    store.ephemeral.clearChatPending(pr);
+  };
+  // Stop in the composer ends the newest run still going here: the
+  // pending question, a line's question, or a skill run.
+  const current = newestRun<LiveRun>([
+    ...(pending && !answered
+      ? [{ at: pending.startedAt, stop: stopPending }]
+      : []),
+    ...lineAsks.map(([key, a]) => ({
+      at: a.startedAt ?? 0,
+      stop: () => dismissLineAsk(store, key),
+    })),
+    ...runs
+      .filter((r) => r.status === 'running')
+      .map((r) => ({
+        at: r.started_at,
+        stop: () => void cancelRun(store, r.id).catch(() => {}),
+      })),
+  ]);
+  // ⌘. stops it too, as in a space — from anywhere while it runs.
+  const stopRef = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    stopRef.current = current?.stop ?? null;
+  });
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || latinKey(e) !== '.') return;
+      const stop = stopRef.current;
+      if (!stop) return;
+      e.preventDefault();
+      stop();
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, []);
 
   const runMatch = (s: SkillInfo) => {
     void runSkill(store, pr, s.id, skillAgents);
@@ -982,12 +776,13 @@ const Chat = observer(function Chat({ pr }: { pr: PrId }) {
   const send = () => {
     const t = text.trim();
     if (!t || files.busy) return;
-    if (matches && matches[hi]) {
-      runMatch(matches[hi]!);
-      return;
-    }
     if (t.startsWith('/')) {
-      void runSkill(store, pr, t.slice(1).split(' ')[0] ?? '', skillAgents);
+      // ⏎ with the list open picks there; the arrow runs the typed name,
+      // or the first skill it matches.
+      const name = t.slice(1).split(' ')[0] ?? '';
+      const skill =
+        skills.find((s) => s.id === name) ?? matchSkills(skills, t)?.[0];
+      void runSkill(store, pr, skill?.id ?? name, skillAgents);
     } else if (lineRef) {
       // About a line: its own status on the line, its own bubble here.
       if (lineAskRunning(store, pr, lineRef)) {
@@ -1005,9 +800,8 @@ const Chat = observer(function Chat({ pr }: { pr: PrId }) {
       store.ephemeral.clearLineRef(pr);
       files.clear();
     } else {
-      const startedAt = Date.now();
       const agent = skillAgents[0] ?? null;
-      void ask(store, {
+      void askPending(store, {
         pr,
         question: t,
         about: null,
@@ -1015,13 +809,23 @@ const Chat = observer(function Chat({ pr }: { pr: PrId }) {
         agent,
         attachments: files.ids.length ? files.ids : null,
       })
-        .then((id) => {
-          files.clear();
-          setPending({ run: askRunId(id), startedAt, question: t, agent });
-        })
+        .then(() => files.clear())
         .catch(() => {});
     }
     setText('');
+  };
+
+  const reAsk = (m: ChatMessage) => {
+    const question = priorQuestion(messages, m);
+    if (!question) return undefined;
+    return () =>
+      void ask(store, {
+        pr,
+        question,
+        about: null,
+        group: null,
+        agent: m.author.kind === 'me' ? null : m.author.agent,
+      }).catch(() => {});
   };
 
   return (
@@ -1039,23 +843,16 @@ const Chat = observer(function Chat({ pr }: { pr: PrId }) {
           }}
         />
       )}
-      <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-auto px-4 py-5">
+      <ChatLog end={end}>
         {messages.length === 0 &&
         runs.length === 0 &&
         !pending &&
         lineAsks.length === 0 ? (
-          <div className="m-auto flex w-full flex-col gap-4">
-            <div className="flex flex-col items-center gap-2 text-center">
-              <span className="grid size-10 place-items-center rounded-full bg-default text-muted">
-                <Sparkles className="size-5" />
-              </span>
-              <Typography.Heading level={6}>
-                Ask about this PR
-              </Typography.Heading>
-              <Typography.Paragraph size="sm" color="muted" align="center">
-                The agent works in a worktree and sees the whole repo.
-              </Typography.Paragraph>
-            </div>
+          <ChatEmpty
+            icon={<Sparkles />}
+            title="Ask about this PR"
+            hint="The agent works in a worktree and sees the whole repo."
+          >
             {skills.length > 0 && (
               <ListBox
                 aria-label="Suggested skills"
@@ -1087,7 +884,7 @@ const Chat = observer(function Chat({ pr }: { pr: PrId }) {
                 ))}
               </ListBox>
             )}
-          </div>
+          </ChatEmpty>
         ) : (
           <>
             {/* Skill runs and chat as one conversation, oldest first. */}
@@ -1095,206 +892,96 @@ const Chat = observer(function Chat({ pr }: { pr: PrId }) {
               item.kind === 'run' ? (
                 <SkillRunView key={item.run.id} pr={pr} run={item.run.id} />
               ) : (
-                ((m) =>
-                  m.author.kind === 'me' ? (
-                    <div
-                      key={m.id}
-                      data-msg={m.id}
-                      className="msg user flex justify-end"
-                    >
-                      <div className="flex max-w-[85%] flex-col items-end gap-1.5">
-                        {m.refs.length > 0 && (
-                          <div className="flex max-w-full flex-wrap justify-end gap-1.5">
-                            {m.refs.map((a, i) => (
-                              <Ref key={i} a={a} pr={pr} />
-                            ))}
-                          </div>
-                        )}
-                        <MessageAttachments
-                          attachments={m.attachments}
-                          align="end"
-                        />
-                        <div className="rich whitespace-pre-wrap rounded-3xl bg-surface px-4 py-2 text-sm">
-                          {rich(m.text)}
-                        </div>
-                      </div>
-                    </div>
-                  ) : (
-                    <div
-                      key={m.id}
-                      data-msg={m.id}
-                      className="msg agent flex gap-3"
-                    >
-                      <div className="flex min-w-0 flex-1 flex-col gap-2 pt-1">
-                        <AgentTag id={m.author.agent} />
-                        {m.failed ? (
-                          <AgentFailedCard pr={pr} m={m} messages={messages} />
-                        ) : (
-                          <>
-                            <div className="text-sm leading-relaxed">
-                              <Md text={m.text} />
-                            </div>
-                            {m.refs.length > 0 && (
-                              <div className="flex flex-wrap gap-1.5">
-                                {m.refs.map((a, i) => (
-                                  <Ref key={i} a={a} pr={pr} />
-                                ))}
-                              </div>
-                            )}
-                            <MessageActions
-                              text={m.text}
-                              onRetry={() => {
-                                const q = priorQuestion(messages, m);
-                                const agent =
-                                  m.author.kind === 'me'
-                                    ? null
-                                    : m.author.agent;
-                                if (q)
-                                  void ask(store, {
-                                    pr,
-                                    question: q,
-                                    about: null,
-                                    group: null,
-                                    agent,
-                                  }).catch(() => {});
-                              }}
-                            />
-                          </>
-                        )}
-                      </div>
-                    </div>
-                  ))(item.message)
+                <ChatMessageView
+                  key={item.message.id}
+                  m={item.message}
+                  refs={
+                    item.message.refs.length > 0
+                      ? item.message.refs.map((a, i) => (
+                          <Ref key={i} a={a} pr={pr} />
+                        ))
+                      : undefined
+                  }
+                  onAskAgain={reAsk(item.message)}
+                  onRetryFailed={reAsk(item.message)}
+                />
               ),
             )}
-            {pending &&
-              (() => {
-                const stalled = store.ephemeral.stalled.has(pending.run);
-                const stop = () => {
-                  void cancelRun(store, pending.run);
-                  setPending(null);
-                };
-                return (
-                  <div className="msg agent flex gap-3">
-                    <div className="flex min-w-0 flex-1 flex-col gap-2 pt-1">
-                      {stalled ? (
-                        <Alert status="warning" className="agent-stalled">
-                          <Alert.Indicator />
-                          <Alert.Content>
-                            <Alert.Description className="text-xs">
-                              No response in a while — the agent may be stuck.
-                            </Alert.Description>
-                          </Alert.Content>
-                        </Alert>
-                      ) : store.ephemeral.agentText.get(pending.run) ? (
-                        <div className="text-sm leading-relaxed">
-                          <Md
-                            text={store.ephemeral.agentText.get(pending.run)!}
-                          />
-                        </div>
-                      ) : (
-                        <Dots />
-                      )}
-                      {(store.ephemeral.runLog.get(pending.run)?.length ?? 0) >
-                        0 && (
-                        <ToolCalls
-                          tools={store.ephemeral.runLog.get(pending.run)!}
-                          running
-                          turn={pending.run}
-                        />
-                      )}
-                      <div className="flex gap-1.5">
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          className="h-7 w-fit px-2 text-xs"
-                          onPress={stop}
-                        >
-                          <CircleStop className="size-3.5" />
-                          Stop
-                        </Button>
-                        {stalled && (
-                          <Button
-                            size="sm"
-                            variant="tertiary"
-                            className="h-7 w-fit px-2 text-xs"
-                            onPress={() => {
-                              const { question, agent } = pending;
-                              stop();
-                              const startedAt = Date.now();
-                              void ask(store, {
-                                pr,
-                                question,
-                                about: null,
-                                group: null,
-                                agent,
-                              })
-                                .then((id) =>
-                                  setPending({
-                                    run: askRunId(id),
-                                    startedAt,
-                                    question,
-                                    agent,
-                                  }),
-                                )
-                                .catch(() => {});
-                            }}
-                          >
-                            Retry
-                          </Button>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })()}
+            {pending && !answered && (
+              <>
+                {/* The question, until its stored message shows above. */}
+                {!stored(askMessageOf(pending.run)) && (
+                  <UserBubble text={pending.question} />
+                )}
+                <ChatLive
+                  run={pending.run}
+                  agent={pending.agent}
+                  follow={end}
+                  className="chat-pending"
+                  onRetry={() => {
+                    const { question, agent } = pending;
+                    stopPending();
+                    void askPending(store, {
+                      pr,
+                      question,
+                      about: null,
+                      group: null,
+                      agent,
+                    }).catch(() => {});
+                  }}
+                />
+              </>
+            )}
             {lineAsks.map(([key, a]) => (
-              <LineAskBubble key={key} askKey={key} a={a} />
+              <LineAskBubble
+                key={key}
+                askKey={key}
+                a={a}
+                asked={stored(a.message)}
+                follow={end}
+              />
             ))}
           </>
         )}
-        <div ref={end} />
-      </div>
+      </ChatLog>
 
-      <div
-        className="chat-input flex flex-col gap-2.5 px-4 pb-3 pt-1"
-        onDragOver={drop.onDragOver}
-        onDrop={drop.onDrop}
-      >
-        {matches && matches.length > 0 && (
-          <SkillMenu
-            matches={matches}
-            hi={hi}
-            onHover={setHi}
-            onPick={runMatch}
-            footer={
-              <div className="flex items-center gap-1 ps-3 pt-1 text-xs text-muted">
-                <span className="min-w-0 truncate">
-                  Runs on {skillAgents.join(' + ')}
-                </span>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="manage-skills ms-auto shrink-0 gap-1.5 text-xs text-muted"
-                  onPress={() => setManaging(true)}
-                >
-                  <Pencil className="size-3.5" />
-                  Manage skills…
-                </Button>
-              </div>
-            }
-          />
-        )}
-        <TextField
-          fullWidth
-          aria-label="Ask the agent"
+      <div className="chat-input flex flex-col gap-2 px-4 pb-3 pt-1">
+        <Composer
+          inputRef={inputRef}
           value={text}
           onChange={setText}
-        >
-          <InputGroup
-            fullWidth
-            className="flex flex-col gap-2 rounded-3xl py-2.5"
-          >
-            {lineRef && (
+          onSubmit={send}
+          label="Ask the agent"
+          placeholder={
+            lineRef
+              ? `Ask about ${refLabel(lineRef)}`
+              : 'Ask about the code, or / to run a skill'
+          }
+          requireText
+          sendWhileRunning
+          running={current != null}
+          onStop={current?.stop}
+          skills={skills}
+          onPickSkill={runMatch}
+          skillFooter={
+            <div className="flex items-center gap-1 ps-3 pt-1 text-xs text-muted">
+              <span className="min-w-0 truncate">
+                Runs on {skillAgents.join(' + ')}
+              </span>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="manage-skills ms-auto shrink-0 gap-1.5 text-xs text-muted"
+                onPress={() => setManaging(true)}
+              >
+                <Pencil className="size-3.5" />
+                Manage skills…
+              </Button>
+            </div>
+          }
+          attachments={files}
+          strip={
+            lineRef && (
               <div className="line-ref flex w-full px-3 pb-1">
                 <Ref
                   a={lineRef}
@@ -1305,81 +992,26 @@ const Chat = observer(function Chat({ pr }: { pr: PrId }) {
                   }}
                 />
               </div>
-            )}
-            <AttachmentStrip at={files} />
-            <InputGroup.TextArea
-              ref={inputRef}
-              rows={2}
-              onPaste={drop.onPaste}
-              className="w-full resize-none px-4 py-0"
-              placeholder={
-                lineRef
-                  ? `Ask about ${refLabel(lineRef)}`
-                  : 'Ask about the code, or / to run a skill'
-              }
-              onKeyDown={(e) => {
-                if (
-                  skillMenuKey(e, matches, hi, setHi, runMatch, () =>
-                    setText(''),
-                  )
-                ) {
-                  return;
-                }
-                // Backspace in an empty box takes the line chip back out.
-                if (e.key === 'Backspace' && lineRef && !text) {
-                  e.preventDefault();
-                  store.ephemeral.clearLineRef(pr);
-                  return;
-                }
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault();
-                  send();
-                }
-              }}
+            )
+          }
+          // Backspace in an empty box takes the line chip back out.
+          onEmptyBackspace={
+            lineRef ? () => store.ephemeral.clearLineRef(pr) : undefined
+          }
+          chips={
+            /* Only agents installed on this computer and not disabled in
+               Settings → Agents are offered. */
+            <AgentMenu
+              multiple
+              agents={(installed ?? AGENTS).filter((a) =>
+                isAgentEnabled(store, a),
+              )}
+              selected={skillAgents}
+              onSelect={setSkillAgents}
             />
-            <InputGroup.Suffix className="flex w-full items-center gap-1.5 px-2.5 py-0">
-              <AttachButton onFiles={files.add} />
-              <Tooltip>
-                <Button
-                  isIconOnly
-                  size="sm"
-                  variant="tertiary"
-                  aria-label="Skills"
-                  className="slash-btn shrink-0 rounded-full font-mono"
-                  onPress={() => {
-                    setText(text === '/' ? '' : '/');
-                    inputRef.current?.focus();
-                  }}
-                >
-                  /
-                </Button>
-                <Tooltip.Content>Skills</Tooltip.Content>
-              </Tooltip>
-              {/* Only agents installed on this computer and not disabled
-                  in Settings → Agents are offered. */}
-              <AgentMenu
-                multiple
-                agents={(installed ?? AGENTS).filter((a) =>
-                  isAgentEnabled(store, a),
-                )}
-                selected={skillAgents}
-                onSelect={setSkillAgents}
-              />
-              <span className="flex-1" />
-              <Button
-                isIconOnly
-                size="sm"
-                aria-label="Send"
-                className="shrink-0 rounded-full"
-                isDisabled={!text.trim()}
-                onPress={send}
-              >
-                <ArrowUp className="size-4" />
-              </Button>
-            </InputGroup.Suffix>
-          </InputGroup>
-        </TextField>
-        <div className="flex items-center gap-2 text-xs text-muted">
+          }
+        />
+        <div className="flex items-center gap-2 px-2 text-xs text-muted">
           <span className="min-w-0 truncate">The agent can be wrong</span>
         </div>
       </div>

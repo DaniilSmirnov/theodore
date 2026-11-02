@@ -110,20 +110,26 @@ impl CommandPort for ShellRunner {
     }
 
     async fn reap_group(&self, pgid: u32, grace: Duration) {
-        signal_group(pgid, "-TERM").await;
-        let deadline = tokio::time::Instant::now() + grace;
-        while tokio::time::Instant::now() < deadline {
-            if !group_alive(pgid).await {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        signal_group(pgid, "-KILL").await;
+        terminate_group(pgid, grace).await;
     }
 }
 
+/// SIGTERM a process group, `grace` to exit, then SIGKILL — the discipline
+/// every command and the space terminal's PTY (`pty.rs`) kill a group with.
+pub(crate) async fn terminate_group(pgid: u32, grace: Duration) {
+    signal_group(pgid, "-TERM").await;
+    let deadline = tokio::time::Instant::now() + grace;
+    while tokio::time::Instant::now() < deadline {
+        if !group_alive(pgid).await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    signal_group(pgid, "-KILL").await;
+}
+
 /// Whether a process (any process, not necessarily ours) exists at `pid`.
-async fn group_alive(pid: u32) -> bool {
+pub(crate) async fn group_alive(pid: u32) -> bool {
     Command::new("ps")
         .args(["-p", &pid.to_string()])
         .stdin(Stdio::null())
@@ -189,7 +195,7 @@ async fn terminate(child: &mut Child, grace: Duration) {
     let _ = child.wait().await;
 }
 
-async fn signal_group(pid: u32, signal: &str) {
+pub(crate) async fn signal_group(pid: u32, signal: &str) {
     let _ = Command::new("kill")
         .arg(signal)
         .arg(format!("-{pid}"))

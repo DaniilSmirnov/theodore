@@ -6,6 +6,13 @@
 //! shapes are long-documented Claude Code stream-json content blocks but were
 //! not exercised live here (sandboxed shell denied a tool-using prompt); see
 //! `tests/fixtures/claude_tool_call.jsonl`, built from that documented shape.
+//!
+//! A steerable run (`build_steerable_args`, docs/spaces.md §8 "Send now")
+//! reads its messages from stdin instead (`--input-format stream-json
+//! --replay-user-messages`, 2.1.312): one written while it works is taken at
+//! its next step, in the same turn, and echoed back (`isReplay`) when taken.
+//! One that lands as the turn ends starts another turn in the same process
+//! and session; the run is done once every message was taken and answered.
 
 use std::path::Path;
 
@@ -14,6 +21,7 @@ use theodore_domain::Usage;
 use theodore_ports::agent::{AgentEvent, AgentMode, AgentRequest};
 
 use crate::config::AgentBinaryConfig;
+use crate::edit_guard;
 use crate::process::LineParser;
 
 /// The `--mcp-config` JSON, including the bearer token in its `headers`.
@@ -63,15 +71,65 @@ pub fn build_args(
     cfg: &AgentBinaryConfig,
     mcp_config_path: Option<&Path>,
 ) -> Vec<String> {
-    let mut args = vec![
-        "-p".to_string(),
-        req.prompt.clone(),
+    args_with(
+        req,
+        cfg,
+        mcp_config_path,
+        edit_guard::installed_exe(),
+        false,
+    )
+}
+
+/// `build_args` with `guard` as the edit hook's binary (`edit_guard`).
+#[cfg(test)]
+fn build_args_guarded(
+    req: &AgentRequest,
+    cfg: &AgentBinaryConfig,
+    mcp_config_path: Option<&Path>,
+    guard: Option<&Path>,
+) -> Vec<String> {
+    args_with(req, cfg, mcp_config_path, guard, false)
+}
+
+/// [`build_args`] for a run that reads its messages from stdin: the prompt
+/// goes in as the first one ([`user_message_line`]), not in argv.
+pub fn build_steerable_args(
+    req: &AgentRequest,
+    cfg: &AgentBinaryConfig,
+    mcp_config_path: Option<&Path>,
+) -> Vec<String> {
+    args_with(req, cfg, mcp_config_path, edit_guard::installed_exe(), true)
+}
+
+/// One message of yours in `--input-format stream-json`.
+pub fn user_message_line(text: &str) -> String {
+    serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": text },
+    })
+    .to_string()
+}
+
+fn args_with(
+    req: &AgentRequest,
+    cfg: &AgentBinaryConfig,
+    mcp_config_path: Option<&Path>,
+    guard: Option<&Path>,
+    stdin_input: bool,
+) -> Vec<String> {
+    let mut args = vec!["-p".to_string()];
+    if stdin_input {
+        args.extend(["--input-format", "stream-json", "--replay-user-messages"].map(String::from));
+    } else {
+        args.push(req.prompt.clone());
+    }
+    args.extend([
         "--output-format".to_string(),
         "stream-json".to_string(),
         "--verbose".to_string(),
         "--permission-prompts".to_string(),
         "none".to_string(),
-    ];
+    ]);
     // Text deltas as the answer is generated (`stream_event` lines), on
     // top of the per-message events (2.1.312: `-p` + stream-json only).
     if req.stream_text {
@@ -127,10 +185,11 @@ pub fn build_args(
             args.push("Bash,Edit,Write,MultiEdit,NotebookEdit".to_string());
         }
         AgentMode::Edit => {
+            // No bare `Edit`/`Write` here: allowed outright they reach any
+            // path. `acceptEdits` takes edits in the working directories
+            // only, and `edit_settings` names those.
             args.push("--allowedTools".to_string());
-            args.push(format!(
-                "{READ_TOOLS},Edit,Write,MultiEdit,NotebookEdit,Bash,{mcp_tools}"
-            ));
+            args.push(format!("{READ_TOOLS},Bash,{mcp_tools}"));
             args.push("--permission-mode".to_string());
             args.push("acceptEdits".to_string());
         }
@@ -139,6 +198,10 @@ pub fn build_args(
             args.push("--permission-mode".to_string());
             args.push("bypassPermissions".to_string());
         }
+    }
+    if let Some(settings) = edit_settings(req, guard) {
+        args.push("--settings".to_string());
+        args.push(settings);
     }
     if let Some(model) = req.model.as_ref().or(cfg.model.as_ref()) {
         args.push("--model".to_string());
@@ -161,6 +224,50 @@ pub fn build_args(
     }
     args.extend(cfg.extra_args.iter().cloned());
     args
+}
+
+/// The tools that write files; one `PreToolUse` matcher for all of them.
+const EDIT_TOOLS: &str = "Edit|Write|MultiEdit|NotebookEdit";
+
+/// Edit and Run: the `--settings` that keep the file-edit tools inside
+/// the worktree and the attachment dirs (docs/spaces.md §5). Edit names
+/// them as the only places edits are allowed; both modes get the
+/// `edit_guard` hook, which also holds under `bypassPermissions`. Shell
+/// commands are not limited.
+fn edit_settings(req: &AgentRequest, guard: Option<&Path>) -> Option<String> {
+    if req.mode == AgentMode::ReadOnly {
+        return None;
+    }
+    let mut roots = vec![req.cwd.clone()];
+    roots.extend(attachment_dirs(req).into_iter().map(Path::to_path_buf));
+    let mut settings = serde_json::json!({});
+    if req.mode == AgentMode::Edit {
+        let mut allow: Vec<String> = Vec::new();
+        for root in &roots {
+            // As given and with symlinks resolved (`/tmp` → `/private/tmp`).
+            let real = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+            for form in [root, &real] {
+                // `//` = an absolute path in Claude Code's rule syntax.
+                let rule = format!("Edit(/{}/**)", form.display());
+                if !allow.contains(&rule) {
+                    allow.push(rule);
+                }
+            }
+        }
+        settings["permissions"] = serde_json::json!({ "allow": allow });
+    }
+    if let Some(exe) = guard {
+        settings["hooks"] = serde_json::json!({
+            "PreToolUse": [{
+                "matcher": EDIT_TOOLS,
+                "hooks": [{
+                    "type": "command",
+                    "command": crate::edit_guard::hook_command(exe, &roots),
+                }],
+            }],
+        });
+    }
+    (settings != serde_json::json!({})).then(|| settings.to_string())
 }
 
 /// Each attachment's directory, once, in order.
@@ -189,11 +296,66 @@ pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 pub const ULTRACODE: &str = "ultracode";
 
 #[derive(Debug, Default)]
-pub struct ClaudeParser;
+pub struct ClaudeParser {
+    /// The run reads its messages from stdin (a steerable run).
+    stdin_input: bool,
+    /// Messages written to stdin the CLI hasn't echoed back as taken yet.
+    pending: u32,
+    /// What the run's turns answered so far, while messages are pending.
+    answers: Vec<String>,
+    usage: Usage,
+    /// Turns finished in this run and not reported yet.
+    results: u32,
+}
 
 impl ClaudeParser {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// For [`build_steerable_args`]: `Done` only once every written message
+    /// was taken and answered, with every answer in it.
+    pub fn with_stdin_input() -> Self {
+        Self {
+            stdin_input: true,
+            ..Self::default()
+        }
+    }
+
+    fn on_stdin_line(&mut self, line: &str) -> Vec<AgentEvent> {
+        if let Ok(v) = serde_json::from_str::<Value>(line.trim())
+            && v.get("type").and_then(Value::as_str) == Some("user")
+            && v.get("isReplay").and_then(Value::as_bool) == Some(true)
+        {
+            // One of ours, taken into the conversation.
+            self.pending = self.pending.saturating_sub(1);
+            return vec![];
+        }
+        let mut out = Vec::new();
+        for ev in parse_line(line) {
+            match ev {
+                AgentEvent::Done { final_text, usage } => {
+                    if !final_text.is_empty() {
+                        self.answers.push(final_text);
+                    }
+                    self.usage += usage;
+                    self.results += 1;
+                    if self.pending == 0 {
+                        out.push(self.done());
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    fn done(&mut self) -> AgentEvent {
+        self.results = 0;
+        AgentEvent::Done {
+            final_text: std::mem::take(&mut self.answers).join("\n\n"),
+            usage: std::mem::take(&mut self.usage),
+        }
     }
 }
 
@@ -385,10 +547,18 @@ fn claude_usage(u: &Value, usd: f64) -> Usage {
 
 impl LineParser for ClaudeParser {
     fn on_line(&mut self, line: &str) -> Vec<AgentEvent> {
+        if self.stdin_input {
+            return self.on_stdin_line(line);
+        }
         parse_line(line)
     }
 
     fn on_exit(&mut self, success: bool, stderr_tail: &str) -> AgentEvent {
+        // A steerable run whose input was closed while a message was still
+        // pending: its answers so far are the turn's.
+        if success && self.results > 0 {
+            return self.done();
+        }
         AgentEvent::Error {
             message: if success {
                 "claude exited without a final result event".to_string()
@@ -397,6 +567,14 @@ impl LineParser for ClaudeParser {
             },
             stderr_tail: stderr_tail.to_string(),
         }
+    }
+
+    fn on_input(&mut self) {
+        self.pending += 1;
+    }
+
+    fn awaiting_input(&self) -> bool {
+        self.pending > 0 && self.results > 0
     }
 
     /// `system` / `api_retry` events: Claude Code retrying its API.
@@ -793,6 +971,75 @@ mod run_mode_tests {
         // bypassPermissions already allows every tool; no allowlist to widen.
         assert!(!args.iter().any(|a| a == "--allowedTools"));
     }
+
+    fn settings_of(args: &[String]) -> Option<serde_json::Value> {
+        let i = args.iter().position(|a| a == "--settings")?;
+        Some(serde_json::from_str(&args[i + 1]).unwrap())
+    }
+
+    /// Edit and Run: the file-edit tools stay in the worktree and the
+    /// attachment dirs (docs/spaces.md §5); a review run gets nothing.
+    #[test]
+    fn edits_are_kept_inside_the_worktree_and_attachments() {
+        let mut req = AgentRequest {
+            agent: theodore_domain::AgentId::Claude,
+            prompt: "p".into(),
+            system: None,
+            cwd: "/data/spaces/a1".into(),
+            mode: AgentMode::Edit,
+            mcp: None,
+            model: None,
+            effort: None,
+            stall_after_ms: 1000,
+            env: Vec::new(),
+            user_mcp: false,
+            attachments: vec![theodore_ports::AgentAttachment {
+                path: "/data/attachments/x/shot.png".into(),
+                mime: "image/png".into(),
+            }],
+            resume: None,
+            stream_text: false,
+        };
+        let exe = Path::new("/Applications/Theodore.app/Contents/MacOS/theodore");
+
+        let args = build_args_guarded(&req, &Default::default(), None, Some(exe));
+        let i = args.iter().position(|a| a == "--allowedTools").unwrap();
+        let allowed: Vec<&str> = args[i + 1].split(',').collect();
+        for bare in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
+            assert!(!allowed.contains(&bare), "{bare} would reach any path");
+        }
+        assert!(allowed.contains(&"Bash"));
+        let s = settings_of(&args).expect("settings");
+        assert_eq!(
+            s["permissions"]["allow"],
+            serde_json::json!(["Edit(//data/spaces/a1/**)", "Edit(//data/attachments/x/**)"])
+        );
+        let hook = &s["hooks"]["PreToolUse"][0];
+        assert_eq!(hook["matcher"], "Edit|Write|MultiEdit|NotebookEdit");
+        assert_eq!(
+            hook["hooks"][0]["command"],
+            "'/Applications/Theodore.app/Contents/MacOS/theodore' --theodore-edit-guard \
+             '/data/spaces/a1' '/data/attachments/x'"
+        );
+
+        // Run: no allow rules (everything is allowed), the hook still holds.
+        req.mode = AgentMode::Run;
+        let s = settings_of(&build_args_guarded(
+            &req,
+            &Default::default(),
+            None,
+            Some(exe),
+        ))
+        .expect("settings");
+        assert!(s.get("permissions").is_none());
+        assert!(s["hooks"]["PreToolUse"][0]["hooks"][0]["command"].is_string());
+        // A binary that never installed the guard offers no hook.
+        assert!(settings_of(&build_args_guarded(&req, &Default::default(), None, None)).is_none());
+
+        req.mode = AgentMode::ReadOnly;
+        let args = build_args_guarded(&req, &Default::default(), None, Some(exe));
+        assert!(settings_of(&args).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -943,5 +1190,109 @@ mod model_and_effort_tests {
             .map(|w| w[1].as_str())
             .collect();
         assert_eq!(dirs, ["/data/attachments/a", "/data/attachments/b"]);
+    }
+
+    // ── steerable runs (stdin input) ────────────────────────────────────
+
+    fn replay(text: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": text },
+            "isReplay": true,
+        })
+        .to_string()
+    }
+
+    fn result(text: &str) -> String {
+        serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "result": text, "session_id": "S",
+            "usage": { "input_tokens": 1, "output_tokens": 2 },
+        })
+        .to_string()
+    }
+
+    fn done_text(events: &[AgentEvent]) -> Option<String> {
+        events.iter().find_map(|e| match e {
+            AgentEvent::Done { final_text, .. } => Some(final_text.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_steerable_run_takes_the_prompt_from_stdin() {
+        let r = req(None, None);
+        let args = build_steerable_args(&r, &Default::default(), None);
+        assert_eq!(args[0], "-p");
+        assert_eq!(
+            flag(&args, "--input-format").as_deref(),
+            Some("stream-json")
+        );
+        assert!(args.contains(&"--replay-user-messages".to_string()));
+        assert!(!args.contains(&r.prompt), "the prompt goes in on stdin");
+        let line: Value = serde_json::from_str(&user_message_line("fix \"it\"")).unwrap();
+        assert_eq!(line["type"], "user");
+        assert_eq!(line["message"]["content"], "fix \"it\"");
+    }
+
+    #[test]
+    fn a_message_taken_mid_turn_ends_in_one_done() {
+        let mut p = ClaudeParser::with_stdin_input();
+        p.on_input();
+        assert!(p.on_line(&replay("first")).is_empty());
+        p.on_input(); // steered while the tool ran
+        assert!(p.on_line(&replay("also this")).is_empty());
+        assert!(!p.awaiting_input());
+        let events = p.on_line(&result("did both"));
+        assert_eq!(done_text(&events).as_deref(), Some("did both"));
+    }
+
+    #[test]
+    fn a_message_landing_as_the_turn_ends_waits_for_its_own_answer() {
+        let mut p = ClaudeParser::with_stdin_input();
+        p.on_input();
+        p.on_line(&replay("first"));
+        p.on_input(); // written, not taken yet
+        let events = p.on_line(&result("one"));
+        assert_eq!(done_text(&events), None, "held for the second message");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Session { .. }))
+        );
+        assert!(p.awaiting_input());
+        p.on_line(&replay("second"));
+        assert!(!p.awaiting_input());
+        let events = p.on_line(&result("two"));
+        assert_eq!(done_text(&events).as_deref(), Some("one\n\ntwo"));
+        let usage = events.iter().find_map(|e| match e {
+            AgentEvent::Done { usage, .. } => Some(*usage),
+            _ => None,
+        });
+        assert_eq!(usage.unwrap().output_tokens, 4, "both turns counted");
+    }
+
+    #[test]
+    fn closed_input_with_a_held_answer_still_ends_in_done() {
+        let mut p = ClaudeParser::with_stdin_input();
+        p.on_input();
+        p.on_line(&replay("first"));
+        p.on_input();
+        p.on_line(&result("one"));
+        match p.on_exit(true, "") {
+            AgentEvent::Done { final_text, .. } => assert_eq!(final_text, "one"),
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_results_are_not_taken_for_replays() {
+        let mut p = ClaudeParser::with_stdin_input();
+        p.on_input();
+        let tool = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"ok"}]}}"#;
+        let events = p.on_line(tool);
+        assert!(matches!(events.as_slice(), [AgentEvent::ToolResult { .. }]));
+        p.on_line(&result("x"));
+        assert!(p.awaiting_input(), "the prompt itself was never echoed");
     }
 }

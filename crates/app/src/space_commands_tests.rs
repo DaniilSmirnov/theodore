@@ -13,7 +13,7 @@ use theodore_contract::{
     SpaceStatus, SpaceTrustRequest, models,
 };
 use theodore_domain::{AgentId, Sha, Usage};
-use theodore_ports::{AgentEvent, Store};
+use theodore_ports::{AgentEvent, AgentMode, Store};
 
 use crate::testkit::{FakeScript, Fixtures, fixtures};
 use crate::{Core, Receivers};
@@ -31,7 +31,7 @@ pub(crate) async fn wait_until(mut cond: impl FnMut() -> bool) {
 pub(crate) struct Env {
     pub f: Fixtures,
     pub core: Core,
-    _recv: Receivers,
+    pub recv: Receivers,
     pub project: Project,
     folder: tempfile::TempDir,
     _spaces: tempfile::TempDir,
@@ -45,11 +45,16 @@ async fn started() -> Env {
 
 /// `started`, with `tools`: the fake MCP registry wired in.
 pub(crate) async fn start_env(tools: bool) -> Env {
+    start_env_with(|f| if tools { f.deps_with_tools() } else { f.deps() }).await
+}
+
+/// `started` with the deps `deps` picks from the fixtures.
+pub(crate) async fn start_env_with(deps: impl FnOnce(&Fixtures) -> crate::Deps) -> Env {
     let f = fixtures();
     let folder = tempfile::tempdir().unwrap();
     let spaces = tempfile::tempdir().unwrap();
     f.git.set_space_root(spaces.path());
-    let (core, recv) = Core::start(if tools { f.deps_with_tools() } else { f.deps() });
+    let (core, recv) = Core::start(deps(&f));
     tokio::time::sleep(Duration::from_millis(30)).await;
     let project = core
         .add_project(AddProjectRequest {
@@ -77,7 +82,7 @@ pub(crate) async fn start_env(tools: bool) -> Env {
     Env {
         f,
         core,
-        _recv: recv,
+        recv,
         project,
         folder,
         _spaces: spaces,
@@ -275,10 +280,27 @@ async fn no_setup_means_the_goal_runs_at_once() {
     let e = started().await;
     e.f.agents.push_script(done("ok"));
     let s = e.create("Fix it").await;
-    assert_eq!(s.setup, None);
-    assert!(s.ports.is_empty());
+    // Zero config still gets the defaults: 2 ports, and a note that this
+    // empty fixture folder has no `.env*` to copy — but no command to
+    // wait on, so the goal still runs at once.
+    let setup = s.setup.clone().expect("a copy note");
+    assert_eq!(setup.status, SetupStatus::Done);
+    assert!(!setup.goal_pending);
+    assert!(setup.notes.iter().any(|n| n.contains(".env*")), "{setup:?}");
+    assert_eq!(s.ports.len(), 2);
     e.until(&s.id, |s| s.turns == 1).await;
     assert!(e.f.commands.specs().is_empty());
+}
+
+#[tokio::test]
+async fn explicit_copy_and_ports_turn_the_defaults_off() {
+    let e = started().await;
+    e.global("spaces: {copy: [], ports: 0}");
+    e.f.agents.push_script(done("ok"));
+    let s = e.create("Fix it").await;
+    assert_eq!(s.setup, None, "no note: copy is off, not just unmatched");
+    assert!(s.ports.is_empty());
+    e.until(&s.id, |s| s.turns == 1).await;
 }
 
 #[tokio::test]
@@ -829,4 +851,99 @@ async fn run_reports_a_port_already_held_instead_of_crashing() {
             .with_runtime(&s.id, |rt| rt.logs.iter().any(|l| l.line == message)),
         "the run log explains it"
     );
+}
+
+#[tokio::test]
+async fn set_up_with_agent_sends_a_turn_to_write_the_spaces_section() {
+    let e = started().await;
+    e.global("spaces: {copy: [], ports: 0}");
+    let s = e.create("").await;
+    assert_eq!(s.setup, None, "nothing configured, nothing to wait on");
+
+    e.f.agents
+        .push_script(done("added spaces: setup, run, check"));
+    e.core.space_setup_assist(&s.id).await.unwrap();
+    e.until(&s.id, |s| s.turns == 1).await;
+
+    let req = e.f.agents.last_request().expect("the turn ran");
+    assert_eq!(req.mode, AgentMode::Edit, "it must be able to write files");
+    assert!(
+        req.prompt.contains(".theodore/config.yaml"),
+        "{}",
+        req.prompt
+    );
+    assert!(req.prompt.contains("spaces:"), "{}", req.prompt);
+    assert!(req.prompt.contains("$THEODORE_PORT"), "{}", req.prompt);
+    for word in ["setup", "run", "check", "archive", "copy", "ports"] {
+        assert!(
+            req.prompt.contains(word),
+            "{word:?} missing: {}",
+            req.prompt
+        );
+    }
+}
+
+#[tokio::test]
+async fn fix_with_agent_quotes_the_failure_and_leaves_setup_retryable() {
+    let e = started().await;
+    e.global("spaces: {setup: make setup}");
+    e.f.commands.on(
+        "make setup",
+        FakeScript::Exit {
+            lines: vec!["no make".into()],
+            code: 3,
+        },
+    );
+    let s = e.create("Fix it").await;
+    let s = e
+        .until(&s.id, |s| setup_status(s) == Some(SetupStatus::Failed))
+        .await;
+    assert!(
+        s.setup.as_ref().unwrap().goal_pending,
+        "the goal still waits"
+    );
+
+    e.f.agents.push_script(done("fixed the Makefile"));
+    let s = e.core.space_fix_setup(&s.id).await.unwrap();
+    assert_eq!(
+        setup_status(&s),
+        Some(SetupStatus::Failed),
+        "setup itself is untouched: Retry / Continue without setup stay put"
+    );
+    e.until(&s.id, |s| s.turns == 1).await;
+
+    let req = e.f.agents.last_request().expect("the fix turn ran");
+    assert_eq!(req.mode, AgentMode::Edit);
+    assert!(req.prompt.contains("make setup"), "{}", req.prompt);
+    assert!(req.prompt.contains("setup exited with 3"), "{}", req.prompt);
+    assert!(req.prompt.contains("no make"), "{}", req.prompt);
+
+    // Retry still works, and the goal it was waiting on finally runs.
+    e.f.commands.on(
+        "make setup",
+        FakeScript::Exit {
+            lines: vec![],
+            code: 0,
+        },
+    );
+    e.f.agents.push_script(done("ok"));
+    e.core
+        .space_setup(SpaceSetupRequest {
+            space: s.id.clone(),
+            action: SetupAction::Retry,
+        })
+        .await
+        .unwrap();
+    e.until(&s.id, |s| {
+        setup_status(s) == Some(SetupStatus::Done) && s.turns == 2
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn fix_with_agent_refuses_when_setup_has_not_failed() {
+    let e = started().await;
+    let s = e.create("").await;
+    let err = e.core.space_fix_setup(&s.id).await.unwrap_err();
+    assert!(err.to_string().contains("hasn't failed"), "{err}");
 }

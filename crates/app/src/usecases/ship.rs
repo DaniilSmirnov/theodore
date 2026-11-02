@@ -43,8 +43,18 @@ impl Core {
     /// as it is now; an opened PR lands on `space.pr` once the outbox item
     /// runs.
     pub async fn ship_space(&self, req: ShipSpaceRequest) -> AppResult<Space> {
+        self.ship_space_as(req, None).await
+    }
+
+    /// `ship_space` asked for by the agent of the turn `turn` (the `ship`
+    /// tool): the space is running that very turn, which doesn't block it.
+    pub(crate) async fn ship_space_as(
+        &self,
+        req: ShipSpaceRequest,
+        turn: Option<&str>,
+    ) -> AppResult<Space> {
         let how = crate::usecases::telemetry::wire_str(&req.action);
-        let result = self.ship_space_inner(req).await;
+        let result = self.ship_space_inner(req, turn).await;
         match &result {
             Ok(_) => {
                 theodore_telemetry::product(theodore_telemetry::ProductEvent::SpaceShipped { how })
@@ -60,10 +70,16 @@ impl Core {
         result
     }
 
-    async fn ship_space_inner(&self, req: ShipSpaceRequest) -> AppResult<Space> {
+    async fn ship_space_inner(
+        &self,
+        req: ShipSpaceRequest,
+        turn: Option<&str>,
+    ) -> AppResult<Space> {
         let _guard = self.0.ship_lock.lock().await;
         let space = self.space_row(&req.space).await?;
+        let own_turn = turn.is_some() && space.run.as_deref() == turn;
         match space.status {
+            SpaceStatus::Running if own_turn => {}
             SpaceStatus::Running => {
                 return Err(AppError::Invalid(
                     "the agent is still working; stop it or wait for the turn to end".into(),
@@ -73,6 +89,11 @@ impl Core {
                 return Err(AppError::Invalid("this space is archived".into()));
             }
             SpaceStatus::Idle | SpaceStatus::Failed => {}
+        }
+        if space.updating.is_some() {
+            return Err(AppError::Invalid(
+                "finish or abort the update from base first; nothing half-merged ships".into(),
+            ));
         }
         let project = self
             .project_row(&space.project)
@@ -97,7 +118,8 @@ impl Core {
         let repo_path = self.ensure_project_cache(&project).await?;
         // Edits made by hand in the worktree since the last turn ship too.
         let head = if Path::new(&space.worktree).exists() {
-            self.0
+            let saved = self
+                .0
                 .deps
                 .git
                 .space_checkpoint(
@@ -105,7 +127,14 @@ impl Core {
                     &space.id,
                     &format!("{}: edits before shipping", space.name),
                 )
-                .await?
+                .await;
+            match saved {
+                Ok(head) => head,
+                // Its `.git` is gone: the last checkpoint is what ships.
+                Err(GitError::NotAWorktree(_)) => space.head_sha.clone(),
+                // A rebase or conflict mid-way: nothing half-done ships.
+                Err(e) => return Err(e.into()),
+            }
         } else {
             space.head_sha.clone()
         };
@@ -220,6 +249,7 @@ impl Core {
             head: head.clone(),
             parent: parent.clone(),
             replay_from,
+            merge_parent: merge_parent(parent, space),
             message: message.to_string(),
             author: author.clone(),
         };
@@ -297,6 +327,7 @@ impl Core {
                     head: head.clone(),
                     parent: parent.clone(),
                     replay_from: None,
+                    merge_parent: merge_parent(parent, space),
                     message: message.to_string(),
                     author: author.clone(),
                 },
@@ -485,6 +516,13 @@ impl Core {
             data: Some(data),
         }
     }
+}
+
+/// After the first ship, the space's base (moved on by Update from base)
+/// as the new commit's second parent: the git port leaves it out when the
+/// shipped history already has it.
+fn merge_parent(parent: &Sha, space: &Space) -> Option<Sha> {
+    (parent != &space.base_sha).then(|| space.base_sha.clone())
 }
 
 /// A safety refusal reads as the user's mistake to fix, not a git failure.

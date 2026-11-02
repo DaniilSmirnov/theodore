@@ -188,8 +188,8 @@ spaces:
 
 | Key | Default | Does |
 | --- | --- | --- |
-| `copy` | `[]` | paths copied from the project's local folder into the new space's worktree (§3) |
-| `ports` | `0` | free TCP ports reserved for the space's life (at most 16) |
+| `copy` | `[".env*"]` | paths copied from the project's local folder into the new space's worktree (§3); `copy: []` turns it off |
+| `ports` | `2` | free TCP ports reserved for the space's life (at most 16); `ports: 0` turns it off |
 | `env` | `{}` | extra environment for the space's commands and agent turns; values expand variables (§4) |
 | `setup` | — | runs once after create, before the first agent turn |
 | `run` | — | long-running (a dev server): Run / Stop in the space header, `⇧R` |
@@ -211,7 +211,7 @@ variables, then get the space's variables and `env`.
 
 ```
 create ─▶ worktree ─▶ copy ─▶ ports ─▶ setup ──ok──▶ turn 1 (the goal)
-                                         │ └─fail─▶ Retry · Continue without setup
+                                         │ └─fail─▶ Retry · Continue without setup · Fix with agent
                                          └─ from the repo, not allowed ─▶ "Run commands from this repo?"
 turn ─▶ checkpoint ─▶ files changed? ─▶ check ─▶ ✓ / ✗ on the turn
                                                   └─ ✗: its output goes into the next prompt
@@ -221,9 +221,23 @@ archive ─▶ stop run ─▶ checkpoint ─▶ archive ─▶ remove worktree 
 
 - **Setup.** The space page shows "Setting up…" with the live log. The goal
   waits; sending a message is refused until setup ends. On failure (non-zero
-  exit, timeout) the page offers **Retry** and **Continue without setup**.
-  Notes from copying (a missing file, a path outside the project) are shown
-  with it.
+  exit, timeout) the page offers **Retry**, **Continue without setup** and
+  **Fix with agent**. Notes from copying (a missing file, a path outside the
+  project) are shown with it.
+- **No commands at all.** A project whose `spaces:` section sets none of
+  `setup` / `run` / `check` / `archive` shows **Set up with agent** instead:
+  a turn asking the space's agent to look at the repo (package manager,
+  lockfiles, README, Makefile/justfile, docker compose, existing scripts)
+  and write the section. The agent edits `.theodore/config.yaml` with its
+  normal tools, in its own worktree, like any other change — so whatever it
+  proposes reaches the project only once the space ships, and waits for the
+  usual trust prompt from there.
+- **Fix with agent.** Setup's `failed` state already lets you type in the
+  composer (only `running` / `waiting` block it); this button sends the
+  agent a turn with the setup command, how it failed and the tail of its
+  output, asking it to fix the script or the config. Setup itself is left
+  `failed` — Retry and Continue without setup stay put, and a Retry that
+  later succeeds still fires the goal it was waiting on.
 - **Check** is part of the turn: the space stays running until it ends, and
   Stop stops it too. A turn that changed nothing runs no check. Passed /
   failed shows as a chip on the turn, expandable to the output.
@@ -232,13 +246,58 @@ archive ─▶ stop run ─▶ checkpoint ─▶ archive ─▶ remove worktree 
 - **Archive** failing is a warning; the space is archived anyway. Unarchive
   reserves fresh ports.
 
+## 2b. `code_intel:`
+
+Symbols, references and diagnostics for agents and the diff
+(docs/code-intel.md).
+
+```yaml
+code_intel:
+  enabled: true              # off: no index, no servers, no tools
+  install: ask               # ask | always | never: language servers
+  languages: [typescript, rust]   # empty: detected
+  servers: { python: pyright }    # preferred server per language
+  max_servers: 4
+  idle_minutes: 10
+  max_file_kb: 1024
+  lsp:                       # your global / local file only
+    spaces: true
+    review: false            # true: a PR's code may run during reviews
+```
+
+| Key | Default | Does |
+| --- | --- | --- |
+| `enabled` | `true` | off: no worktree is indexed and no run gets the code tools |
+| `install` | `ask` | `ask`: a toast offers each missing server once per session, a No is remembered; `always`: downloaded; `never`: only servers already installed. Grammars are downloaded either way |
+| `languages` | `[]` | only these; empty: detected from the repo's files |
+| `servers.<language>` | — | the server preferred over the manifest's order |
+| `max_servers` | `4` | language servers alive at once |
+| `idle_minutes` | `10` | an idle server is shut down after this |
+| `max_file_kb` | `1024` | larger files are not indexed |
+| `lsp.spaces` | `true` | language servers serve your spaces (an untrusted space only with `lsp.review` too) |
+| `lsp.review` | `false` | language servers serve review runs on PRs. **A PR's code may run** (build scripts, macros, plugins), written by whoever opened the PR |
+
+- `lsp.*` is honoured only from your global and local files. A repo's file
+  setting it is ignored, with a toast, and the editor warns on that line:
+  a repo turning servers on for reviews of its own PRs would run their
+  authors' code. Unset, the Settings → Languages toggles apply.
+
+- Read like the rest of the repo layer: at the base, never at a PR's head,
+  so a PR can't change what gets downloaded or run.
+- Trust (docs/code-intel.md §8): a review's worktree is always served
+  read-only (no build scripts, no proc macros). A space's is trusted once
+  nothing from the repo layer waits for Allow (§5); "Not now" keeps it
+  read-only.
+
 ## 3. `copy`
 
 Each entry is a path relative to the project's folder: a file, a directory
 (copied whole), or a `*` / `?` glob in its last segment (`.env*`). Absolute
 paths, `..`, `.git` and symlinks are skipped with a note. Copying needs the
 project's own checkout: a host project has none, so `copy` is skipped there
-with a note.
+with a note. Unset by every layer, a space copies `.env*` by default — so a
+project with no config at all still gets its local secrets; set `copy: []`
+to turn that off.
 
 ## 4. Variables
 
@@ -297,8 +356,8 @@ every line commented, the layers explained, an example of each section.
 ## 7. Tools the agent gets
 
 Each agent turn in a space gets the `space-tools` MCP server: the space's
-configured commands as tools, and nothing else. No tool runs a command the
-agent writes; there is no shell tool.
+configured commands as tools, plus the tools that act on the change (below).
+No tool runs a command the agent writes; there is no shell tool.
 
 | Tool | Does |
 | --- | --- |
@@ -328,7 +387,7 @@ agent ─▶ run_check / start_app ─▶ set? ─no──▶ error: no `spaces.
 - **Scoped to the space.** Each turn gets its own token, revoked when the
   agent exits; it reaches only that space. The agent never names a space.
 - **Told in the prompt.** The turn's system prompt lists the tools: use
-  `run_check` after changes, `start_app` to try the app.
+  `run_check` after changes, `start_app` to try the app, `ship` when asked.
 - **A space's PR.** Chat, skills and fixes on a space's review (or the PR
   it shipped as) keep `review-tools` and also get the read-only `read_logs`
   and `app_status`. Any other PR is unchanged.
@@ -337,6 +396,39 @@ agent ─▶ run_check / start_app ─▶ set? ─no──▶ error: no `spaces.
 - **Ask mode too.** A turn in Ask mode may call `run_check` and
   `start_app` (owner decision, 2026-10-23: "if it needs to run, it can
   run"). They run the configured commands only, under the same trust.
+
+The change itself (docs/spaces.md §5):
+
+| Tool | Takes | Returns |
+| --- | --- | --- |
+| `ship` | `action`: `open_pr · open_draft_pr · push · merge_locally · keep_branch`; `title?` | `branch`, `sha`, `pr_number`, `pr_url`, a one-line `summary` |
+| `get_space_diff` | `file?`, `stat?` | `base`, `base_sha` (merge-base), `head`, `uncommitted`, `files` (status, +/−), `diff` (unified, at most 120 000 chars; `truncated`) |
+| `get_review_comments` | `file?` | `items`: `kind` (`draft · finding · thread`), `on` (`space · pr`), `location`, `state` (`draft · open · resolved · outdated`), `severity`, `title`, `comments` (`author`: `you`, an agent or a login) |
+| `add_review_comment` | `file`, `line` (new side, 1-based), `body`, `severity?` (`info` default · `warn` · `high`) | `finding_id` |
+| `set_base` | `branch` | `base`, `base_sha`, `previous`, `note` (an open PR is not retargeted) |
+| `update_progress` | `steps` (`label`, `state`: `pending · active · done`; at most 20), `note?` | `ok` |
+
+```
+ship ─▶ same turn? ─no──▶ error: the agent is still working
+          └─yes─▶ ship_space: checkpoint ─▶ squash (you) ─▶ push / merge / branch
+                     └─ refused (local folder vs host, nothing new, branch taken,
+                        conflict, no identity) ─▶ the reason, nothing changed
+```
+
+- **Ship on request only.** The prompt and the tool say: call `ship` when
+  the user asks to push, open a PR or merge; never `git push` or `gh pr
+  create`. Open PR waits up to 15 s for the host and returns the PR; after
+  that it says the PR is on its way (the outbox finishes it).
+- **Ignored and drafted findings** are left out of `get_review_comments`;
+  the agent's own comments are findings of skill `space-agent`.
+- **`set_base`** refuses an unknown branch, the space's own branch, an
+  archived space, or a space another run holds.
+
+**Code tools.** With code intelligence on for the project (§2b), both
+`review-tools` and `space-tools` also list `find_symbol`, `get_symbol`,
+`references`, `definition`, `diagnostics` and `code_status`; a space turn
+in Edit or Run mode also gets `replace_symbol_body`, `insert_after_symbol`
+and `rename_symbol` (refused in Ask mode). Off, they aren't listed.
 
 Your own MCP servers come along unless you turn them off: with Settings →
 Agents → **Allow my Claude MCP servers in spaces** on (the default),

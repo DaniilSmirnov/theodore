@@ -10,8 +10,8 @@ use theodore_contract::TokenSource;
 use theodore_domain::grouping::RepoContext;
 use theodore_domain::{AgentId, Grouping, PrDetail, PrId, Revision};
 use theodore_ports::{
-    AccountPort, AgentPort, Clock, CommandPort, DeviceLoginPort, GitPort, HostAdapter, McpEndpoint,
-    Secrets, Store, WorktreeLease,
+    AccountPort, AgentPort, Clock, CodeIntelPort, CommandPort, DeviceLoginPort, GitPort,
+    HostAdapter, McpEndpoint, Secrets, Store, TerminalPort, WorktreeLease,
 };
 
 use crate::error::GrouperError;
@@ -60,16 +60,42 @@ pub trait Grouper: Send + Sync {
     ) -> Result<Grouping, GrouperError>;
 }
 
+/// Which code-intelligence tools a run gets (docs/code-intel.md §7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CodeTools {
+    /// None listed: no port, or `code_intel.enabled: false`.
+    #[default]
+    Off,
+    /// `find_symbol`, `get_symbol`, `references`, `definition`,
+    /// `diagnostics`, `code_status`.
+    Read,
+    /// `Read` plus the edits, for a space turn that may write.
+    Edit,
+}
+
 /// Per-run MCP tools for agents (plan §8.3). Implemented over the MCP
 /// server by whoever wires `Deps`.
 pub trait RunTools: Send + Sync {
     /// `review-tools` for a PR run. `space`: the space whose PR it is,
-    /// which adds the read-only `read_logs` / `app_status`.
-    fn register(&self, run_id: &str, pr: &PrId, agent: AgentId, space: Option<&str>)
-    -> McpEndpoint;
+    /// which adds the read-only `read_logs` / `app_status`. `code`: the
+    /// code tools it lists (never edits on a PR run).
+    fn register(
+        &self,
+        run_id: &str,
+        pr: &PrId,
+        agent: AgentId,
+        space: Option<&str>,
+        code: CodeTools,
+    ) -> McpEndpoint;
     /// `space-tools` for a space's agent turn (docs/spaces.md "Tools the
     /// agent gets").
-    fn register_space(&self, run_id: &str, space: &str, agent: AgentId) -> McpEndpoint;
+    fn register_space(
+        &self,
+        run_id: &str,
+        space: &str,
+        agent: AgentId,
+        code: CodeTools,
+    ) -> McpEndpoint;
     fn unregister(&self, endpoint: &McpEndpoint);
 }
 
@@ -120,7 +146,13 @@ pub struct Deps {
     /// Runs a space's `setup` / `run` / `check` / `archive` commands
     /// (docs/config.md).
     pub commands: Arc<dyn CommandPort>,
+    /// Runs a space's interactive terminals (docs/spaces.md "Terminal").
+    pub terminals: Arc<dyn TerminalPort>,
     /// Theodore's data directory (`~/.theodore`): holds the global
     /// `config.yaml`. Tests point it at a throwaway directory.
     pub data_dir: std::path::PathBuf,
+    /// Symbols, references and diagnostics over worktrees
+    /// (docs/code-intel.md). `None` (tests, the CLI): the feature is off,
+    /// runs get no code tools and `find_symbol` greps.
+    pub code_intel: Option<Arc<dyn CodeIntelPort>>,
 }

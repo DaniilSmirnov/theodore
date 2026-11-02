@@ -19,11 +19,13 @@ use theodore_ports::{
 use tokio_util::sync::CancellationToken;
 
 use crate::core::{Core, RunHandle};
+use crate::deps::CodeTools;
 use crate::error::{AppError, AppResult};
-use crate::usecases::agents::tool_log_line_with;
 use crate::usecases::attachments::{agent_attachments, with_attachments};
+use crate::usecases::live::LiveRun;
 use crate::usecases::projects::stable_hash_u32;
 use crate::usecases::skills::{expand_skill, space_skill_content};
+use crate::usecases::space_queue::TurnEnd;
 
 /// The `chat_message.pr` key a space's transcript is stored under.
 pub fn space_chat_key(space: &str) -> PrId {
@@ -32,7 +34,7 @@ pub fn space_chat_key(space: &str) -> PrId {
 
 /// Messages of history replayed into a turn that starts a new agent session
 /// (docs/spaces.md §5 "One session per space").
-const HISTORY_MESSAGES: usize = 12;
+pub(crate) const HISTORY_MESSAGES: usize = 12;
 /// Per replayed message.
 const HISTORY_CHARS: usize = 2_000;
 
@@ -49,6 +51,14 @@ impl Core {
             .ok_or_else(|| {
                 AppError::Invalid(format!("project {} has no default branch yet", project.id))
             })?;
+        // Whether the dialog's own name/branch wins over the agent's later
+        // proposal (`space_naming::apply`, docs/spaces.md §3 "New space").
+        let user_named = req
+            .name
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|n| !n.is_empty());
+        let user_branched = req.branch.is_some();
         let name = match req.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
             Some(n) => n.to_string(),
             // Named after the goal; a second "fix login" in the project
@@ -61,22 +71,9 @@ impl Core {
         };
         let branch = match req.branch.clone() {
             Some(b) => b,
-            None => {
-                // Named after you on the host (docs/spaces.md §12); a local
-                // folder, or a host we can't reach, gets `space/<slug>`.
-                let login = match project.path {
-                    Some(_) => None,
-                    None => self
-                        .0
-                        .deps
-                        .host
-                        .viewer_for(project.repo.host)
-                        .await
-                        .ok()
-                        .map(|p| p.login),
-                };
-                crate::usecases::ship::branch_for(login.as_deref(), &slug(&name))
-            }
+            // Named after you on the host (docs/spaces.md §12); a local
+            // folder, or a host we can't reach, gets `space/<slug>`.
+            None => crate::usecases::space_naming::branch_for(self, &project, &name).await,
         };
         if !is_valid_branch(&branch) {
             return Err(AppError::Invalid(format!("bad branch name {branch:?}")));
@@ -112,7 +109,7 @@ impl Core {
 
         // Files from the checkout, then ports for the space's life.
         let mut notes = Vec::new();
-        let copy = cfg.merged.config.spaces.copy.clone();
+        let copy = cfg.merged.config.spaces.effective_copy();
         match (&project.path, copy.is_empty()) {
             (_, true) => {}
             (Some(root), false) => {
@@ -167,8 +164,13 @@ impl Core {
             process: None,
             commands_denied: false,
             agent_session: None,
+            sent_feedback: Vec::new(),
             created_at: now,
             updated_at: now,
+            title: None,
+            handoff_summary: None,
+            progress: None,
+            updating: None,
         };
         self.apply(vec![NewAction {
             model: models::SPACE.into(),
@@ -178,6 +180,7 @@ impl Core {
         }])
         .await?;
         drop(ports_guard);
+        self.spawn_space_code(&space, &project);
         theodore_telemetry::product(theodore_telemetry::ProductEvent::SpaceCreated {
             mode: crate::usecases::telemetry::wire_str(&space.mode),
         });
@@ -204,6 +207,29 @@ impl Core {
             })
             .await?;
         }
+        // A better name and a chat title, from the chat agent (never turn
+        // 1's own, which the dialog may have overridden): backgrounded, so
+        // it never delays turn 1 (`space_naming`).
+        if !space.goal.is_empty() {
+            let configured = self
+                .setting_agent_scoped("agents.chat", Some(&project.repo.slug()), AgentId::Claude)
+                .await;
+            let chat_agent = self.effective_agent(configured).await;
+            let core = self.clone();
+            let (id2, goal, cwd) = (id.clone(), space.goal.clone(), wt.path.clone());
+            tokio::spawn(async move {
+                crate::usecases::space_naming::apply(
+                    &core,
+                    id2,
+                    chat_agent,
+                    goal,
+                    cwd,
+                    user_named,
+                    user_branched,
+                )
+                .await;
+            });
+        }
         self.space_row(&id).await
     }
 
@@ -222,21 +248,45 @@ impl Core {
         Ok(spaces)
     }
 
-    /// Stores the message and starts one agent turn in the space's worktree.
-    /// Returns the message id; the reply arrives as a `chat_message` row.
+    /// Stores the message and starts one agent turn in the space's worktree;
+    /// while a turn runs it is queued for its own turn instead
+    /// (docs/spaces.md §8). Returns the message id; the reply arrives as a
+    /// `chat_message` row.
     pub async fn space_send(&self, req: SpaceSendRequest) -> AppResult<String> {
+        let _queue = self.space_queue_lock(&req.space).await;
         let space = self.space_row(&req.space).await?;
-        match space.status {
-            SpaceStatus::Running => {
-                return Err(AppError::Invalid(
-                    "the agent is still working in this space".into(),
-                ));
-            }
-            SpaceStatus::Archived => {
-                return Err(AppError::Invalid("this space is archived".into()));
-            }
-            SpaceStatus::Idle | SpaceStatus::Failed => {}
+        if space.status == SpaceStatus::Archived {
+            return Err(AppError::Invalid("this space is archived".into()));
         }
+        let running = space.status == SpaceStatus::Running;
+        if !running {
+            self.check_setup_done(&space)?;
+        }
+        let text = req.text.trim().to_string();
+        // Checked before anything is stored: an unknown id fails the send.
+        let attachments = self.resolve_attachments(req.attachments.as_deref()).await?;
+        if text.is_empty() && attachments.is_empty() {
+            return Err(AppError::Invalid("empty message".into()));
+        }
+        if running {
+            return self.queue_message(&space, &req, text, attachments).await;
+        }
+        let message = ChatMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            pr: space_chat_key(&space.id),
+            author: Author::Me,
+            text,
+            refs: vec![],
+            at: self.0.deps.clock.now(),
+            failed: None,
+            attachments,
+            queued: None,
+        };
+        self.start_turn(space, &req, message, false).await
+    }
+
+    /// Refused while the space sets up: the goal goes first.
+    pub(crate) fn check_setup_done(&self, space: &Space) -> AppResult<()> {
         if let Some(setup) = &space.setup
             && matches!(
                 setup.status,
@@ -245,13 +295,21 @@ impl Core {
         {
             return Err(AppError::Invalid("the space is still setting up".into()));
         }
-        let text = req.text.trim().to_string();
-        // Checked before anything is stored: an unknown id fails the send.
-        let attachments = self.resolve_attachments(req.attachments.as_deref()).await?;
-        if text.is_empty() && attachments.is_empty() {
-            return Err(AppError::Invalid("empty message".into()));
-        }
+        Ok(())
+    }
+
+    /// Stores `message` (new, or a queued one now sent: `stored`) and
+    /// starts its turn with `req`'s picks. Caller holds the space's queue
+    /// lock; the space isn't running.
+    pub(crate) async fn start_turn(
+        &self,
+        space: Space,
+        req: &SpaceSendRequest,
+        message: ChatMessage,
+        stored: bool,
+    ) -> AppResult<String> {
         let project = self.space_project(&space).await?;
+        let (text, attachments) = (message.text.clone(), message.attachments.clone());
 
         let agent = req.agent.unwrap_or(space.agent);
         let model = req.model.clone().or_else(|| space.model.clone());
@@ -267,25 +325,19 @@ impl Core {
             .await?;
 
         let history = self.space_history(&space).await?;
-        let key = space_chat_key(&space.id);
-        let message_id = uuid::Uuid::new_v4().to_string();
-        let now = self.0.deps.clock.now();
-        let message = ChatMessage {
-            id: message_id.clone(),
-            pr: key.clone(),
-            author: Author::Me,
-            text: text.clone(),
-            refs: vec![],
-            at: now,
-            failed: None,
-            attachments: attachments.clone(),
-        };
+        let message_id = message.id.clone();
+        let now = message.at;
         let run_id = format!("space:{}:{message_id}", space.id);
         self.apply(vec![
             NewAction {
                 model: models::CHAT_MESSAGE.into(),
                 model_id: message_id.clone(),
-                action: SyncActionCode::I,
+                // A queued one is rewritten: it stops being queued.
+                action: if stored {
+                    SyncActionCode::U
+                } else {
+                    SyncActionCode::I
+                },
                 data: Some(to_json(&message)?),
             },
             NewAction {
@@ -326,10 +378,34 @@ impl Core {
         // hears only the new turn; anything else starts a new session from
         // the replayed transcript.
         let resume = resumable_session(&space, agent, &wt.path);
-        let replay = wrap(turn_prompt(&history, &ask));
+        // Can't resume: a cached, once-generated summary of everything
+        // before the replayed window stands in for the full transcript
+        // (`space_handoff`). The rarer case — a resume that turns out to
+        // be gone mid-run — keeps today's plain replay; it's already
+        // failing once, so it doesn't also pay for a summarizer call.
         let (prompt, replay) = match &resume {
-            Some(_) => (wrap(ask), Some(replay)),
-            None => (replay, None),
+            Some(_) => (wrap(ask.clone()), Some(wrap(turn_prompt(&history, &ask)))),
+            None => (
+                wrap(
+                    crate::usecases::space_handoff::replay_prompt(
+                        self, &space, agent, &wt.path, &history, &ask,
+                    )
+                    .await,
+                ),
+                None,
+            ),
+        };
+        // Opens the worktree on code intelligence; the turn's mode decides
+        // whether its tools may edit.
+        let code = match self.0.deps.tools {
+            Some(_) => {
+                let at = Space {
+                    worktree: wt.path.display().to_string(),
+                    ..space.clone()
+                };
+                self.space_code_tools(&at, &project, mode).await
+            }
+            None => CodeTools::Off,
         };
         let turn = Turn {
             run_id,
@@ -344,12 +420,17 @@ impl Core {
             system: self
                 .space_review_rules(&space, &project, &wt.path)
                 .await
-                .with_system(Some(system_prompt(&space, self.0.deps.tools.is_some())))
+                .with_system(Some(system_prompt(
+                    &space,
+                    self.0.deps.tools.is_some(),
+                    code,
+                )))
                 .unwrap_or_default(),
             env: self.space_agent_env(&space).await,
             attachments: agent_attachments(&attachments),
             cwd: wt.path,
             cancel,
+            code,
         };
         let core = self.clone();
         let span = tracing::info_span!("space_turn", space = %space.id, agent = agent.as_str());
@@ -395,6 +476,8 @@ impl Core {
     /// Checkpoints uncommitted edits, removes the worktree and the review;
     /// the checkpoint ref and the transcript stay.
     pub async fn archive_space(&self, space: &str) -> AppResult<()> {
+        // Not while a turn hands over to the next queued message.
+        let _queue = self.space_queue_lock(space).await;
         let space = self.space_row(space).await?;
         if space.status == SpaceStatus::Running {
             return Err(AppError::Invalid(
@@ -408,9 +491,13 @@ impl Core {
         let repo_path = self.ensure_project_cache(&project).await?;
         // docs/config.md: stop `run`, checkpoint, `archive`, then remove.
         self.stop_space_commands(&space.id).await;
+        // docs/spaces.md "Terminal": a shell must not keep writing into a
+        // worktree about to be removed.
+        self.close_space_terminals(&space.id).await;
         let worktree_exists = Path::new(&space.worktree).exists();
         if worktree_exists {
-            self.0
+            let saved = self
+                .0
                 .deps
                 .git
                 .space_checkpoint(
@@ -418,7 +505,13 @@ impl Core {
                     &space.id,
                     &format!("{}: uncommitted changes at archive", space.name),
                 )
-                .await?;
+                .await;
+            match saved {
+                // Its `.git` is gone: nothing git can save, and the remove
+                // below moves the directory aside instead of deleting it.
+                Ok(_) | Err(theodore_ports::GitError::NotAWorktree(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         self.run_archive_command(&space, &project, worktree_exists)
             .await;
@@ -427,6 +520,7 @@ impl Core {
             .git
             .remove_space_worktree(&repo_path, &space.id)
             .await?;
+        self.close_code_root(Path::new(&space.worktree)).await;
         if let Some(review) = &space.review_pr {
             // Best-effort: a review that was never stored is already gone.
             let _ = self.close_branch_review(review).await;
@@ -454,6 +548,7 @@ impl Core {
     pub async fn undo_space_turn(&self, space: &str) -> AppResult<Space> {
         // Not while a ship reads the checkpoint.
         let _guard = self.0.ship_lock.lock().await;
+        let _queue = self.space_queue_lock(space).await;
         let space = self.space_row(space).await?;
         let i = undoable_turn(&space).map_err(AppError::Invalid)?;
         let turn = space.turn_log[i].clone();
@@ -469,23 +564,34 @@ impl Core {
             .deps
             .git
             .space_reset(&wt.path, &space.id, &turn.before)
-            .await?;
+            .await
+            .map_err(|e| match e {
+                theodore_ports::GitError::Busy(busy) => AppError::Invalid(format!(
+                    "can't undo: {busy} in the space's worktree; finish or abort it first"
+                )),
+                e => e.into(),
+            })?;
         let mut log = space.turn_log.clone();
         log[i].undone = true;
+        let mut data = serde_json::json!({
+            "status": SpaceStatus::Idle,
+            "head_sha": turn.before,
+            "error": null,
+            "turn_log": log,
+            // The agent's session still holds the undone turn: the next
+            // one starts over from the transcript, which leaves it out.
+            "agent_session": null,
+            "updated_at": self.0.deps.clock.now(),
+        });
+        // The turn completed an update from base: the old base is back.
+        if let Some(base) = &turn.base_before {
+            data["base_sha"] = serde_json::json!(base);
+        }
         self.apply(vec![NewAction {
             model: models::SPACE.into(),
             model_id: space.id.clone(),
             action: SyncActionCode::C,
-            data: Some(serde_json::json!({
-                "status": SpaceStatus::Idle,
-                "head_sha": turn.before,
-                "error": null,
-                "turn_log": log,
-                // The agent's session still holds the undone turn: the next
-                // one starts over from the transcript, which leaves it out.
-                "agent_session": null,
-                "updated_at": self.0.deps.clock.now(),
-            })),
+            data: Some(data),
         }])
         .await?;
         if turn.before != turn.after {
@@ -564,7 +670,9 @@ impl Core {
             group: false,
         })
         .await?;
-        self.space_row(&space.id).await
+        let space = self.space_row(&space.id).await?;
+        self.spawn_space_code(&space, &project);
+        Ok(space)
     }
 
     /// Turns left `running` by a previous process can never finish
@@ -577,7 +685,7 @@ impl Core {
         let now = self.0.deps.clock.now();
         // Turns, and a space's setup, `run` and `check` (docs/config.md).
         let mut actions: Vec<NewAction> = Vec::new();
-        for s in spaces {
+        for s in spaces.clone() {
             let reaped = self.reap_space_process(&s).await;
             let Some(patch) = crate::usecases::space_hooks::interrupted_patch(&s, now, reaped)
             else {
@@ -591,6 +699,7 @@ impl Core {
             });
         }
         let _ = self.apply(actions).await;
+        self.hold_queues_after_restart(&spaces).await;
     }
 
     /// Reopens a space's branch review by its id (`ensure_open` after a
@@ -660,7 +769,11 @@ impl Core {
             .turn_log
             .iter()
             .filter(|t| t.undone)
-            .flat_map(|t| [t.message.as_str(), t.reply.as_str()])
+            .flat_map(|t| {
+                [t.message.as_str(), t.reply.as_str()]
+                    .into_iter()
+                    .chain(t.steered.iter().map(String::as_str))
+            })
             .collect();
         let rows =
             tokio::task::spawn_blocking(move || store.query(models::CHAT_MESSAGE, "pr", &key))
@@ -670,6 +783,7 @@ impl Core {
             .into_iter()
             .filter_map(|r| serde_json::from_value(r.data).ok())
             .filter(|m: &ChatMessage| m.failed.is_none())
+            .filter(|m| !crate::usecases::space_queue::is_queued(m))
             .filter(|m| !undone.contains(&m.id.as_str()))
             .collect();
         messages.sort_by_key(|m| m.at);
@@ -697,6 +811,8 @@ struct Turn {
     attachments: Vec<AgentAttachment>,
     cwd: PathBuf,
     cancel: CancellationToken,
+    /// The code tools this turn's `space-tools` lists.
+    code: CodeTools,
 }
 
 /// The stored session the next turn continues: same agent, same worktree.
@@ -732,29 +848,27 @@ async fn stream_run(
     let agent = req.agent;
     let resumed = req.resume.is_some();
     let mut out = Streamed::default();
-    let mut run = match core.0.deps.agents.run(req).await {
-        Ok(run) => run,
+    let mut run = match core.0.deps.agents.run_steerable(req).await {
+        Ok((run, steer)) => {
+            // "Send now" writes into this run while it works.
+            core.steer_run(run_id, steer);
+            run
+        }
         Err(e) => {
             out.error = Some(e.to_string());
             return out;
         }
     };
+    let mut live = LiveRun::new(run_id, agent);
+    let _unsteer = Unsteer { core, run: run_id };
     loop {
         tokio::select! {
             _ = cancel.cancelled() => { run.cancel.cancel(); break; }
             event = run.events.recv() => {
                 let Some(event) = event else { break };
+                live.show(core, &event);
                 match event {
-                    AgentEvent::Text { text: t } => {
-                        out.text.push_str(&t);
-                        core.emit(Ephemeral::AgentDelta { run: run_id.to_string(), agent, text: t });
-                    }
-                    AgentEvent::ToolCall { name, input, .. } => {
-                        core.emit(Ephemeral::RunLog { run: run_id.to_string(), agent, line: tool_log_line_with(&name, &input) });
-                    }
-                    AgentEvent::Stalled => {
-                        core.emit(Ephemeral::RunStalled { run: run_id.to_string(), agent });
-                    }
+                    AgentEvent::Text { text: t } => out.text.push_str(&t),
                     AgentEvent::Session { id } => out.session = Some(id),
                     AgentEvent::Done { final_text, .. } => {
                         if !final_text.is_empty() {
@@ -768,15 +882,29 @@ async fn stream_run(
                         out.error = Some(message);
                         break;
                     }
-                    AgentEvent::Thinking { .. }
+                    AgentEvent::TextDelta { .. }
+                    | AgentEvent::Thinking { .. }
+                    | AgentEvent::ToolCall { .. }
                     | AgentEvent::ToolResult { .. }
-                    | AgentEvent::Usage { .. }
-                    | AgentEvent::TextDelta { .. } => {}
+                    | AgentEvent::Stalled
+                    | AgentEvent::Usage { .. } => {}
                 }
             }
         }
     }
     out
+}
+
+/// Nothing more is steered into a run once its events stop.
+struct Unsteer<'a> {
+    core: &'a Core,
+    run: &'a str,
+}
+
+impl Drop for Unsteer<'_> {
+    fn drop(&mut self) {
+        self.core.unsteer_run(self.run);
+    }
 }
 
 async fn drive_turn(core: &Core, turn: Turn) {
@@ -795,6 +923,7 @@ async fn drive_turn(core: &Core, turn: Turn) {
         attachments,
         cwd,
         cancel,
+        code,
     } = turn;
     // The space's commands as tools, for this turn only.
     let mcp = core
@@ -802,7 +931,7 @@ async fn drive_turn(core: &Core, turn: Turn) {
         .deps
         .tools
         .as_ref()
-        .map(|t| t.register_space(&run_id, &space.id, agent));
+        .map(|t| t.register_space(&run_id, &space.id, agent, code));
     let tools_guard = crate::usecases::agents::ToolsGuard {
         core,
         mcp: mcp.clone(),
@@ -826,7 +955,7 @@ async fn drive_turn(core: &Core, turn: Turn) {
         user_mcp: core.user_mcp_allowed().await,
         attachments,
         resume,
-        stream_text: false,
+        stream_text: true,
     };
     let started = std::time::Instant::now();
     let mut streamed = stream_run(core, req.clone(), &cancel, &run_id).await;
@@ -904,18 +1033,27 @@ async fn drive_turn(core: &Core, turn: Turn) {
     } else {
         ""
     };
-    let checkpoint = core
-        .0
-        .deps
-        .git
-        .space_checkpoint(
-            &cwd,
-            &space.id,
-            &format!("{}: turn {turn_no}{suffix}", space.name),
-        )
-        .await;
-    let head = match checkpoint {
+    // While an update from base resolves, Theodore commits its merge here.
+    let saved = crate::usecases::space_update::turn_checkpoint(
+        core,
+        &space,
+        &cwd,
+        &format!("{}: turn {turn_no}{suffix}", space.name),
+    )
+    .await;
+    // A rebase or conflict left in the worktree: the answer stands, the
+    // snapshot waits for the next turn, and the space says why.
+    let mut skipped = None;
+    let head = match saved.result {
         Ok(head) => Some(head),
+        Err(theodore_ports::GitError::Busy(busy)) => {
+            skipped = Some(
+                saved
+                    .skipped
+                    .unwrap_or_else(|| format!("checkpoint skipped: {busy}")),
+            );
+            None
+        }
         Err(e) => {
             error.get_or_insert_with(|| format!("checkpoint failed: {e}"));
             None
@@ -932,24 +1070,34 @@ async fn drive_turn(core: &Core, turn: Turn) {
         at: core.0.deps.clock.now(),
         failed: error.clone(),
         attachments: vec![],
+        queued: None,
     };
     let changed = head.as_ref().is_some_and(|h| *h != space.head_sha);
     // `check` (docs/config.md) is part of the turn: the space stays
     // running, and Stop stops it too.
     let checking = changed && !cancelled && core.has_check(&space).await;
-    let status = if error.is_some() && !cancelled {
+    let status = if (error.is_some() && !cancelled) || skipped.is_some() {
         SpaceStatus::Failed
     } else {
         SpaceStatus::Idle
+    };
+    let space_error = match (cancelled, &error) {
+        (false, Some(e)) => Some(e.clone()),
+        _ => skipped.clone(),
     };
     let mut patch = serde_json::json!({
         "status": if checking { SpaceStatus::Running } else { status },
         "run": if checking { Some(run_id.clone()) } else { None },
         "turns": turn_no,
-        "error": if cancelled { None } else { error.clone() },
+        "error": space_error,
         "agent_session": agent_session,
+        // The tracker is the turn's: it goes when the agent is done.
+        "progress": null,
         "updated_at": core.0.deps.clock.now(),
     });
+    if let Some(extra) = saved.patch {
+        crate::usecases::space_update::merge_fields(&mut patch, extra);
+    }
     if let Some(head) = &head {
         patch["head_sha"] = serde_json::json!(head);
         // Nothing else writes the log while a turn runs (undo is refused),
@@ -965,6 +1113,7 @@ async fn drive_turn(core: &Core, turn: Turn) {
             before: space.head_sha.clone(),
             after: head.clone(),
             undone: false,
+            steered: core.take_steered(&run_id),
             check: checking.then(|| theodore_contract::SpaceCheck {
                 status: theodore_contract::SpaceCheckStatus::Running,
                 exit_code: None,
@@ -973,6 +1122,7 @@ async fn drive_turn(core: &Core, turn: Turn) {
                 started_at: core.0.deps.clock.now(),
                 finished_at: None,
             }),
+            base_before: saved.base_before.clone(),
         });
         patch["turn_log"] = serde_json::json!(log);
     }
@@ -991,11 +1141,22 @@ async fn drive_turn(core: &Core, turn: Turn) {
         action: SyncActionCode::C,
         data: Some(patch),
     });
-    let _ = core.apply(actions).await;
-    if !checking {
+    // Stopped or failed: whatever is queued waits for you.
+    let end = if cancelled || error.is_some() {
+        TurnEnd::Interrupted
+    } else {
+        TurnEnd::Done
+    };
+    if checking {
+        let _ = core.apply(actions).await;
+    } else {
         core.0.runs.write().await.remove(&run_id);
+        core.end_turn(&space.id, actions, end).await;
     }
 
+    if changed && let Some(after) = &head {
+        core.spawn_space_code_changed(cwd.clone(), space.head_sha.clone(), after.clone());
+    }
     if changed {
         // The live diff follows the new checkpoint; grouping waits for Review.
         if let Err(e) = core
@@ -1023,8 +1184,16 @@ async fn drive_turn(core: &Core, turn: Turn) {
         if let Some(t) = log.iter_mut().rev().find(|t| t.reply == reply.id) {
             t.check = check;
         }
-        let _ = core
-            .apply(vec![NewAction {
+        // A failing check isn't a failed turn: the next one hears it. Stop
+        // during the check is a stop.
+        let end = if cancel.is_cancelled() {
+            TurnEnd::Interrupted
+        } else {
+            end
+        };
+        core.end_turn(
+            &space.id,
+            vec![NewAction {
                 model: models::SPACE.into(),
                 model_id: space.id.clone(),
                 action: SyncActionCode::C,
@@ -1034,8 +1203,10 @@ async fn drive_turn(core: &Core, turn: Turn) {
                     "turn_log": log,
                     "updated_at": core.0.deps.clock.now(),
                 })),
-            }])
-            .await;
+            }],
+            end,
+        )
+        .await;
     }
 }
 
@@ -1089,6 +1260,9 @@ pub(crate) fn undoable_turn(space: &Space) -> Result<usize, String> {
         }
         SpaceStatus::Archived => return Err("this space is archived".into()),
         SpaceStatus::Idle | SpaceStatus::Failed => {}
+    }
+    if space.updating.is_some() {
+        return Err("finish or abort the update from base first".into());
     }
     let i = space
         .turn_log
@@ -1252,13 +1426,23 @@ pub(crate) const SPACE_TOOLS_PROMPT: &str = "Theodore's space-tools MCP server r
      space's configured commands for you: run_check (the project's check; use it after \
      changes), start_app / stop_app / app_status (the app, its ports and http://localhost \
      URLs; start_app to try it), read_logs (setup, run, check or archive output) and \
-     space_info.";
+     space_info. It also acts on the change: when the user asks you to push, open a PR \
+     (or a draft), merge or keep it as a branch, call ship and tell them what it returns \
+     (the PR link, or why it was refused). get_space_diff shows your change against the \
+     base, uncommitted edits included; get_review_comments reads the review's comments \
+     and add_review_comment leaves one on a line; set_base changes the base branch when \
+     the user asks; update_progress shows your plan above the user's message box, for \
+     work with several steps.";
 
-fn system_prompt(space: &Space, tools: bool) -> String {
+fn system_prompt(space: &Space, tools: bool, code: CodeTools) -> String {
     let mut prompt = base_system_prompt(space);
     if tools {
         prompt.push('\n');
         prompt.push_str(SPACE_TOOLS_PROMPT);
+    }
+    if let Some(hint) = crate::usecases::code_intel::code_prompt(code) {
+        prompt.push('\n');
+        prompt.push_str(hint);
     }
     prompt
 }
@@ -1268,10 +1452,12 @@ fn base_system_prompt(space: &Space) -> String {
         "You are working in a Theodore space: an isolated git worktree for one change.\n\
          Goal: {goal}\n\
          Base branch: {base}. The change will be shipped as branch {branch}.\n\
-         Rules: work only inside the current directory. Do not push, do not switch or \
-         create branches, do not rewrite history. Theodore commits your edits after every \
-         turn, so you don't need to. End each turn with a short summary of what you changed \
-         and anything left to do.",
+         Rules: work only inside the current directory. Shipping goes through Theodore: \
+         never run git push, gh pr create or another PR command, and do not switch, create \
+         or rebase branches or rewrite history yourself; without the ship tool, point the \
+         user to Ship in the space's header. Theodore commits your edits after every turn, \
+         so you don't need to. End each turn with a short summary of what you \
+         changed and anything left to do.",
         goal = if space.goal.is_empty() {
             &space.name
         } else {
@@ -1285,7 +1471,7 @@ fn base_system_prompt(space: &Space) -> String {
 /// The new message, preceded by the recent transcript (each CLI run starts
 /// fresh, so this is what carries the conversation across turns, crashes
 /// and agent switches).
-fn turn_prompt(history: &[ChatMessage], text: &str) -> String {
+pub(crate) fn turn_prompt(history: &[ChatMessage], text: &str) -> String {
     let recent = &history[history.len().saturating_sub(HISTORY_MESSAGES)..];
     if recent.is_empty() {
         return text.to_string();
@@ -1381,6 +1567,7 @@ mod tests {
             at,
             failed: None,
             attachments: vec![],
+            queued: None,
         }
     }
 

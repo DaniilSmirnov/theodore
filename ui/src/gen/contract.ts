@@ -200,6 +200,8 @@ export type ChatMessage = {
 	failed?: string | null,
 	/**  Files sent with your message; empty on replies and older rows. */
 	attachments?: Attachment[],
+	/**  A space message waiting for its turn (docs/spaces.md §8). */
+	queued?: QueuedSend | null,
 };
 
 export type Check = {
@@ -240,6 +242,82 @@ export type ClientLog = {
 };
 
 export type ClientLogLevel = "error" | "warn" | "info";
+
+/**  Where a grammar or a server stands. */
+export type CodeInstall =
+/**  Not on disk; can be downloaded. */
+{ state: "missing" } | { state: "downloading" } |
+/**  Found on the machine (PATH, rustup, xcrun, …). */
+{ state: "system"; path: string; version: string | null } |
+/**  Downloaded by Theodore. */
+{ state: "installed"; version: string } |
+/**  No download for this platform. */
+{ state: "unavailable" } |
+/**  You said no to the install suggestion. */
+{ state: "declined" } | { state: "failed"; error: string };
+
+/**  `code_intel.install`. */
+export type CodeInstallPolicy = "ask" | "always" | "never";
+
+/**  `code_intel_set_lsp`: Settings → Languages' toggles. */
+export type CodeIntelLspRequest = {
+	scope: CodeLspScope,
+	on: boolean,
+};
+
+/**  `code_intel_status(project)`. */
+export type CodeIntelStatus = {
+	/**  `code_intel.enabled` for the project and a backend in this build. */
+	enabled: boolean,
+	install: CodeInstallPolicy,
+	/**  Where language servers may run (`code_intel.lsp`). */
+	lsp: CodeLsp,
+	/**  Empty when no worktree of the project is open yet. */
+	languages: CodeLanguage[],
+};
+
+/**  One language of a project's worktree. */
+export type CodeLanguage = {
+	/**  A manifest id: `rust`, `typescript`, … */
+	language: string,
+	/**  Files of this language in the worktree. */
+	files: number,
+	grammar: CodeInstall,
+	/**  The server that would serve it, when the manifest has one. */
+	server: CodeServer | null,
+	/**  0–100. */
+	index_percent: number,
+};
+
+/**  `code_intel.lsp.review` and `code_intel.lsp.spaces`. */
+export type CodeLsp = {
+	/**
+	 *  In review runs on PRs. On: a PR's code may run (build scripts,
+	 *  macros), written by whoever opened the PR.
+	 */
+	review: CodeLspToggle,
+	/**  In spaces. */
+	spaces: CodeLspToggle,
+};
+
+export type CodeLspScope = "review" | "spaces";
+
+export type CodeLspToggle = {
+	on: boolean,
+	/**
+	 *  The global or local config file that sets it: the file wins over
+	 *  the toggle until the line is removed. A repo's file never does.
+	 */
+	from_config: string | null,
+};
+
+export type CodeServer = {
+	name: string,
+	install: CodeInstall,
+	state: CodeServerState,
+};
+
+export type CodeServerState = "not_running" | "warming" | "ready" | "failed";
 
 export type CommandError = {
 	code: string,
@@ -506,7 +584,27 @@ export type Ephemeral = { type: "agent_delta"; run: string; agent: AgentId; text
  */
 { type: "config_pr"; project: string; number: number;
 /**  Empty when the host didn't say. */
-url: string };
+url: string } |
+/**
+ *  `code_intel.install: ask` and a language's server is missing
+ *  (docs/code-intel.md §5.1): offer `code_intel_install(language)`,
+ *  or `code_intel_decline(language)`. Once per language per session.
+ */
+{ type: "code_intel_suggest";
+/**  The project whose worktree needs it, when known. */
+project: string | null; language: string;
+/**  The server that would be downloaded (`clangd`). */
+server: string } |
+/**
+ *  Raw PTY output of a space's terminal (docs/spaces.md "Terminal"),
+ *  base64 (control sequences and all) so a chunk split mid UTF-8 still
+ *  round-trips — `xterm.js`'s own parser tolerates that. `seq` is
+ *  monotonic per terminal, for merging with `SpaceTerminalInfo::seq`'s
+ *  scrollback seed, the same way `space_log` merges with `space_logs`.
+ */
+{ type: "terminal_output"; space: string; terminal: string; seq: number; data: string } |
+/**  The terminal's shell exited (on its own, or `close_space_terminal`). */
+{ type: "terminal_exit"; space: string; terminal: string; exit_code: number | null; error: string | null };
 
 export type FileDiff = {
 	path: string,
@@ -556,6 +654,12 @@ export type FindSymbolRequest = {
 	lang: string | null,
 	/**  The file the click came from. Hits in it, or near it, rank first. */
 	from_path: string | null,
+	/**
+	 *  Where in `from_path` the click was (1-based line, char column):
+	 *  lets code intelligence resolve the exact symbol instead of the name.
+	 */
+	line?: number | null,
+	col?: number | null,
 };
 
 export type Finding = {
@@ -871,6 +975,12 @@ export type OpenPrResponse = {
 	head: Sha,
 };
 
+export type OpenTerminalRequest = {
+	space: string,
+	cols: number,
+	rows: number,
+};
+
 export type Patch = {
 	path: string,
 	before: string[],
@@ -1017,6 +1127,33 @@ export type ProjectWorkingState = {
 	dirty_files: number,
 };
 
+/**  What to do with one queued message. */
+export type QueuedAction =
+/**  Run it now if the space is free; otherwise release it to the queue. */
+{ kind: "send" } |
+/**  Drop it from the transcript. */
+{ kind: "cancel" } |
+/**  Replace its text. */
+{ kind: "edit"; text: string };
+
+/**
+ *  On a `ChatMessage` of yours that hasn't run yet: what it was sent with
+ *  and where it stands. Cleared when its turn starts.
+ */
+export type QueuedSend = {
+	/**  Queue position: the queue sends lowest first. */
+	seq: number,
+	/**  The picks it was sent with; `None` = the space's when it runs. */
+	agent?: AgentId | null,
+	model?: string | null,
+	mode?: SpaceMode | null,
+	/**
+	 *  Waits for your "Send": the turn before it was stopped or failed,
+	 *  its own turn couldn't start, or Theodore restarted meanwhile.
+	 */
+	held?: boolean,
+};
+
 export type ReactRequest = {
 	pr: PrId,
 	comment: CommentId,
@@ -1084,6 +1221,12 @@ export type RerunCheckRequest = {
 	pr: PrId,
 	/**  `Check::id`, as reported in `PrDetail::checks`. */
 	check: string,
+};
+
+export type ResizeTerminalRequest = {
+	terminal: string,
+	cols: number,
+	rows: number,
 };
 
 export type ResolveRequest = {
@@ -1228,6 +1371,15 @@ export type SaveSkillRequest = {
 	scope: string,
 	pr: PrId | null,
 	body: string,
+};
+
+/**
+ *  One item a "Send to agent" sent, and the turn it went as — `Space::turns`
+ *  once that turn finishes (`space_send_feedback`, docs/spaces.md §3).
+ */
+export type SentFeedback = {
+	item: SpaceFeedback,
+	turn: number,
 };
 
 export type SetLinearTokenRequest = {
@@ -1400,8 +1552,48 @@ export type Space = {
 	 *  agent continues it instead of replaying the transcript.
 	 */
 	agent_session?: AgentSession | null,
+	/**
+	 *  Items a "Send to agent" already sent, and which turn carries them
+	 *  (docs/spaces.md §3 "Send N to agent"): kept so the same draft,
+	 *  finding or thread isn't sent twice, and so a finding it addressed
+	 *  can be dismissed in bulk once that turn ends.
+	 */
+	sent_feedback?: SentFeedback[],
 	created_at: number,
 	updated_at: number,
+	/**
+	 *  A short chat title the chat agent proposed from the goal, shown
+	 *  instead of its raw first line (`ui/src/ui/space/spaces.ts`'s
+	 *  `defaultTitle`); `None` until that run lands or when it failed.
+	 */
+	title?: string | null,
+	/**
+	 *  The earlier conversation, summarized once and cached: what a turn
+	 *  that can't resume its agent session prepends instead of replaying
+	 *  the whole transcript (docs/spaces.md §5 "One session per space").
+	 */
+	handoff_summary?: string | null,
+	/**
+	 *  The running turn's progress tracker (`update_progress`); cleared
+	 *  when the turn ends.
+	 */
+	progress?: SpaceProgress | null,
+	/**
+	 *  An Update from base Theodore started and the agent is resolving:
+	 *  set while its merge conflicts (docs/spaces.md §6).
+	 */
+	updating?: SpaceUpdate | null,
+};
+
+/**
+ *  How far the space's base branch moved on since its `base_sha`, as of
+ *  the project's last fetch (`space_base_status`).
+ */
+export type SpaceBaseStatus = {
+	/**  The base branch's tip in Theodore's copy of the repo. */
+	base_tip: Sha,
+	/**  Commits on the base since `base_sha`. */
+	behind: number,
 };
 
 /**  `check` after a turn that changed files. */
@@ -1446,6 +1638,15 @@ export type SpaceFeedbackRequest = {
 	items: SpaceFeedback[],
 };
 
+/**
+ *  "Fix with agent" on a space PR's failing checks (docs/spaces.md "Fix
+ *  CI"): fetches each failed job's log and sends them to the space's agent
+ *  as one turn.
+ */
+export type SpaceFixCiRequest = {
+	space: string,
+};
+
 /**  One line of a space command's output (`space_logs`, `Ephemeral::SpaceLog`). */
 export type SpaceLogLine = {
 	kind: SpaceCommandKind,
@@ -1486,6 +1687,27 @@ export type SpaceProcess = {
 	 *  pid since reused by something else — before touching it.
 	 */
 	script?: string | null,
+};
+
+/**  `Space::progress`: the steps the agent last reported in this turn. */
+export type SpaceProgress = {
+	steps: SpaceProgressStep[],
+	note?: string | null,
+	at: number,
+};
+
+export type SpaceProgressState = "pending" | "active" | "done";
+
+export type SpaceProgressStep = {
+	label: string,
+	state: SpaceProgressState,
+};
+
+export type SpaceQueuedRequest = {
+	space: string,
+	/**  The queued `chat_message` id. */
+	message: string,
+	action: QueuedAction,
 };
 
 export type SpaceReviewRequest = {
@@ -1553,6 +1775,36 @@ export type SpaceStatus =
 /**  The last turn errored, was interrupted, or the worktree is gone. */
 "failed" | "archived";
 
+/**
+ *  One terminal tab. `scrollback` is the backend's bounded raw buffer
+ *  (base64, ANSI intact), written into the terminal emulator once before
+ *  live `Ephemeral::TerminalOutput` events (by `seq`) pick up where it left
+ *  off — the same seed-then-live pattern `space_logs` uses for command
+ *  output.
+ */
+export type SpaceTerminalInfo = {
+	id: string,
+	space: string,
+	title: string,
+	shell: string,
+	status: TerminalStatus,
+	exit_code?: number | null,
+	/**
+	 *  Set when the shell could not even be started (a missing cwd, an
+	 *  unknown `$SHELL`); `status` is `exited`.
+	 */
+	error?: string | null,
+	cols: number,
+	rows: number,
+	created_at: number,
+	/**
+	 *  The last output event already folded into `scrollback`; live events
+	 *  at or before this `seq` are redundant.
+	 */
+	seq: number,
+	scrollback?: string,
+};
+
 /**  "Run commands from this repo?" for a space's project. */
 export type SpaceTrustRequest = {
 	space: string,
@@ -1581,6 +1833,31 @@ export type SpaceTurn = {
 	undone?: boolean,
 	/**  `spaces.check` after the turn, when it changed files. */
 	check?: SpaceCheck | null,
+	/**
+	 *  Messages of yours sent into it while it ran ("Send now"):
+	 *  `chat_message` ids, undone with it.
+	 */
+	steered?: string[],
+	/**
+	 *  The turn completed an Update from base: the `base_sha` before it,
+	 *  which Undo puts back.
+	 */
+	base_before?: Sha | null,
+};
+
+/**
+ *  A merge of the base into the space, left in progress on conflicts
+ *  (docs/spaces.md §6 "Update from base"). Theodore commits it once the
+ *  agent has resolved them; Abort goes back to `from`.
+ */
+export type SpaceUpdate = {
+	/**  The base's tip being merged in; `base_sha` once committed. */
+	base_tip: Sha,
+	/**  The checkpoint the merge started from. */
+	from: Sha,
+	/**  Files with conflicts, as of the last look. */
+	conflicts?: string[],
+	started_at: number,
 };
 
 /**
@@ -1608,9 +1885,20 @@ export type SymbolHit = {
 	kind: SymbolKind,
 	/**  The matched source line, trimmed. */
 	preview: string,
+	/**  Who found it; the grep fallback is `Text`. */
+	source?: SymbolSource | null,
 };
 
 export type SymbolKind = "definition" | "reference";
+
+/**  How far to trust a hit (docs/code-intel.md §1). */
+export type SymbolSource =
+/**  A language server: exact. */
+"lsp" |
+/**  tree-sitter: matched by name. */
+"syntax" |
+/**  Whole-word text search. */
+"text";
 
 export type SyncCode = "I" | "U" | "C" | "A" | "D";
 
@@ -1695,6 +1983,10 @@ export type TelemetryStatus = {
 	never_sent: string[],
 };
 
+export type TerminalStatus = "running" |
+/**  The shell exited; `exit_code` says how. */
+"exited";
+
 export type Thread = {
 	id: ThreadId,
 	anchor: Anchor | null,
@@ -1768,4 +2060,10 @@ export type WireRow = {
 	id: string,
 	data: unknown,
 	archived: boolean,
+};
+
+export type WriteTerminalRequest = {
+	terminal: string,
+	/**  What was typed or pasted, as `xterm.js`'s `onData` hands it over. */
+	data: string,
 };

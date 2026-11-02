@@ -30,10 +30,9 @@ pub fn locate_binary(id: AgentId, cfg: &AgentBinaryConfig) -> Option<PathBuf> {
 /// Run `<path> --version` with a timeout; `None` on timeout, spawn failure, or
 /// non-UTF8 / empty output.
 pub async fn read_version(path: &Path) -> Option<String> {
-    let fut = tokio::process::Command::new(path)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .output();
+    let mut cmd = tokio::process::Command::new(path);
+    cmd.arg("--version").stdin(std::process::Stdio::null());
+    let fut = crate::exit_output::output_after_exit(cmd);
     let output = tokio::time::timeout(VERSION_TIMEOUT, fut)
         .await
         .ok()?

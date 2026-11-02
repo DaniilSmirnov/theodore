@@ -17,6 +17,8 @@ use tokio::sync::broadcast::error::RecvError;
 /// data dir (`~/.theodore` for production, `~/.theodore-<env>` otherwise;
 /// `~/.theodore-sandbox` in sandbox mode).
 fn main() {
+    // An agent's edit hook (docs/spaces.md §5): judges one edit and exits.
+    theodore_agents::edit_guard::run_if_requested();
     if std::env::args().any(|a| a == "--export-bindings") {
         let out = "ui/src/gen/bindings.ts";
         export_bindings(out).expect("export TS bindings");

@@ -347,6 +347,17 @@ pub trait HostAdapter: Send + Sync {
         Err(HostError::Unsupported("rerun_check"))
     }
 
+    /// The tail of a failed check's log (docs/spaces.md "Fix CI"), trimmed
+    /// to the part worth putting in an agent's prompt (ANSI and per-line
+    /// timestamps stripped, last few hundred lines). Same idea as
+    /// `rerun_check`: the whole `Check` goes in so the adapter can resolve
+    /// the right API from its id/url itself. `Ok(None)` means this check has
+    /// no log to fetch — an external status context, or any check the host
+    /// can't read logs for — callers fall back to its name and `url`.
+    async fn check_log(&self, _pr: &PrRef, _check: &Check) -> HostResult<Option<String>> {
+        Err(HostError::Unsupported("check_log"))
+    }
+
     /// Cheap single-repo metadata fetch (plan "projects"): description,
     /// visibility, last push. The per-repo counterpart to `list_repos`, used
     /// to keep a project's header current without re-listing every repo the

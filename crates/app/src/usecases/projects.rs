@@ -3,7 +3,7 @@
 //! writing to the folder's own `.git` — and reviewing one of their branches
 //! without a host PR.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use theodore_contract::{
     AddProjectRequest, Ephemeral, LocalBranch, OpenBranchRequest, Project, ProjectStatus,
@@ -341,11 +341,20 @@ impl Core {
         // Same lock `open_branch` takes, so a re-open can't interleave.
         let _guard = self.0.open_lock.lock().await;
         self.0.current_head.write().await.remove(pr);
-        self.0.revisions.write().await.retain(|(id, _), _| id != pr);
+        let mut roots: Vec<PathBuf> = Vec::new();
+        self.0.revisions.write().await.retain(|(id, _), e| {
+            if id == pr && !roots.contains(&e.worktree_path) {
+                roots.push(e.worktree_path.clone());
+            }
+            id != pr
+        });
         self.0.etags.write().await.remove(pr);
         // Best-effort: the review is closed even if its worktree was
         // already gone (or never made it to disk).
         let _ = self.0.deps.git.remove_worktree(&summary.pr).await;
+        for root in roots {
+            self.close_code_root(&root).await;
+        }
 
         let mut actions = Vec::new();
         for model in [models::PR, models::PR_DETAIL, models::GROUPING] {

@@ -431,7 +431,7 @@ async fn space_turns_carry_the_repo_instructions() {
     wait_until(|| f.agents.last_request().is_some()).await;
     let system = f.agents.last_request().unwrap().system.unwrap();
     assert!(
-        system.contains("Do not push"),
+        system.contains("never run git push"),
         "the space's own prompt stays"
     );
     assert!(system.contains("Unique repo instruction marker."));

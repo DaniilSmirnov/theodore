@@ -18,17 +18,23 @@ pub mod claude;
 pub mod codex;
 pub mod config;
 pub mod detect;
+pub mod edit_guard;
 pub mod env;
+pub mod exit_output;
 pub mod gemini;
 pub mod models;
 pub mod process;
+pub mod pty;
 pub mod shell;
 
 use async_trait::async_trait;
 use theodore_domain::AgentId;
-use theodore_ports::agent::{AgentError, AgentInfo, AgentPort, AgentRequest, AgentRun, ModelInfo};
+use theodore_ports::agent::{
+    AgentError, AgentInfo, AgentPort, AgentRequest, AgentRun, ModelInfo, Steer,
+};
 
 pub use config::{AgentBinaryConfig, AgentCliConfig};
+pub use pty::PtyRunner;
 pub use shell::ShellRunner;
 
 /// `AgentPort` over local CLI processes.
@@ -140,25 +146,14 @@ impl AgentCli {
     }
 }
 
-#[async_trait]
-impl AgentPort for AgentCli {
-    async fn detect(&self) -> Vec<AgentInfo> {
-        let mut out = Vec::with_capacity(AgentId::ALL.len());
-        for id in AgentId::ALL {
-            let cfg = self.configs.get(id);
-            let info = detect::detect_one(id, &cfg).await;
-            if let Some(v) = &info.version {
-                self.versions
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .insert(id, v.clone());
-            }
-            out.push(info);
-        }
-        out
-    }
-
-    async fn run(&self, req: AgentRequest) -> Result<AgentRun, AgentError> {
+impl AgentCli {
+    /// One CLI process for `req`; `steerable` (Claude only) keeps its stdin
+    /// open for steered messages.
+    async fn spawn(
+        &self,
+        req: AgentRequest,
+        steerable: bool,
+    ) -> Result<(AgentRun, Option<Steer>), AgentError> {
         let cfg = self.configs.get(req.agent);
         let program =
             detect::locate_binary(req.agent, &cfg).ok_or(AgentError::NotInstalled(req.agent))?;
@@ -177,7 +172,11 @@ impl AgentPort for AgentCli {
                 if let Some(g) = mcp_guard {
                     guards.push(Box::new(g));
                 }
-                claude::build_args(&req, &cfg, mcp_path.as_deref())
+                if steerable {
+                    claude::build_steerable_args(&req, &cfg, mcp_path.as_deref())
+                } else {
+                    claude::build_args(&req, &cfg, mcp_path.as_deref())
+                }
             }
             AgentId::Codex => {
                 if let Some(mcp) = &req.mcp {
@@ -195,9 +194,10 @@ impl AgentPort for AgentCli {
         };
 
         let parser: Box<dyn process::LineParser> = match req.agent {
+            AgentId::Claude if steerable => Box::new(claude::ClaudeParser::with_stdin_input()),
             AgentId::Claude => Box::new(claude::ClaudeParser::new()),
             AgentId::Codex => Box::new(codex::CodexParser::new()),
-            AgentId::Gemini => Box::new(gemini::GeminiParser::new()),
+            AgentId::Gemini => Box::new(gemini::GeminiParser::new(req.stream_text)),
         };
 
         let spec = process::SpawnSpec {
@@ -217,7 +217,49 @@ impl AgentPort for AgentCli {
                 .get(&req.agent)
                 .cloned(),
         };
-        process::spawn_and_stream(spec, parser)
+        if !steerable {
+            return process::spawn_and_stream(spec, parser).map(|run| (run, None));
+        }
+        let (steer, messages) = Steer::channel();
+        let input = process::Input {
+            first: claude::user_message_line(&req.prompt),
+            messages,
+            encode: claude::user_message_line,
+        };
+        process::spawn_with_input(spec, parser, input).map(|run| (run, Some(steer)))
+    }
+}
+
+#[async_trait]
+impl AgentPort for AgentCli {
+    async fn detect(&self) -> Vec<AgentInfo> {
+        let mut out = Vec::with_capacity(AgentId::ALL.len());
+        for id in AgentId::ALL {
+            let cfg = self.configs.get(id);
+            let info = detect::detect_one(id, &cfg).await;
+            if let Some(v) = &info.version {
+                self.versions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(id, v.clone());
+            }
+            out.push(info);
+        }
+        out
+    }
+
+    async fn run(&self, req: AgentRequest) -> Result<AgentRun, AgentError> {
+        self.spawn(req, false).await.map(|(run, _)| run)
+    }
+
+    /// Claude Code reads its messages from stdin while it runs; Codex and
+    /// Gemini take one prompt per process, so theirs is a plain run.
+    async fn run_steerable(
+        &self,
+        req: AgentRequest,
+    ) -> Result<(AgentRun, Option<Steer>), AgentError> {
+        let steerable = req.agent == AgentId::Claude;
+        self.spawn(req, steerable).await
     }
 
     async fn models(&self, agent: AgentId) -> Vec<ModelInfo> {

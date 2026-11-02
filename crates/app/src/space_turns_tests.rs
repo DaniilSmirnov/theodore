@@ -7,11 +7,12 @@ use std::time::Duration;
 
 use serde_json::json;
 use theodore_contract::{
-    AddProjectRequest, ChatMessage, CreateSpaceRequest, Project, ShipAction, ShipSpaceRequest,
-    Space, SpaceFeedback, SpaceFeedbackRequest, SpaceSendRequest, SpaceStatus, models,
+    AddProjectRequest, ChatMessage, CreateSpaceRequest, Project, SentFeedback, ShipAction,
+    ShipSpaceRequest, Space, SpaceFeedback, SpaceFeedbackRequest, SpaceSendRequest, SpaceStatus,
+    models,
 };
 use theodore_domain::{AgentId, Author, PrId, Sha, Usage};
-use theodore_ports::{AgentEvent, NewAction, Store, SyncActionCode};
+use theodore_ports::{AgentEvent, AgentRequest, NewAction, Store, SyncActionCode};
 
 use crate::testkit::{Fixtures, fixtures};
 use crate::usecases::spaces::space_chat_key;
@@ -461,6 +462,78 @@ async fn a_thread_and_a_finding_on_the_space_pr_go_as_one_turn() {
 }
 
 #[tokio::test]
+async fn sent_feedback_is_marked_with_the_turn_it_rides_and_not_sent_twice() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    f.agents.push_script(done("one"));
+    f.git.push_checkpoint(Sha::new("turn1"));
+    let s = core
+        .create_space(request(&project, "Redirect"))
+        .await
+        .unwrap();
+    let s = idle(&f, &s.id).await;
+    assert_eq!(s.turns, 1);
+    let review = s.review_pr.clone().unwrap();
+    put(
+        &f,
+        models::DRAFT,
+        "d1",
+        json!({ "id": "d1", "pr": review, "anchor": anchor("src/redirect.ts", 12),
+                "body": "also handle //evil.com", "source": { "kind": "me" },
+                "outdated": false }),
+    );
+
+    f.agents.push_script(done("Handled it."));
+    core.space_send_feedback(SpaceFeedbackRequest {
+        space: s.id.clone(),
+        items: vec![SpaceFeedback::Draft("d1".into())],
+    })
+    .await
+    .expect("send to agent");
+
+    // Recorded at once, before the turn it starts has even finished.
+    let mid = space(&f, &s.id);
+    assert_eq!(
+        mid.sent_feedback,
+        vec![SentFeedback {
+            item: SpaceFeedback::Draft("d1".into()),
+            turn: 2,
+        }]
+    );
+
+    let s = idle(&f, &s.id).await;
+    assert_eq!(s.turns, 2);
+    // The turn finishing doesn't touch the marking; it's keyed by turn
+    // number, not by a flag the turn flips.
+    assert_eq!(s.sent_feedback, mid.sent_feedback);
+
+    // Sending it again (e.g. the UI composed a second batch before seeing
+    // the first was recorded) adds a second entry at the next turn — the
+    // core doesn't refuse a resend, the footer's own filtering does.
+    f.agents.push_script(done("Handled it again."));
+    core.space_send_feedback(SpaceFeedbackRequest {
+        space: s.id.clone(),
+        items: vec![SpaceFeedback::Draft("d1".into())],
+    })
+    .await
+    .expect("send to agent again");
+    let s = idle(&f, &s.id).await;
+    assert_eq!(
+        s.sent_feedback,
+        vec![
+            SentFeedback {
+                item: SpaceFeedback::Draft("d1".into()),
+                turn: 2,
+            },
+            SentFeedback {
+                item: SpaceFeedback::Draft("d1".into()),
+                turn: 3,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
 async fn feedback_from_another_pr_is_refused() {
     let f = fixtures();
     let (core, _recv, project) = started(&f).await;
@@ -581,6 +654,46 @@ async fn the_next_turn_continues_the_session_with_only_the_new_message() {
     assert!(req.system.is_some(), "the system prompt goes on every turn");
     assert_eq!(s.agent_session.unwrap().id, "s1");
     assert!(transcript(&f, &s.id).iter().any(|m| m.text == "Logged it."));
+}
+
+/// A turn's answer streams piece by piece, shows once, and the stored
+/// reply is the whole message.
+#[tokio::test]
+async fn a_turn_streams_its_answer_once_and_stores_it_whole() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    let s = space_in_session(&f, &core, &project).await;
+    let mut events = core.0.ephemeral_tx.subscribe();
+
+    f.agents.push_script(vec![
+        AgentEvent::TextDelta { text: "Log".into() },
+        AgentEvent::TextDelta {
+            text: "ged.".into(),
+        },
+        AgentEvent::Text {
+            text: "Logged.".into(),
+        },
+        AgentEvent::Done {
+            final_text: "Logged.".into(),
+            usage: Usage::default(),
+        },
+    ]);
+    let s = send(&f, &core, &s.id, "Log it", None).await;
+    assert!(f.agents.last_request().unwrap().stream_text);
+
+    let mut shown = String::new();
+    while let Ok(e) = events.try_recv() {
+        if let theodore_contract::Ephemeral::AgentDelta { text, .. } = e {
+            shown.push_str(&text);
+        }
+    }
+    assert_eq!(shown, "Logged.");
+    let replies: Vec<_> = transcript(&f, &s.id)
+        .into_iter()
+        .filter(|m| m.text.starts_with("Logged"))
+        .map(|m| m.text)
+        .collect();
+    assert_eq!(replies, vec!["Logged.".to_string()]);
 }
 
 #[tokio::test]
@@ -751,4 +864,119 @@ async fn unarchive_keeps_the_session_unless_the_checkpoints_are_gone() {
     );
     let s = core.unarchive_space(&s.id).await.unwrap();
     assert_eq!(s.agent_session, None);
+}
+
+// ── handoff summaries ────────────────────────────────────────────────────────
+
+fn is_summary_call(req: &AgentRequest) -> bool {
+    req.system.as_deref() == Some(crate::usecases::space_handoff::SUMMARY_SYSTEM)
+}
+
+fn summary_calls(f: &Fixtures) -> usize {
+    f.agents
+        .utility_requests()
+        .iter()
+        .filter(|r| is_summary_call(r))
+        .count()
+}
+
+/// `space_in_session`, then `extra` more turns resuming the same session —
+/// enough of them pushes the history past `HISTORY_MESSAGES` without ever
+/// needing a summary yet.
+async fn long_space_in_session(f: &Fixtures, core: &Core, project: &Project, extra: u32) -> Space {
+    let mut s = space_in_session(f, core, project).await;
+    for i in 0..extra {
+        f.agents.push_script(in_session("s1", &format!("did {i}")));
+        s = send(f, core, &s.id, &format!("do {i}"), None).await;
+    }
+    s
+}
+
+#[tokio::test]
+async fn a_long_space_gets_a_cached_summary_when_it_cant_resume() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    // Turn 1 plus 6 more: 14 messages, past the 12-message replay window.
+    let s = long_space_in_session(&f, &core, &project, 6).await;
+    assert_eq!(
+        f.agents.last_request().unwrap().resume.as_deref(),
+        Some("s1")
+    );
+
+    // Switching to Gemini can't resume: the summarizer runs once.
+    f.agents.push_tagged(
+        is_summary_call,
+        vec![AgentEvent::Done {
+            final_text: "Added a guard; six follow-ups logged things.".into(),
+            usage: Usage::default(),
+        }],
+    );
+    f.agents.push_script(vec![AgentEvent::Done {
+        final_text: "Reviewed.".into(),
+        usage: Usage::default(),
+    }]);
+    let s = send(&f, &core, &s.id, "Have a look", Some(AgentId::Gemini)).await;
+
+    let req = f.agents.last_request().unwrap();
+    assert!(
+        req.prompt.starts_with(
+            "Summary of the conversation before this point:\n\
+             Added a guard; six follow-ups logged things.\n\n\
+             Conversation so far:"
+        ),
+        "{}",
+        req.prompt
+    );
+    assert_eq!(summary_calls(&f), 1);
+    assert_eq!(
+        space(&f, &s.id).handoff_summary.as_deref(),
+        Some("Added a guard; six follow-ups logged things.")
+    );
+
+    // Another switch reuses the cached summary: no second call.
+    f.agents.push_script(in_session("s2", "ok"));
+    send(&f, &core, &s.id, "Go on", Some(AgentId::Claude)).await;
+    assert_eq!(summary_calls(&f), 1, "cached, not asked again");
+}
+
+#[tokio::test]
+async fn a_failed_summarizer_falls_back_to_the_plain_replay() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    let s = long_space_in_session(&f, &core, &project, 6).await;
+
+    f.agents.push_tagged(
+        is_summary_call,
+        vec![AgentEvent::Error {
+            message: "rate limited".into(),
+            stderr_tail: String::new(),
+        }],
+    );
+    f.agents.push_script(done("Reviewed."));
+    let s = send(&f, &core, &s.id, "Have a look", Some(AgentId::Gemini)).await;
+
+    let req = f.agents.last_request().unwrap();
+    assert!(
+        !req.prompt
+            .contains("Summary of the conversation before this point"),
+        "{}",
+        req.prompt
+    );
+    assert!(req.prompt.contains("Conversation so far:"));
+    assert_eq!(summary_calls(&f), 1);
+    assert_eq!(space(&f, &s.id).handoff_summary, None);
+}
+
+/// A space whose history never outgrows the replay window needs no
+/// summarizer call at all, even across an agent switch.
+#[tokio::test]
+async fn a_short_space_switch_needs_no_summary() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    let s = space_in_session(&f, &core, &project).await;
+
+    f.agents.push_script(done("Reviewed."));
+    let s = send(&f, &core, &s.id, "Have a look", Some(AgentId::Gemini)).await;
+    assert_eq!(summary_calls(&f), 0);
+    assert_eq!(space(&f, &s.id).handoff_summary, None);
 }

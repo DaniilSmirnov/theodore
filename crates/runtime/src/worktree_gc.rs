@@ -152,6 +152,8 @@ pub fn spawn_periodic(
             if let Err(e) = sweep(git.as_ref(), store.clone(), locks.clone(), open).await {
                 tracing::warn!(error = %e, "worktree gc sweep failed");
             }
+            // Code intelligence lets go of the worktrees the sweep removed.
+            core.code_intel_sweep().await;
         }
     })
 }

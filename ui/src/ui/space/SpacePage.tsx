@@ -17,6 +17,7 @@ import {
   CodePullRequest,
   Folder,
   LayoutSideContentRight,
+  Pencil,
 } from '@gravity-ui/icons';
 import {
   Alert,
@@ -55,13 +56,16 @@ import { Hints, K, Spinner } from '../bits';
 import { DiffPane, type ComposerState } from '../DiffPane';
 import { RevisionError } from '../review/RevisionError';
 import type { ReviewMode } from '../GroupsPane';
-import { ToolCalls } from '../SidePanel';
-import { Md } from '../../highlight';
-import { MessageAttachments, useAttachments } from '../attachments';
+import { ToolCalls } from '../ToolCalls';
+import { useAttachments } from '../attachments';
+import { ChatEmpty, ChatLive, ChatLog, ChatMessage } from '../ChatTurn';
+import { QueuedMessages } from './QueuedMessages';
+import { canSendNow, splitQueue } from './queue';
 import { latinKey, useViewKeys } from '../keys';
 import { AgentChip, ChipMenu, Composer } from './Composer';
-import { agentEffort, agentLabel, agentModel } from '../agentModel';
+import { agentModel } from '../agentModel';
 import { isBuildMode } from './mode';
+import { ReviewMenu } from './ReviewMenu';
 import { markSpaceSeen } from './seen';
 import {
   checksByReply,
@@ -70,7 +74,9 @@ import {
   settingUp,
   setupView,
 } from './commands';
-import { GlobalConfigSection } from './ConfigSection';
+import { GlobalConfigSection, SpaceSetupAssistHint } from './ConfigSection';
+import { SpaceProgress } from './SpaceProgress';
+import { BaseMoved, UpdatingBanner } from './BaseUpdate';
 import {
   CheckChip,
   LogsDrawer,
@@ -84,6 +90,7 @@ import {
   useSpaceConfig,
   useSpaceLogsSeed,
 } from './SpaceCommands';
+import { TerminalDrawer, TerminalToggle } from './Terminal';
 import {
   AUTO_ARCHIVE_KEY,
   BUILD_MODE_KEY,
@@ -116,6 +123,7 @@ const WHOLE_DIFF: ReviewMode = { mode: 'groups', group: null, file: null };
 type Store = ReturnType<typeof useRootStore>;
 
 const LS_SPACE_CHANGES = `${STORAGE_NS}theodore-space-changes`;
+const LS_SPACE_TERMINAL = `${STORAGE_NS}theodore-space-terminal`;
 type Ui = ReturnType<typeof useUi>;
 
 /** What the page's keys reach inside the chat and the ship controls. */
@@ -181,6 +189,31 @@ export const SpacePage = observer(function SpacePage({ id }: { id: string }) {
       localStorage.setItem(LS_SPACE_CHANGES, v ? '0' : '1');
       return !v;
     });
+  // Same idea for the terminal drawer, default closed: its shells live in
+  // the core regardless, so reopening it (or navigating back to the page)
+  // just re-lists and re-attaches them.
+  const [terminalOpen, setTerminalOpen] = useState(
+    () => localStorage.getItem(LS_SPACE_TERMINAL) === '1',
+  );
+  const toggleTerminal = () =>
+    setTerminalOpen((v) => {
+      localStorage.setItem(LS_SPACE_TERMINAL, v ? '0' : '1');
+      return !v;
+    });
+  // ⌃` toggles it from anywhere on the page, composer included — the same
+  // reach as ⌘.'s stop, below.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || e.key !== '`') return;
+      e.preventDefault();
+      setTerminalOpen((v) => {
+        localStorage.setItem(LS_SPACE_TERMINAL, v ? '0' : '1');
+        return !v;
+      });
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, []);
   useSpaceLogsSeed(id);
   const run = space ? runControl(config, space) : null;
 
@@ -287,9 +320,12 @@ export const SpacePage = observer(function SpacePage({ id }: { id: string }) {
         config={config}
         logsOpen={logsOpen}
         onToggleLogs={() => setLogsOpen((v) => !v)}
+        terminalOpen={terminalOpen}
+        onToggleTerminal={toggleTerminal}
         showChanges={showChanges}
         onToggleChanges={toggleChanges}
       />
+      <UpdatingBanner space={space} />
       <div className="flex min-h-0 flex-1">
         <section
           className={
@@ -305,7 +341,7 @@ export const SpacePage = observer(function SpacePage({ id }: { id: string }) {
               onChanged={refreshConfig}
             />
           </div>
-          <SpaceChat space={space} handle={chat} />
+          <SpaceChat space={space} config={config} handle={chat} />
         </section>
         {showChanges && (
           <section className="flex min-w-0 flex-1 flex-col">
@@ -322,10 +358,18 @@ export const SpacePage = observer(function SpacePage({ id }: { id: string }) {
       {logsOpen && (
         <LogsDrawer space={space} onClose={() => setLogsOpen(false)} />
       )}
+      {terminalOpen && live && (
+        <TerminalDrawer
+          space={space.id}
+          open={terminalOpen}
+          onClose={() => setTerminalOpen(false)}
+        />
+      )}
       {space.status === 'archived' && <ArchivedBanner space={space} />}
       <Hints>
-        <K>C</K> message the agent <K>M</K> mode <K>D</K> changes <K>⌘.</K> stop{' '}
-        <K>R</K> review <K>P</K> {space.pr ? 'push' : 'ship'}
+        <K>C</K> message the agent <K>M</K> mode <K>D</K> changes <K>⌃`</K>{' '}
+        terminal <K>⌘.</K> stop <K>R</K> review <K>P</K>{' '}
+        {space.pr ? 'push' : 'ship'}
         {space.pr ? (
           <>
             {' '}
@@ -376,6 +420,8 @@ const SpaceHeader = observer(function SpaceHeader({
   config,
   logsOpen,
   onToggleLogs,
+  terminalOpen,
+  onToggleTerminal,
   showChanges,
   onToggleChanges,
 }: {
@@ -384,12 +430,13 @@ const SpaceHeader = observer(function SpaceHeader({
   config: SpaceConfigView | null;
   logsOpen: boolean;
   onToggleLogs: () => void;
+  terminalOpen: boolean;
+  onToggleTerminal: () => void;
   showChanges: boolean;
   onToggleChanges: () => void;
 }) {
   const store = useRootStore();
   const ui = useUi();
-  const [busy, setBusy] = useState(false);
   const running = space.status === 'running';
   const archived = space.status === 'archived';
   const project = store.models.projects.get(space.project);
@@ -422,26 +469,14 @@ const SpaceHeader = observer(function SpaceHeader({
         </span>
       )}
       <span className="flex-1" />
+      <BaseMoved space={space} />
       <RunButton space={space} config={config} />
       <PortChips space={space} />
       <LogsToggle open={logsOpen} onToggle={onToggleLogs} />
-      <Button
-        size="sm"
-        variant="secondary"
-        isDisabled={busy || archived}
-        onPress={async () => {
-          setBusy(true);
-          try {
-            await openGroupedReview(store, ui, space);
-          } catch {
-            // toasted by api.ts
-          } finally {
-            setBusy(false);
-          }
-        }}
-      >
-        Review
-      </Button>
+      {!archived && (
+        <TerminalToggle open={terminalOpen} onToggle={onToggleTerminal} />
+      )}
+      <ReviewMenu space={space} />
       {!archived && project && (
         <ShipControls
           space={space}
@@ -689,11 +724,14 @@ const ShipControls = observer(function ShipControls({
   );
 });
 
-const SpaceChat = observer(function SpaceChat({
+/** The space's chat: its turns, the live one, the composer. */
+export const SpaceChat = observer(function SpaceChat({
   space,
+  config,
   handle,
 }: {
   space: Space;
+  config: SpaceConfigView | null;
   /** `C` / `M` on the page. */
   handle: MutableRefObject<ChatHandle | null>;
 }) {
@@ -702,9 +740,10 @@ const SpaceChat = observer(function SpaceChat({
   const files = useAttachments();
   const input = useRef<HTMLTextAreaElement>(null);
   const end = useRef<HTMLDivElement>(null);
-  const messages = [
+  // Queued messages wait under the running turn, in the order they send.
+  const { sent: messages, queued } = splitQueue([
     ...store.models.chatMessages.byPr(spaceChatKey(space.id)),
-  ].sort((a, b) => a.at - b.at);
+  ]);
   const run = space.status === 'running' ? space.run : null;
   const undone = undoneMessages(space);
   const undo = undoState(space);
@@ -720,16 +759,19 @@ const SpaceChat = observer(function SpaceChat({
     ) : null;
   };
   const setupStage = setupView(space) === 'stage';
-  const streaming = run ? store.ephemeral.agentText.get(run) : undefined;
-  const tools = run ? (store.ephemeral.runLog.get(run) ?? []) : [];
+  // A turn whose check still runs has its reply stored already: its text
+  // shows there, not twice.
+  const replied = run != null && [...turnRuns.values()].includes(run);
   useEffect(() => {
     end.current?.scrollIntoView?.({ block: 'end' });
-  }, [messages.length, streaming]);
+  }, [messages.length, queued.length, run]);
 
   // Sticky per space: the next turn starts in the space's last mode.
   const [mode, setMode] = useState<SpaceMode>(space.mode);
   useEffect(() => setMode(space.mode), [space.mode]);
-  const locked = !!run || space.status === 'archived';
+  // Open while a turn runs: a queued message keeps the picks it was sent
+  // with.
+  const locked = space.status === 'archived';
   // `/skill` in the box: your Claude skills and the repo's.
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   useEffect(() => {
@@ -750,103 +792,98 @@ const SpaceChat = observer(function SpaceChat({
     cycleMode: () => !locked && setMode((m) => nextMode(m)),
   };
 
-  const send = () => {
+  const send = (now = false) => {
     const t = text.trim();
-    if ((!t && !files.ids.length) || run || files.busy) return;
+    if ((!t && !files.ids.length) || files.busy) return;
     if (space.status === 'archived') return;
     setText('');
-    void api
-      .spaceSend({
-        space: space.id,
-        text: t,
-        agent: agent === space.agent ? null : agent,
-        // The chip's model, so a change there reaches the next turn.
-        model: agentModel(store, agent),
-        mode: mode === space.mode ? null : mode,
-        attachments: files.ids.length ? files.ids : null,
-      })
+    void (now ? api.spaceSendNow : api.spaceSend)({
+      space: space.id,
+      text: t,
+      agent: agent === space.agent ? null : agent,
+      // The chip's model, so a change there reaches the next turn; "Send
+      // now" keeps the running turn's.
+      model: now ? null : agentModel(store, agent),
+      mode: mode === space.mode ? null : mode,
+      attachments: files.ids.length ? files.ids : null,
+    })
       .then(() => files.clear())
       .catch(() => setText(t));
   };
+  const sendNow = canSendNow(space, {
+    agent,
+    mode,
+    files: files.ids.length,
+  })
+    ? () => send(true)
+    : undefined;
 
   return (
     <>
-      <div className="flex min-h-0 flex-1 flex-col overflow-auto">
-        {/* Messages keep a reading width; the scroll area and the input
-            strip below span the whole column. */}
-        <div className="mx-auto flex w-full max-w-[860px] flex-col gap-4 px-5 py-4">
-          <SetupStage space={space} />
-          <SetupNote space={space} />
-          {messages.length === 0 && !run && !setupStage && (
-            <span className="text-sm text-muted">
-              Tell the agent what to change. It works in its own worktree; your
-              checkout is never touched.
-            </span>
-          )}
-          {messages.map((m) => (
-            <div
+      <ChatLog end={end}>
+        <SetupStage space={space} />
+        <SetupNote space={space} />
+        {messages.length === 0 && !run && !setupStage && (
+          <>
+            <ChatEmpty
+              icon={<Pencil />}
+              title="Tell the agent what to change"
+              hint="It works in its own worktree; your checkout is never touched."
+            />
+            <SpaceSetupAssistHint space={space} config={config} />
+          </>
+        )}
+        {messages.map((m) => {
+          const agent = m.author.kind === 'agent';
+          const undoneReply = agent && undone.has(m.id);
+          const undoHere =
+            undo.turn?.reply === m.id && space.status !== 'archived';
+          return (
+            <ChatMessage
               key={m.id}
-              className={`flex flex-col gap-1 ${undone.has(m.id) ? 'space-undone opacity-50' : ''}`}
-            >
-              <span className="flex items-center gap-1.5 text-xs text-muted">
-                {m.author.kind === 'me' ? 'you' : m.author.agent}
-                {undone.has(m.id) && m.author.kind === 'agent' && (
-                  <span className="rounded-full bg-default px-1.5 text-[10px]">
-                    undone
-                  </span>
-                )}
-                {undo.turn?.reply === m.id && space.status !== 'archived' && (
-                  <UndoTurn
-                    space={space}
-                    reason={undo.ok ? null : undo.reason}
-                  />
-                )}
-              </span>
-              {m.failed ? (
-                <span className="text-sm text-danger [overflow-wrap:anywhere]">
-                  {m.failed}
-                </span>
-              ) : (
-                <div className="text-sm leading-relaxed">
-                  {m.author.kind === 'me' ? (
-                    <span className="whitespace-pre-wrap">{m.text}</span>
-                  ) : (
-                    <Md text={m.text} />
-                  )}
-                </div>
-              )}
-              <MessageAttachments attachments={m.attachments} />
-              {m.author.kind === 'agent' && turnTools(m.id)}
-              {m.author.kind === 'agent' && checks.has(m.id) && (
-                <CheckChip check={checks.get(m.id)!} />
-              )}
-            </div>
-          ))}
-          {run && (
-            <div className="flex flex-col gap-1">
-              <span className="flex items-center gap-2 text-xs text-muted">
-                <Spinner />{' '}
-                {agentLabel(
-                  space.agent,
-                  space.model ?? agentModel(store, space.agent),
-                  agentEffort(store, space.agent),
-                )}{' '}
-                is working
-              </span>
-              {tools.length > 0 && (
-                <ToolCalls tools={tools} running turn={run} />
-              )}
-              {streaming && (
-                <div className="text-sm leading-relaxed">
-                  <Md text={streaming} />
-                </div>
-              )}
-            </div>
-          )}
-          <div ref={end} />
-        </div>
-      </div>
-      <div className="px-4 pb-3 pt-1">
+              m={m}
+              className={undone.has(m.id) ? 'space-undone opacity-50' : ''}
+              badges={
+                undoneReply || undoHere ? (
+                  <>
+                    {undoneReply && (
+                      <span className="rounded-full bg-default px-1.5 text-[10px] text-muted">
+                        undone
+                      </span>
+                    )}
+                    {undoHere && (
+                      <UndoTurn
+                        space={space}
+                        reason={undo.ok ? null : undo.reason}
+                      />
+                    )}
+                  </>
+                ) : undefined
+              }
+              after={
+                agent ? (
+                  <>
+                    {turnTools(m.id)}
+                    {checks.has(m.id) && (
+                      <CheckChip check={checks.get(m.id)!} />
+                    )}
+                  </>
+                ) : undefined
+              }
+            />
+          );
+        })}
+        {run && (
+          <ChatLive
+            run={run}
+            agent={space.agent}
+            text={!replied}
+            follow={end}
+          />
+        )}
+        <QueuedMessages space={space} queued={queued} />
+      </ChatLog>
+      <div className="chat-input px-4 pb-3 pt-1">
         <div className="mx-auto flex w-full max-w-[860px] flex-col gap-2">
           {space.status === 'failed' && space.error && (
             <span
@@ -856,21 +893,26 @@ const SpaceChat = observer(function SpaceChat({
               {space.error}
             </span>
           )}
+          <SpaceProgress space={space} />
           <Composer
             inputRef={input}
             value={text}
             onChange={setText}
-            onSubmit={send}
+            onSubmit={() => send()}
             placeholder={
               space.status === 'archived'
                 ? 'Archived'
                 : settingUp(space)
                   ? 'Setting up…'
-                  : 'Ask the agent to change something…'
+                  : run
+                    ? 'Queue a message for after this turn…'
+                    : 'Ask the agent to change something…'
             }
             disabled={space.status === 'archived' || settingUp(space)}
             running={!!run}
             onStop={() => void api.spaceStop(space.id).catch(() => {})}
+            onSendNow={sendNow}
+            queueWhileRunning
             skills={skills}
             attachments={files}
             chips={
@@ -1073,6 +1115,7 @@ export const NewSpaceModal = observer(function NewSpaceModal() {
             onSubmit={() => void start()}
             placeholder="What do you want to work on?"
             rows={5}
+            quiet
             autoFocus
             disabled={busy || !project}
             submit={busy ? 'Creating…' : 'Create'}

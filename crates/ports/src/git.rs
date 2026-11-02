@@ -36,9 +36,45 @@ pub enum GitError {
     /// The message is meant for the user as is.
     #[error("{0}")]
     Refused(String),
+    /// A space's directory is not its own git worktree any more (its `.git`
+    /// is gone, or points elsewhere), so git would resolve another
+    /// repository — a parent one, say. Nothing was run. The message is
+    /// meant for the user as is.
+    #[error("{0}")]
+    NotAWorktree(String),
+    /// A git operation is unfinished in a space's worktree (docs/spaces.md
+    /// §6): nothing was committed or reset.
+    #[error("{0} in the space's worktree; finish or abort it first")]
+    Busy(WorktreeBusy),
 }
 
 pub type GitResult<T> = Result<T, GitError>;
+
+/// What git is in the middle of in a worktree (`GitPort::worktree_busy`).
+/// Checkpoint and Undo wait while it lasts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeBusy {
+    /// `rebase-merge` / `rebase-apply` (also `git am`).
+    Rebase,
+    Merge,
+    CherryPick,
+    Revert,
+    /// Unmerged index entries with none of the above (a conflicting
+    /// `stash pop`, `checkout -m`).
+    Conflicts,
+}
+
+impl std::fmt::Display for WorktreeBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            WorktreeBusy::Rebase => "rebase in progress",
+            WorktreeBusy::Merge => "merge in progress",
+            WorktreeBusy::CherryPick => "cherry-pick in progress",
+            WorktreeBusy::Revert => "revert in progress",
+            WorktreeBusy::Conflicts => "unresolved conflicts",
+        })
+    }
+}
 
 impl GitError {
     /// The stable error code logged as `error.code` (docs/telemetry.md).
@@ -52,6 +88,8 @@ impl GitError {
             GitError::Io(_) => "git.io",
             GitError::Unsupported(_) => "git.unsupported",
             GitError::Refused(_) => "git.refused",
+            GitError::NotAWorktree(_) => "git.not_a_worktree",
+            GitError::Busy(_) => "git.busy",
         }
     }
 }
@@ -362,7 +400,9 @@ pub trait GitPort: Send + Sync {
     /// created at the space's checkpoint ref (`refs/theodore/spaces/<space>`)
     /// if one exists, else at `base` — which then becomes the ref. An
     /// existing worktree is returned as is: it may hold the agent's
-    /// uncommitted edits, so it is never reset. `repo` is the bare cache.
+    /// uncommitted edits, so it is never reset. A directory there that is
+    /// not a worktree of Theodore's (its `.git` gone) is moved aside and
+    /// the worktree recreated. `repo` is the bare cache.
     async fn space_worktree(&self, repo: &Path, space: &str, base: &Sha) -> GitResult<Worktree> {
         let _ = (repo, space, base);
         Err(GitError::Unsupported("space_worktree"))
@@ -370,7 +410,10 @@ pub trait GitPort: Send + Sync {
 
     /// Commits everything in a space's worktree (if anything changed) as a
     /// checkpoint and points `refs/theodore/spaces/<space>` at `HEAD` —
-    /// including commits the agent made itself. Returns `HEAD`.
+    /// including commits the agent made itself. Returns `HEAD`. Commits
+    /// nothing, with `Busy`, while a rebase, merge or conflict is
+    /// unfinished there; `NotAWorktree` when git would resolve another
+    /// repository from `worktree`.
     async fn space_checkpoint(
         &self,
         worktree: &Path,
@@ -383,14 +426,72 @@ pub trait GitPort: Send + Sync {
 
     /// Moves a space back to an earlier checkpoint `to`: its worktree is
     /// reset to it (tracked and untracked edits dropped; ignored files
-    /// stay) and `refs/theodore/spaces/<space>` points at it again.
+    /// stay) and `refs/theodore/spaces/<space>` points at it again. Same
+    /// refusals as `space_checkpoint`.
     async fn space_reset(&self, worktree: &Path, space: &str, to: &Sha) -> GitResult<()> {
         let _ = (worktree, space, to);
         Err(GitError::Unsupported("space_reset"))
     }
 
+    /// The git operation unfinished in a space's `worktree`, if any. Read
+    /// only. `Ok(None)` by default (fakes); the git CLI checks the
+    /// worktree's root first (`NotAWorktree`).
+    async fn worktree_busy(&self, worktree: &Path) -> GitResult<Option<WorktreeBusy>> {
+        let _ = worktree;
+        Ok(None)
+    }
+
+    /// The space's worktree as it is now, as a commit on top of `HEAD`:
+    /// staged through a temporary index, so the worktree's own index, its
+    /// `HEAD` and every ref stay as they were. `HEAD` itself when nothing
+    /// changed since the last checkpoint.
+    async fn space_snapshot(&self, worktree: &Path) -> GitResult<Sha> {
+        let _ = worktree;
+        Err(GitError::Unsupported("space_snapshot"))
+    }
+    /// Update from base (docs/spaces.md §6): merges `tip` into a space's
+    /// worktree (never a rebase, so pushed history stays). Clean: Theodore
+    /// commits it as a checkpoint (`message`) and `Merged` is the new
+    /// head, ref moved. Conflicts: the merge is left in progress for the
+    /// agent and `Conflicts` lists the files. `Busy` when another operation
+    /// is unfinished there already.
+    async fn space_merge(
+        &self,
+        worktree: &Path,
+        space: &str,
+        tip: &Sha,
+        message: &str,
+    ) -> GitResult<SpaceMerge> {
+        let _ = (worktree, space, tip, message);
+        Err(GitError::Unsupported("space_merge"))
+    }
+
+    /// Completes the merge `space_merge` left in progress: once no file it
+    /// listed still has conflict markers, everything is staged and the
+    /// merge commit written as a checkpoint (`Merged`); otherwise
+    /// `Conflicts` with what is left. A merge concluded in the worktree by
+    /// hand is checkpointed as is; `NotMerging` when it was aborted there.
+    async fn space_merge_finish(
+        &self,
+        worktree: &Path,
+        space: &str,
+        tip: &Sha,
+        message: &str,
+    ) -> GitResult<SpaceMerge> {
+        let _ = (worktree, space, tip, message);
+        Err(GitError::Unsupported("space_merge_finish"))
+    }
+
+    /// Abandons an update from base: `merge --abort`, then the worktree
+    /// and `refs/theodore/spaces/<space>` back at checkpoint `to`.
+    async fn space_merge_abort(&self, worktree: &Path, space: &str, to: &Sha) -> GitResult<()> {
+        let _ = (worktree, space, to);
+        Err(GitError::Unsupported("space_merge_abort"))
+    }
+
     /// Removes a space's worktree directory. The checkpoint ref stays, so
-    /// `space_worktree` can bring the space back.
+    /// `space_worktree` can bring the space back. A directory that isn't
+    /// a worktree of Theodore's is moved aside, never deleted.
     async fn remove_space_worktree(&self, repo: &Path, space: &str) -> GitResult<()> {
         let _ = (repo, space);
         Err(GitError::Unsupported("remove_space_worktree"))
@@ -524,8 +625,25 @@ pub struct SpaceCommit {
     /// `parent` has moved on since (someone else pushed to the branch):
     /// only `replay_from..head` is applied on top of `parent`.
     pub replay_from: Option<Sha>,
+    /// The base tip merged into the space since (Update from base): a
+    /// second parent, so the host sees the base merged in and the PR's
+    /// diff stays the change alone. Dropped when `parent` already
+    /// contains it.
+    pub merge_parent: Option<Sha>,
     pub message: String,
     pub author: Identity,
+}
+
+/// What `GitPort::space_merge` / `space_merge_finish` left in a space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpaceMerge {
+    /// The merge is committed; the new checkpoint.
+    Merged(Sha),
+    /// Still in progress: these files have conflicts.
+    Conflicts(Vec<String>),
+    /// No merge in progress any more, and the base isn't in `HEAD`: it
+    /// was aborted in the worktree.
+    NotMerging,
 }
 
 /// Where a space's last shipped (squashed) commit is kept in the cache.

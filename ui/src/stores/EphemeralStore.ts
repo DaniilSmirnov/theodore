@@ -27,7 +27,10 @@ import type {
   UpdateInfo,
 } from '../gen/contract';
 import { appendLogs, seedLogs } from '../ui/space/commands';
+import { appendChunk, type TerminalChunk } from '../ui/space/terminalBuffer';
 import { configPrToast } from '../ui/project/configFile';
+import { suggestText } from '../ui/settings/languages';
+import { api } from '../core/api';
 import { openExternal } from '../core/openExternal';
 import { accountGate, type AccountGate } from '../core/accountGate';
 
@@ -46,6 +49,9 @@ export interface Toast {
    *  `ephemeral` event from core, only by client code that pushes its own
    *  toast (a function can't cross the wire). */
   action?: ToastAction;
+  /** A second choice next to `action` ("Not now"); either one closes the
+   *  toast, which then stays up longer. */
+  secondary?: ToastAction;
 }
 
 /** A question asked about one diff line, shown on the line itself while it
@@ -67,6 +73,8 @@ export interface LineAsk {
   message: string | null;
   /** The reply's chat message id, once it lands. */
   reply: string | null;
+  /** When it was asked (ms): the AI panel's Stop goes to the newest run. */
+  startedAt?: number;
 }
 
 /** What the AI panel should bring into view: a chat message, or the
@@ -76,6 +84,18 @@ export interface AskFocus {
   pr: PrId;
   message: string | null;
   seq: number;
+}
+
+/** A question asked with no diff-line chip to pin it to — the composer's
+ *  plain send, or a fixed question like a hunk's "Ask agent": the pending
+ *  bubble shown in the chat (question, then the agent's streaming text)
+ *  until the real reply lands. One per PR; a later ask replaces it. */
+export interface ChatPending {
+  run: string;
+  startedAt: number;
+  /** So a stalled run's Retry can resend the same question. */
+  question: string;
+  agent: AgentId | null;
 }
 
 /** A one-shot request to a component, per PR; `seq` makes asking twice
@@ -106,10 +126,24 @@ export interface HostStatus {
 }
 
 export class EphemeralStore {
-  /** Streaming text per run id, appended as `agent_delta` events arrive. */
-  agentText = new Map<string, string>();
-  /** Last lines of a skill run's log, per run id. */
-  runLog = new Map<string, string[]>();
+  /** Streaming text per run id, appended as `agent_delta` events arrive
+   *  (a piece at a time while the agent writes). Observable per key: a
+   *  view reading one run re-renders only when that run grows. */
+  readonly agentText: ObservableMap<string, string> = observable.map(
+    {},
+    { deep: false },
+  );
+  /** Last lines of a run's log (its tool calls), per run id. */
+  readonly runLog: ObservableMap<string, string[]> = observable.map(
+    {},
+    { deep: false },
+  );
+  /** The fix run of each task delegated this session, by task id: what
+   *  its row shows live while the task is in progress. */
+  readonly taskRuns: ObservableMap<string, string> = observable.map(
+    {},
+    { deep: false },
+  );
   /** Run ids with no output for `agents.stall_after_ms` while still alive —
    *  the UI offers Retry/Cancel instead of waiting silently. Cleared as
    *  soon as the run produces output again, or ends. */
@@ -146,6 +180,16 @@ export class EphemeralStore {
    *  id: live `space_log` events, seeded from `space_logs` when its page
    *  opens. Bounded (`SPACE_LOG_LIMIT`). */
   spaceLogs = new Map<string, SpaceLogLine[]>();
+  /** A space terminal's live output since this session started, per
+   *  terminal id (bounded) — a bridge over a brief gap (remounting the
+   *  panel); `SpaceTerminalInfo.scrollback` covers everything older. */
+  terminalChunks = new Map<string, TerminalChunk[]>();
+  /** A terminal's exit, once it has happened since the page last read
+   *  `list_space_terminals`. */
+  terminalExit = new Map<
+    string,
+    { exitCode: number | null; error: string | null }
+  >();
   /** Line asks by `lineAskKey` — an observable map, so a line reading its
    *  own key re-renders only when that key changes. */
   readonly lineAsks: ObservableMap<string, LineAsk> = observable.map(
@@ -153,6 +197,12 @@ export class EphemeralStore {
     { deep: false },
   );
   askFocus: AskFocus | null = null;
+  /** `ChatPending` by PR — the composer's and the hunk ask's shared pending
+   *  bubble; an observable map so only a PR's own chat re-renders on it. */
+  readonly chatPending: ObservableMap<PrId, ChatPending> = observable.map(
+    {},
+    { deep: false },
+  );
   /** The diff line the PR chat's next question is about, per PR: a line's
    *  AI button sets it, the composer shows it as a chip and sends it as
    *  the question's `about`. One per PR — `ask` takes one anchor. */
@@ -178,8 +228,6 @@ export class EphemeralStore {
 
   constructor() {
     makeObservable(this, {
-      agentText: observableShallow,
-      runLog: observableShallow,
       stalled: observableShallow,
       toasts: observableShallow,
       hostStatus: observable,
@@ -195,6 +243,8 @@ export class EphemeralStore {
       reactionOverrides: observableShallow,
       suggestionBatch: observableShallow,
       spaceLogs: observableShallow,
+      terminalChunks: observableShallow,
+      terminalExit: observableShallow,
       askFocus: observableRef,
       composerFocus: observableRef,
       lineJump: observableRef,
@@ -245,6 +295,18 @@ export class EphemeralStore {
     if (this.askFocus?.seq !== seq) return;
     runInAction(() => {
       this.askFocus = null;
+    });
+  }
+
+  setChatPending(pr: PrId, p: ChatPending): void {
+    runInAction(() => {
+      this.chatPending.set(pr, p);
+    });
+  }
+
+  clearChatPending(pr: PrId): void {
+    runInAction(() => {
+      this.chatPending.delete(pr);
     });
   }
 
@@ -457,18 +519,13 @@ export class EphemeralStore {
   handle(e: Ephemeral): void {
     runInAction(() => {
       switch (e.type) {
-        case 'agent_delta': {
-          const next = new Map(this.agentText);
-          next.set(e.run, (next.get(e.run) ?? '') + e.text);
-          this.agentText = next;
+        case 'agent_delta':
+          this.agentText.set(e.run, (this.agentText.get(e.run) ?? '') + e.text);
           this.clearStalled(e.run);
           return;
-        }
         case 'run_log': {
-          const next = new Map(this.runLog);
-          const lines = [...(next.get(e.run) ?? []), e.line].slice(-LOG_LIMIT);
-          next.set(e.run, lines);
-          this.runLog = next;
+          const lines = [...(this.runLog.get(e.run) ?? []), e.line];
+          this.runLog.set(e.run, lines.slice(-LOG_LIMIT));
           this.clearStalled(e.run);
           return;
         }
@@ -506,11 +563,56 @@ export class EphemeralStore {
           this.spaceLogs = next;
           return;
         }
+        case 'terminal_output': {
+          const next = new Map(this.terminalChunks);
+          next.set(
+            e.terminal,
+            appendChunk(next.get(e.terminal) ?? [], {
+              seq: e.seq,
+              data: e.data,
+            }),
+          );
+          this.terminalChunks = next;
+          return;
+        }
+        case 'terminal_exit': {
+          const next = new Map(this.terminalExit);
+          next.set(e.terminal, { exitCode: e.exit_code, error: e.error });
+          this.terminalExit = next;
+          return;
+        }
         case 'config_pr': {
           const toast = configPrToast(e.number, e.url, openExternal);
           this.toasts = [
             ...this.toasts,
             { id: this.nextToastId++, level: 'info', ...toast },
+          ];
+          return;
+        }
+        case 'code_intel_suggest': {
+          // The core asks once per language per session (§5.1).
+          const { language } = e;
+          this.toasts = [
+            ...this.toasts,
+            {
+              id: this.nextToastId++,
+              level: 'info',
+              text: suggestText(language, e.server),
+              action: {
+                label: 'Download',
+                onAction: () =>
+                  void api.codeIntelInstall(language).catch(() => {
+                    // toasted by api.ts
+                  }),
+              },
+              secondary: {
+                label: 'Not now',
+                onAction: () =>
+                  void api.codeIntelDecline(language).catch(() => {
+                    // toasted by api.ts
+                  }),
+              },
+            },
           ];
           return;
         }
@@ -548,13 +650,28 @@ export class EphemeralStore {
   /** A run is done (or cancelled/failed): its streaming text and log no longer grow. */
   clearRun(run: string): void {
     runInAction(() => {
-      const text = new Map(this.agentText);
-      text.delete(run);
-      this.agentText = text;
-      const log = new Map(this.runLog);
-      log.delete(run);
-      this.runLog = log;
+      this.agentText.delete(run);
+      this.runLog.delete(run);
       this.clearStalled(run);
+    });
+  }
+
+  /** A terminal tab is closed: its buffered output and exit no longer
+   *  matter (a new tab never reuses an id). */
+  clearTerminal(terminal: string): void {
+    runInAction(() => {
+      this.terminalChunks.delete(terminal);
+      this.terminalExit.delete(terminal);
+    });
+  }
+
+  /** `task` is being fixed by `run`; what an earlier fix of it showed is
+   *  dropped. */
+  setTaskRun(task: string, run: string): void {
+    runInAction(() => {
+      const prev = this.taskRuns.get(task);
+      if (prev && prev !== run) this.clearRun(prev);
+      this.taskRuns.set(task, run);
     });
   }
 

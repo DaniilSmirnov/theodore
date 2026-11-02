@@ -4,9 +4,15 @@ import { ALL } from '../../core/workspaces';
 import {
   AUTO_ARCHIVE_KEY,
   BUILD_MODE_KEY,
+  REVIEW_AGENT_KEY,
   autoArchiveDays,
   buildModeOn,
+  defaultReviewSkill,
   defaultTitle,
+  reviewAgentDefault,
+  reviewRunning,
+  sentTurnDone,
+  sentTurnOf,
   spaceStage,
   unshipped,
   diffStat,
@@ -261,5 +267,79 @@ describe('spaceTitle', () => {
     expect(t).toBe(
       'Show a "Free shipping over $50" note under the cart total…',
     );
+  });
+});
+
+describe('review with agent', () => {
+  const row = (key: string, value: unknown, scope = 'user') => ({
+    key,
+    scope,
+    value,
+  });
+
+  it('picks the sticky setting first, else agents.skills, else the first offered', () => {
+    expect(reviewAgentDefault([], ['codex', 'claude'])).toBe('codex');
+    expect(
+      reviewAgentDefault(
+        [row('agents.skills', ['codex'])],
+        ['codex', 'claude'],
+      ),
+    ).toBe('codex');
+    expect(
+      reviewAgentDefault(
+        [row(REVIEW_AGENT_KEY, 'claude'), row('agents.skills', ['codex'])],
+        ['codex', 'claude'],
+      ),
+    ).toBe('claude');
+    // A sticky pick that is no longer enabled falls through, same as an
+    // unset one.
+    expect(
+      reviewAgentDefault([row(REVIEW_AGENT_KEY, 'gemini')], ['codex']),
+    ).toBe('codex');
+  });
+
+  it('prefers the default built-in skill, then any built-in, then anything', () => {
+    expect(
+      defaultReviewSkill([
+        { id: 'tests', source: 'built-in' },
+        { id: 'bugs', source: 'built-in' },
+      ]),
+    ).toBe('bugs');
+    expect(defaultReviewSkill([{ id: 'security', source: 'built-in' }])).toBe(
+      'security',
+    );
+    expect(
+      defaultReviewSkill([{ id: 'polish', source: '~/.claude/skills' }]),
+    ).toBe('polish');
+    expect(defaultReviewSkill([])).toBe('bugs');
+  });
+
+  it('is "reviewing" only while a run on the review is going', () => {
+    expect(reviewRunning([])).toBe(false);
+    expect(reviewRunning([{ status: 'done' }])).toBe(false);
+    expect(reviewRunning([{ status: 'done' }, { status: 'running' }])).toBe(
+      true,
+    );
+  });
+});
+
+describe('send N to agent', () => {
+  it('reads the turn an item was sent with, undefined if never', () => {
+    const s: Pick<Space, 'sent_feedback'> = {
+      sent_feedback: [{ item: { kind: 'draft', id: 'd1' }, turn: 2 }],
+    };
+    expect(sentTurnOf(s, { kind: 'draft', id: 'd1' })).toBe(2);
+    expect(sentTurnOf(s, { kind: 'draft', id: 'd2' })).toBeUndefined();
+    expect(sentTurnOf(s, { kind: 'finding', id: 'd1' })).toBeUndefined();
+    expect(
+      sentTurnOf({ sent_feedback: [] }, { kind: 'draft', id: 'd1' }),
+    ).toBeUndefined();
+  });
+
+  it('is "done" once the space is past that turn and not running', () => {
+    expect(sentTurnDone({ status: 'running', turns: 3 }, 2)).toBe(false);
+    expect(sentTurnDone({ status: 'idle', turns: 1 }, 2)).toBe(false);
+    expect(sentTurnDone({ status: 'idle', turns: 2 }, 2)).toBe(true);
+    expect(sentTurnDone({ status: 'failed', turns: 3 }, 2)).toBe(true);
   });
 });

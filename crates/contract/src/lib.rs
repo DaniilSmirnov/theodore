@@ -23,12 +23,18 @@ mod pr_state;
 pub use pr_state::*;
 mod symbols;
 pub use symbols::*;
+mod code_intel;
+pub use code_intel::*;
 mod sandbox;
 pub use sandbox::*;
 mod project_state;
 pub use project_state::*;
+mod space_progress;
+pub use space_progress::*;
 mod spaces;
 pub use spaces::*;
+mod space_queue;
+pub use space_queue::*;
 mod config;
 pub use config::*;
 mod account;
@@ -37,6 +43,8 @@ mod attachments;
 pub use attachments::*;
 mod telemetry;
 pub use telemetry::*;
+mod terminal;
+pub use terminal::*;
 
 /// Model names used in transactions and sync frames.
 pub mod models {
@@ -594,6 +602,34 @@ pub enum Ephemeral {
         /// Empty when the host didn't say.
         url: String,
     },
+    /// `code_intel.install: ask` and a language's server is missing
+    /// (docs/code-intel.md §5.1): offer `code_intel_install(language)`,
+    /// or `code_intel_decline(language)`. Once per language per session.
+    CodeIntelSuggest {
+        /// The project whose worktree needs it, when known.
+        project: Option<String>,
+        language: String,
+        /// The server that would be downloaded (`clangd`).
+        server: String,
+    },
+    /// Raw PTY output of a space's terminal (docs/spaces.md "Terminal"),
+    /// base64 (control sequences and all) so a chunk split mid UTF-8 still
+    /// round-trips — `xterm.js`'s own parser tolerates that. `seq` is
+    /// monotonic per terminal, for merging with `SpaceTerminalInfo::seq`'s
+    /// scrollback seed, the same way `space_log` merges with `space_logs`.
+    TerminalOutput {
+        space: String,
+        terminal: String,
+        seq: u64,
+        data: String,
+    },
+    /// The terminal's shell exited (on its own, or `close_space_terminal`).
+    TerminalExit {
+        space: String,
+        terminal: String,
+        exit_code: Option<i32>,
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -668,6 +704,9 @@ pub struct ChatMessage {
     /// Files sent with your message; empty on replies and older rows.
     #[serde(default)]
     pub attachments: Vec<Attachment>,
+    /// A space message waiting for its turn (docs/spaces.md §8).
+    #[serde(default)]
+    pub queued: Option<QueuedSend>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -753,6 +792,17 @@ pub fn types() -> specta::Types {
         .register::<LinearIssue>()
         .register::<FindSymbolRequest>()
         .register::<SymbolHit>()
+        .register::<SymbolSource>()
+        .register::<CodeIntelStatus>()
+        .register::<CodeLsp>()
+        .register::<CodeLspToggle>()
+        .register::<CodeIntelLspRequest>()
+        .register::<CodeLspScope>()
+        .register::<CodeInstallPolicy>()
+        .register::<CodeLanguage>()
+        .register::<CodeServer>()
+        .register::<CodeInstall>()
+        .register::<CodeServerState>()
         .register::<StackInfo>()
         .register::<ReactionCount>()
         .register::<DiffSide>()
@@ -778,6 +828,12 @@ pub fn types() -> specta::Types {
         .register::<AgentSession>()
         .register::<SpaceFeedback>()
         .register::<SpaceFeedbackRequest>()
+        .register::<QueuedSend>()
+        .register::<QueuedAction>()
+        .register::<SpaceQueuedRequest>()
+        .register::<SpaceUpdate>()
+        .register::<SpaceBaseStatus>()
+        .register::<SpaceFixCiRequest>()
         .register::<ConfigLayer>()
         .register::<ConfigFile>()
         .register::<ConfigEntry>()
@@ -824,7 +880,12 @@ pub fn types() -> specta::Types {
         .register::<IssueTarget>()
         .register::<IssueRequest>()
         .register::<IssuePreview>()
-        .register::<ReportedIssue>();
+        .register::<ReportedIssue>()
+        .register::<TerminalStatus>()
+        .register::<SpaceTerminalInfo>()
+        .register::<OpenTerminalRequest>()
+        .register::<WriteTerminalRequest>()
+        .register::<ResizeTerminalRequest>();
     // JS numbers: ids, counts and unix-ms timestamps stay far below 2^53.
     use specta::datatype::Primitive as P;
     specta_util::Remapper::new()

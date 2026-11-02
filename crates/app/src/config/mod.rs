@@ -34,6 +34,12 @@ pub const DEFAULT_CHECK_TIMEOUT_S: u64 = 600;
 pub const DEFAULT_ARCHIVE_TIMEOUT_S: u64 = 120;
 /// More would be a typo, not a plan.
 pub const MAX_PORTS: u16 = 16;
+/// `spaces.ports` unset: a space gets this many free ports so `run` has
+/// one to bind without asking (explicit `ports: 0` turns it off).
+pub const DEFAULT_PORTS: u16 = 2;
+/// `spaces.copy` unset: a space's worktree gets the project's env files
+/// (explicit `copy: []` turns it off).
+pub const DEFAULT_COPY: &str = ".env*";
 
 /// The typed, merged config. Unknown keys are dropped here (and reported
 /// by `Merged::unknown`).
@@ -42,6 +48,7 @@ pub const MAX_PORTS: u16 = 16;
 pub struct ProjectConfig {
     pub review: ReviewConfig,
     pub spaces: SpacesConfig,
+    pub code_intel: CodeIntelConfig,
 }
 
 /// `review:` (docs/config.md §1); applied through
@@ -89,10 +96,13 @@ impl OneOrMany {
 #[serde(default)]
 pub struct SpacesConfig {
     /// Paths (a `*` / `?` glob in the last segment) copied from the
-    /// project's local checkout into a new space.
-    pub copy: Vec<String>,
-    /// Free TCP ports reserved per space.
-    pub ports: u16,
+    /// project's local checkout into a new space. `None`: unset by any
+    /// layer, defaults to `[DEFAULT_COPY]`; `Some(vec![])` is an explicit
+    /// `copy: []`, turning it off.
+    pub copy: Option<Vec<String>>,
+    /// Free TCP ports reserved per space. `None`: unset, defaults to
+    /// `DEFAULT_PORTS`; `Some(0)` is explicit, turning it off.
+    pub ports: Option<u16>,
     pub env: BTreeMap<String, String>,
     pub setup: Option<String>,
     pub run: Option<String>,
@@ -134,9 +144,109 @@ impl SpacesConfig {
     }
 
     pub fn port_count(&self) -> u16 {
-        self.ports.min(MAX_PORTS)
+        self.ports.unwrap_or(DEFAULT_PORTS).min(MAX_PORTS)
+    }
+
+    /// Paths copied into a new space's worktree (§3): `copy` as set, or
+    /// `[DEFAULT_COPY]` when no layer sets it at all.
+    pub fn effective_copy(&self) -> Vec<String> {
+        self.copy
+            .clone()
+            .unwrap_or_else(|| vec![DEFAULT_COPY.to_string()])
     }
 }
+
+/// `code_intel:` (docs/code-intel.md §3.1, §9): which languages get
+/// symbols, references and diagnostics, and whether their servers are
+/// downloaded. Read from the base like the rest of the repo layer, so a
+/// PR can't change what gets downloaded or run.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct CodeIntelConfig {
+    /// Off: no index, no servers, no tools.
+    pub enabled: bool,
+    pub install: InstallPolicy,
+    /// Manifest language ids; empty = detected from the repo's files.
+    pub languages: Vec<String>,
+    /// Language → the server preferred over the manifest's order.
+    pub servers: BTreeMap<String, String>,
+    pub max_servers: u32,
+    pub idle_minutes: u32,
+    /// Larger files are not indexed.
+    pub max_file_kb: u32,
+    /// Where language servers may run. Only your global and local files
+    /// set it (`repo_only_ignored`); unset falls back to Settings →
+    /// Languages, then to the defaults.
+    pub lsp: LspConfig,
+}
+
+/// `code_intel.lsp`: language servers, which can run a project's code
+/// (build scripts, proc macros, plugins; docs/code-intel.md §8).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct LspConfig {
+    /// In review runs on PRs (default off): **a PR's code may run** —
+    /// whoever wrote the PR decides what a server executes.
+    pub review: Option<bool>,
+    /// In spaces (default on).
+    pub spaces: Option<bool>,
+}
+
+pub const DEFAULT_LSP_REVIEW: bool = false;
+pub const DEFAULT_LSP_SPACES: bool = true;
+
+/// Keys a repo's file may not set: they decide whether code from the repo
+/// (a PR author's included) runs on your machine. Ignored in the repo
+/// layer and reported (`Merged::ignored`).
+pub fn repo_may_not_set(key: &str) -> bool {
+    key == "code_intel.lsp" || key.starts_with("code_intel.lsp.")
+}
+
+impl Default for CodeIntelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            install: InstallPolicy::Ask,
+            languages: Vec::new(),
+            servers: BTreeMap::new(),
+            max_servers: DEFAULT_MAX_SERVERS,
+            idle_minutes: DEFAULT_IDLE_MINUTES,
+            max_file_kb: DEFAULT_MAX_FILE_KB,
+            lsp: LspConfig::default(),
+        }
+    }
+}
+
+impl CodeIntelConfig {
+    /// `languages`, trimmed, without blanks and repeats.
+    pub fn language_ids(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for l in &self.languages {
+            let l = l.trim();
+            if !l.is_empty() && !out.iter().any(|o| o == l) {
+                out.push(l.to_string());
+            }
+        }
+        out
+    }
+}
+
+/// `code_intel.install`: whether a language server is downloaded
+/// (grammars always are, docs/code-intel.md §5.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InstallPolicy {
+    /// Asked once per server; the answer is remembered.
+    #[default]
+    Ask,
+    Always,
+    /// Only servers already on the machine.
+    Never,
+}
+
+pub const DEFAULT_MAX_SERVERS: u32 = 4;
+pub const DEFAULT_IDLE_MINUTES: u32 = 10;
+pub const DEFAULT_MAX_FILE_KB: u32 = 1024;
 
 /// One layer's text, as read by the caller.
 #[derive(Debug, Clone)]
@@ -159,6 +269,9 @@ pub struct Merged {
     pub files: Vec<ConfigFile>,
     /// `(file, dotted key)` for keys outside the schema.
     pub unknown: Vec<(String, String)>,
+    /// `(file, dotted key)` for keys the repo layer set but may not
+    /// (`repo_may_not_set`): dropped before merging.
+    pub ignored: Vec<(String, String)>,
     /// `(file, message)` for a value of the wrong type: the whole section
     /// is dropped rather than half-applied.
     pub errors: Vec<(String, String)>,
@@ -226,7 +339,12 @@ pub fn merge(layers: &[LayerText]) -> Merged {
                 continue;
             }
         };
-        let value = normalize(value);
+        let mut value = normalize(value);
+        if l.layer == ConfigLayer::Repo {
+            for key in strip_repo_only(&mut value) {
+                out.ignored.push((path.clone(), key));
+            }
+        }
         let mut leaves = Vec::new();
         flatten(String::new(), &value, &mut leaves);
         for (key, _) in &leaves {
@@ -259,8 +377,22 @@ pub fn merge(layers: &[LayerText]) -> Merged {
     out
 }
 
+/// Removes what a repo's file may not set (`repo_may_not_set`) from
+/// `value`, returning the dotted leaves removed.
+fn strip_repo_only(value: &mut Value) -> Vec<String> {
+    let Some(code) = value.get_mut("code_intel").and_then(Value::as_object_mut) else {
+        return Vec::new();
+    };
+    let Some(lsp) = code.remove("lsp") else {
+        return Vec::new();
+    };
+    let mut leaves = Vec::new();
+    flatten("code_intel.lsp".into(), &lsp, &mut leaves);
+    leaves.into_iter().map(|(k, _)| k).collect()
+}
+
 /// Each section on its own, so a bad `review.hide` doesn't also drop
-/// `spaces`.
+/// `spaces` or `code_intel`.
 fn typed(value: &Value, errors: &mut Vec<(String, String)>) -> ProjectConfig {
     let mut cfg = ProjectConfig::default();
     if let Some(review) = value.get("review") {
@@ -273,6 +405,12 @@ fn typed(value: &Value, errors: &mut Vec<(String, String)>) -> ProjectConfig {
         match serde_json::from_value::<SpacesConfig>(spaces.clone()) {
             Ok(s) => cfg.spaces = s,
             Err(e) => errors.push(("spaces".into(), e.to_string())),
+        }
+    }
+    if let Some(code) = value.get("code_intel") {
+        match serde_json::from_value::<CodeIntelConfig>(code.clone()) {
+            Ok(c) => cfg.code_intel = c,
+            Err(e) => errors.push(("code_intel".into(), e.to_string())),
         }
     }
     cfg
@@ -301,7 +439,7 @@ fn undot(value: Value) -> Value {
 
 /// Maps whose keys are globs or names, not config paths: a `.` in them
 /// (`"**/*.sql"`) is part of the key.
-const LITERAL_KEYS: &[&str] = &["review.checklist", "spaces.env"];
+const LITERAL_KEYS: &[&str] = &["review.checklist", "spaces.env", "code_intel.servers"];
 
 /// `undot` of the map at dotted path `at`.
 fn undot_at(at: &str, value: Value) -> Value {
@@ -407,8 +545,21 @@ pub fn is_known(key: &str) -> bool {
         "spaces.timeout_s.setup",
         "spaces.timeout_s.check",
         "spaces.timeout_s.archive",
+        "code_intel.enabled",
+        "code_intel.install",
+        "code_intel.languages",
+        "code_intel.max_servers",
+        "code_intel.idle_minutes",
+        "code_intel.max_file_kb",
+        "code_intel.lsp.review",
+        "code_intel.lsp.spaces",
     ];
-    const UNDER: &[&str] = &["review.agents.", "review.checklist.", "spaces.env."];
+    const UNDER: &[&str] = &[
+        "review.agents.",
+        "review.checklist.",
+        "spaces.env.",
+        "code_intel.servers.",
+    ];
     EXACT.contains(&key) || UNDER.iter().any(|p| key.starts_with(p))
 }
 
@@ -524,8 +675,8 @@ pub const GLOBAL_TEMPLATE: &str = r#"# Theodore global config (docs/config.md).
 #   ignore_findings: ["vendor/**"]
 
 # spaces:
-#   copy: [.env, .env.local]
-#   ports: 1                # $THEODORE_PORT, $THEODORE_PORT_1, …
+#   copy: [.env, .env.local]  # default: [".env*"]; [] turns it off
+#   ports: 1                # $THEODORE_PORT, $THEODORE_PORT_1, … (default: 2; 0 turns it off)
 #   env:
 #     APP_URL: "http://localhost:$THEODORE_PORT"
 #   setup: pnpm install
@@ -533,6 +684,19 @@ pub const GLOBAL_TEMPLATE: &str = r#"# Theodore global config (docs/config.md).
 #   check: pnpm lint && pnpm test
 #   archive: docker compose -p $THEODORE_SPACE down
 #   timeout_s: { setup: 600, check: 600, archive: 120 }
+
+# code_intel:               # symbols, references, diagnostics for agents
+#   enabled: true
+#   install: ask            # ask | always | never: download language servers
+#   languages: [typescript, rust]   # empty: detected
+#   servers: { python: pyright }    # preferred server per language
+#   max_servers: 4
+#   idle_minutes: 10
+#   max_file_kb: 1024
+#   lsp:                    # language servers; only here or in config.local.yaml
+#     spaces: true          # in your spaces
+#     review: false         # in PR reviews. true: a PR's code may run (build
+#                           # scripts, macros), written by whoever opened it
 "#;
 
 #[cfg(test)]

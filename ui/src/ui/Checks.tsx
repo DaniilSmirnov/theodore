@@ -1,6 +1,6 @@
 /** The Checks and Commits tabs of a PR — `PrDetail.checks` / `.commits`. */
 import { useEffect, useState } from 'react';
-import { ArrowRotateRight, PersonPlus } from '@gravity-ui/icons';
+import { ArrowRotateRight, PaperPlane, PersonPlus } from '@gravity-ui/icons';
 import {
   Accordion,
   Button,
@@ -22,6 +22,8 @@ import type {
 import { ask, rerunCheck, setReviewers } from '../actions';
 import { api } from '../core/api';
 import { useRootStore } from '../stores/context';
+import { isBuildMode } from './space/mode';
+import { spaceTitle } from './space/spaces';
 import { ago } from './List';
 import { Avatar, Btn, Spinner } from './bits';
 
@@ -56,6 +58,59 @@ function duration(ms: number | null): string {
   return `${Math.round(s / 60)}m ${s % 60}s`;
 }
 
+/** "Fix with agent" (docs/spaces.md "Fix CI"): only on a PR a space owns,
+ *  only with build mode on, only once something failed. */
+const FixCiButton = observer(function FixCiButton({
+  pr,
+  anyFailing,
+}: {
+  pr: PrId;
+  anyFailing: boolean;
+}) {
+  const store = useRootStore();
+  const [busy, setBusy] = useState(false);
+  if (!isBuildMode(store) || !anyFailing) return null;
+  const space = store.models.spaces
+    .all()
+    .find((s) => s.status !== 'archived' && s.pr === pr);
+  if (!space) return null;
+  const running = space.status === 'running';
+  const send = async () => {
+    setBusy(true);
+    try {
+      await api.spaceFixCi({ space: space.id });
+      store.ephemeral.toast(`Sent to ${spaceTitle(space)}`, 'info', {
+        label: 'Open',
+        onAction: () => store.ui.go({ name: 'space', id: space.id }),
+      });
+    } catch {
+      // toasted by api.ts
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Tooltip>
+      <Button
+        size="sm"
+        variant="ghost"
+        className="fix-ci gap-1.5"
+        isDisabled={running}
+        isPending={busy}
+        onPress={() => void send()}
+      >
+        <PaperPlane className="size-3.5" />
+        Fix with agent
+      </Button>
+      <Tooltip.Content>
+        {running
+          ? `${space.agent} is still working in ${spaceTitle(space)}`
+          : `Send the failing checks' logs to ${spaceTitle(space)} as its next turn`}
+      </Tooltip.Content>
+    </Tooltip>
+  );
+});
+
 export const Checks = observer(function Checks({
   pr,
   checks,
@@ -70,7 +125,10 @@ export const Checks = observer(function Checks({
   return (
     <main className="diff min-w-0 overflow-auto bg-background px-6 pb-20 pt-5">
       <div className="checks flex max-w-[900px] flex-col gap-2">
-        <h3 className="text-sm font-semibold">Checks</h3>
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-semibold">Checks</h3>
+          <FixCiButton pr={pr} anyFailing={failed.length > 0} />
+        </div>
         {sorted.length === 0 ? (
           <p className="text-sm text-muted">No checks reported.</p>
         ) : (

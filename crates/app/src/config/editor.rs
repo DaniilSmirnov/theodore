@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 use theodore_contract::{ConfigProblem, ConfigProblemLevel};
 
-use super::{ReviewConfig, SpacesConfig, flatten, is_known, normalize};
+use super::{CodeIntelConfig, ReviewConfig, SpacesConfig, flatten, is_known, normalize};
 
 /// The keys of each section in the order the editor writes them, each with
 /// the commented example used when it is unset (the global template's
@@ -66,6 +66,26 @@ const SPACES_KEYS: &[(&str, &str)] = &[
     ),
 ];
 
+const CODE_INTEL_KEYS: &[(&str, &str)] = &[
+    ("enabled", "enabled: true"),
+    (
+        "install",
+        "install: ask            # ask | always | never: download language servers",
+    ),
+    (
+        "languages",
+        "languages: [typescript, rust]   # empty: detected",
+    ),
+    ("servers", "servers: { python: pyright }"),
+    ("max_servers", "max_servers: 4"),
+    ("idle_minutes", "idle_minutes: 10"),
+    ("max_file_kb", "max_file_kb: 1024"),
+    (
+        "lsp",
+        "lsp:                    # global / local files only, never the repo's\n  spaces: true\n  review: false         # true: a PR's code may run during reviews",
+    ),
+];
+
 /// The header of a generated file.
 pub fn header(project: &str) -> String {
     format!(
@@ -79,14 +99,18 @@ pub fn header(project: &str) -> String {
     )
 }
 
-/// `header`, then `review:` and `spaces:`: each set key (`values` is the
-/// normalized tree, `{review: {...}, spaces: {...}}`) as YAML, each unset
-/// key as its commented example. A section with nothing set is commented
-/// out whole, so it doesn't parse as `null`.
+/// `header`, then `review:`, `spaces:` and `code_intel:`: each set key
+/// (`values` is the normalized tree, `{review: {...}, spaces: {...}}`) as
+/// YAML, each unset key as its commented example. A section with nothing
+/// set is commented out whole, so it doesn't parse as `null`.
 pub fn render(header: &str, values: &Value) -> String {
     let mut out = header.trim_end().to_string();
     out.push('\n');
-    for (section, keys) in [("review", REVIEW_KEYS), ("spaces", SPACES_KEYS)] {
+    for (section, keys) in [
+        ("review", REVIEW_KEYS),
+        ("spaces", SPACES_KEYS),
+        ("code_intel", CODE_INTEL_KEYS),
+    ] {
         let set = values.get(section).and_then(Value::as_object);
         out.push('\n');
         out.push_str(&render_section(section, keys, set));
@@ -136,6 +160,40 @@ fn has_value(v: Option<&Value>) -> bool {
     }
 }
 
+/// `validate`, plus a warning for each key `layer` may not set (the repo's
+/// file can't turn on language servers, `config::repo_may_not_set`).
+pub fn validate_layer(text: &str, layer: theodore_contract::ConfigLayer) -> Vec<ConfigProblem> {
+    let mut problems = validate(text);
+    if layer != theodore_contract::ConfigLayer::Repo {
+        return problems;
+    }
+    let Ok(value @ Value::Object(_)) = serde_yaml::from_str::<Value>(text) else {
+        return problems;
+    };
+    let lines = key_lines(text);
+    let mut leaves = Vec::new();
+    flatten(String::new(), &normalize(value), &mut leaves);
+    for (key, _) in leaves {
+        if super::repo_may_not_set(&key) {
+            problems.push(ConfigProblem {
+                level: ConfigProblemLevel::Warning,
+                line: line_of(&lines, &key),
+                column: None,
+                message: format!(
+                    "`{key}`: ignored in the repo's file; set it in your global or local file"
+                ),
+            });
+        }
+    }
+    problems.sort_by_key(|p| {
+        (
+            p.line.unwrap_or(u32::MAX),
+            p.level == ConfigProblemLevel::Warning,
+        )
+    });
+    problems
+}
+
 /// Problems in one file's `text`, with 1-based line numbers where the
 /// parser or the key's position says.
 pub fn validate(text: &str) -> Vec<ConfigProblem> {
@@ -176,7 +234,7 @@ pub fn validate(text: &str) -> Vec<ConfigProblem> {
             });
         }
     }
-    for section in ["review", "spaces"] {
+    for section in ["review", "spaces", "code_intel"] {
         let Some(v) = value.get(section) else {
             continue;
         };
@@ -194,7 +252,8 @@ pub fn validate(text: &str) -> Vec<ConfigProblem> {
             let one = Value::Object(one);
             let typed = match section {
                 "review" => serde_json::from_value::<ReviewConfig>(one).err(),
-                _ => serde_json::from_value::<SpacesConfig>(one).err(),
+                "spaces" => serde_json::from_value::<SpacesConfig>(one).err(),
+                _ => serde_json::from_value::<CodeIntelConfig>(one).err(),
             };
             if let Some(e) = typed {
                 let dotted = format!("{section}.{key}");

@@ -36,7 +36,27 @@ impl GitProc<'_> {
     /// inspect/drop a real `Child` directly (`run`'s own `Child` never
     /// escapes it). Production code always goes through `run`/`run_text`.
     fn command(&self) -> tokio::process::Command {
+        self.command_below(None)
+    }
+
+    /// `command`; with `ceiling`, git never looks above it for a repository
+    /// (`GIT_CEILING_DIRECTORIES`), so a space worktree whose `.git` went
+    /// missing fails instead of resolving a parent repo. An inherited
+    /// `GIT_DIR` / `GIT_WORK_TREE` would skip discovery altogether, so
+    /// those go too.
+    fn command_below(&self, ceiling: Option<&Path>) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("git");
+        if let Some(ceiling) = ceiling {
+            cmd.env("GIT_CEILING_DIRECTORIES", ceiling);
+            for var in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_COMMON_DIR",
+                "GIT_INDEX_FILE",
+            ] {
+                cmd.env_remove(var);
+            }
+        }
         cmd.current_dir(self.cwd)
             .args(self.args)
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -73,7 +93,27 @@ impl GitProc<'_> {
     }
 
     pub(crate) async fn run(&self) -> GitResult<Vec<u8>> {
-        let mut cmd = self.command();
+        self.run_cmd(self.command()).await
+    }
+
+    /// `run` with discovery stopped at `ceiling` (`command_below`).
+    pub(crate) async fn run_below(&self, ceiling: &Path) -> GitResult<Vec<u8>> {
+        self.run_cmd(self.command_below(Some(ceiling))).await
+    }
+
+    /// `run` below `ceiling`, with extra variables on the child
+    /// (`GIT_INDEX_FILE` for a snapshot through a temporary index).
+    pub(crate) async fn run_env_below(
+        &self,
+        ceiling: &Path,
+        env: &[(&str, &Path)],
+    ) -> GitResult<Vec<u8>> {
+        let mut cmd = self.command_below(Some(ceiling));
+        cmd.envs(env.iter().copied());
+        self.run_cmd(cmd).await
+    }
+
+    async fn run_cmd(&self, mut cmd: tokio::process::Command) -> GitResult<Vec<u8>> {
         let mut child = cmd.spawn().map_err(io_err)?;
         if let (Some(data), Some(mut pipe)) = (self.stdin, child.stdin.take()) {
             pipe.write_all(data).await.map_err(io_err)?;
@@ -108,7 +148,15 @@ impl GitProc<'_> {
     /// something (0 clean, 1 conflicts, >1 a real error) and still write
     /// useful stdout on exit 1, which `run` would otherwise discard.
     pub(crate) async fn run_raw(&self) -> GitResult<RawOutput> {
-        let mut cmd = self.command();
+        self.run_raw_cmd(self.command()).await
+    }
+
+    /// `run_raw` with discovery stopped at `ceiling` (`command_below`).
+    pub(crate) async fn run_raw_below(&self, ceiling: &Path) -> GitResult<RawOutput> {
+        self.run_raw_cmd(self.command_below(Some(ceiling))).await
+    }
+
+    async fn run_raw_cmd(&self, mut cmd: tokio::process::Command) -> GitResult<RawOutput> {
         let mut child = cmd.spawn().map_err(io_err)?;
         if let (Some(data), Some(mut pipe)) = (self.stdin, child.stdin.take()) {
             pipe.write_all(data).await.map_err(io_err)?;

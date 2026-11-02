@@ -205,6 +205,8 @@ mod tests {
             "list_spaces",
             "create_space",
             "space_send",
+            "space_send_now",
+            "space_queued",
             "space_skills",
             "space_run",
             // shell-side

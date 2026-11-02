@@ -87,15 +87,23 @@ fn codex_documented_success_fixture() {
     );
 }
 
+/// gemini-cli v0.66.0's own stream-json snapshot
+/// (`packages/cli/src/__snapshots__/nonInteractiveCli.test.ts.snap`),
+/// timestamps filled in — not a recorded run.
 #[test]
 fn gemini_documented_stream_fixture() {
     let fixture = include_str!("fixtures/gemini_stream.jsonl");
-    let mut last = String::new();
-    let events: Vec<AgentEvent> = fixture
-        .lines()
-        .flat_map(|l| gemini::parse_line(l, &mut last))
-        .collect();
+    let mut parser = gemini::GeminiParser::new(false);
+    let events: Vec<AgentEvent> = fixture.lines().flat_map(|l| parser.parse_line(l)).collect();
     let terms = terminals(&events);
     assert_eq!(terms.len(), 1);
-    assert!(matches!(terms[0], AgentEvent::Done { .. }));
+    assert!(
+        matches!(terms[0], AgentEvent::Done { final_text, .. } if final_text == "Final answer"),
+        "{terms:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "testTool"))
+    );
 }

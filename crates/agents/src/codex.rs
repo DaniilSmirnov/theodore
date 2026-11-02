@@ -16,6 +16,14 @@
 //! `tests/fixtures/codex_auth_error.jsonl` (real, redacted) vs
 //! `tests/fixtures/codex_success.jsonl` (built from the documented schema,
 //! marked untested).
+//!
+//! No text deltas: `AgentRequest::stream_text` is ignored and an answer
+//! arrives whole, as `item.completed(agent_message)`. `codex exec --json`
+//! (0.164.0, `exec/src/event_processor_with_jsonl_output.rs`) drops the
+//! app-server's `AgentMessageDelta` notifications, sends `item.updated`
+//! only for `todo_list`, and has no flag or feature to turn deltas on.
+//! Only the experimental `codex app-server` protocol streams them
+//! (`item/agentMessage/delta`) — a different runner, not a flag.
 
 use serde_json::Value;
 use theodore_domain::Usage;
@@ -519,6 +527,19 @@ mod model_tests {
         );
         // Flags come before the prompt, which stays last.
         assert_eq!(args.last().map(String::as_str), Some("p"));
+    }
+
+    /// Nothing in `exec` streams answer text, so asking for it changes
+    /// nothing.
+    #[test]
+    fn stream_text_changes_nothing() {
+        let mut streamed = req(None, None);
+        streamed.stream_text = true;
+        let cfg = Default::default();
+        assert_eq!(
+            build_args(&streamed, &cfg),
+            build_args(&req(None, None), &cfg)
+        );
     }
 
     #[test]

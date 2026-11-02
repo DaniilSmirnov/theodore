@@ -1,0 +1,42 @@
+[package]
+name = "theodore-code-intel-toolchain"
+description = "Code-intel toolchain: language manifest, detection, verified downloads of grammars and language servers, grammar loading."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+theodore-ports.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+hex.workspace = true
+which.workspace = true
+url.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true
+tree-sitter.workspace = true
+# Not in [workspace.dependencies]: only the toolchain unpacks archives and
+# loads native grammars.
+serde_yaml = "0.9"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "4", default-features = false, features = ["deflate"] }
+libloading = "0.9"
+tree-sitter-language = "0.1"
+
+[dev-dependencies]
+wiremock.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+pretty_assertions.workspace = true
+
+# Not `workspace = true`: the grammar loader needs `unsafe` (dlopen + a C
+# symbol), so `unsafe_code` is `deny` here instead of `forbid`, allowed only
+# on that one function.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

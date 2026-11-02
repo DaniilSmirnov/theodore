@@ -26,9 +26,11 @@ chunk lands (validated, repaired) ─▶ its final groups replace its streamed o
 all chunks ─▶ merge pass ─▶ returned grouping (final, not in_progress)
 ```
 
-- `AgentRequest::stream_text` adds `--include-partial-messages`. Deltas come
-  on top of the per-message `Text` events. Codex and Gemini ignore it.
-- `GroupingOptions::stream`: the app sets it for Claude runs
+- `AgentRequest::stream_text` turns on `TextDelta` events, on top of the
+  per-message `Text` events. Claude gets `--include-partial-messages`; Gemini's
+  `stream-json` is deltas already. Codex ignores it: `codex exec --json` has
+  no text deltas.
+- `GroupingOptions::stream`: the app sets it for Claude and Gemini runs
   (`crates/runtime/src/grouper.rs`). The CLI leaves it off unless
   `theodore eval --stream`, so evals stay comparable with earlier runs.
 - Only a chunk's first answer streams. A repair call does not: the chunk's
@@ -140,5 +142,6 @@ group in sooner than two phases alone, fully explained. Not shipped.
 - A PR fragmented enough that per-chunk coarsening merges groups on landing:
   the streamed groups it merges are replaced when their chunk lands (in unit
   tests only).
-- Only Claude Code streams. A Codex or Gemini run shows the grouping when it
-  is done, as before.
+- Claude Code and Gemini stream (Gemini from its documented format, not yet
+  run against a real binary). A Codex run shows the grouping when it is done,
+  as before.

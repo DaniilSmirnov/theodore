@@ -107,7 +107,9 @@ mod tests {
             user_mcp: false,
             attachments: vec![],
             resume: None,
-            stream_text: false,
+            // `true`: so `FakeAgent::last_request` (reserved for turn-like
+            // calls, not one-shot utility ones) sees it.
+            stream_text: true,
         }
     }
 

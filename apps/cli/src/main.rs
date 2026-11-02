@@ -30,6 +30,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // An agent's edit hook (docs/spaces.md §5): judges one edit and exits.
+    theodore_agents::edit_guard::run_if_requested();
     let cli = Cli::parse();
     match cli.command {
         Command::Group(args) => run_group(args).await,

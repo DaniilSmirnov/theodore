@@ -2,10 +2,12 @@
 //! environment, so nothing here ran against a real binary. Built from the
 //! CLI's public docs (`--output-format stream-json` shipped per
 //! google-gemini/gemini-cli#8203; `-p`, `-m`, `--approval-mode`; MCP servers
-//! are settings-file only, no `--mcp-config` flag). Flags and the event
-//! schema (`init` / `message` / `tool_use` / `tool_result` / `error` /
-//! `result`) need re-verification against `gemini --help` and a real run
-//! before this runner ships.
+//! are settings-file only, no `--mcp-config` flag). Flags need
+//! re-verification against `gemini --help` and a real run before this runner
+//! ships. The event schema (`init` / `message` / `tool_use` / `tool_result` /
+//! `error` / `result`, field names included) is read off the v0.66.0 source
+//! (`packages/core/src/output/types.ts`, `packages/cli/src/nonInteractiveCli.ts`)
+//! and its stream-json snapshot test, not off a run.
 //!
 //! MCP and the allow/deny tool list are settings-file only; we write a throwaway
 //! settings file and point `GEMINI_CLI_SYSTEM_SETTINGS_PATH` at it for just
@@ -98,89 +100,143 @@ pub fn build_args(req: &AgentRequest, cfg: &AgentBinaryConfig) -> Vec<String> {
     args
 }
 
+/// Folds `stream-json` into normalized events. Gemini only ever streams an
+/// answer: every assistant `message` is a `"delta": true` chunk
+/// (`nonInteractiveCli.ts`), and nothing repeats it whole. So the chunks of
+/// one message are collected here and the whole `Text` goes out at the
+/// message's end — the next `tool_use`, or `result`:
+///
+/// ```text
+/// message(delta) ─▶ [TextDelta]   (only with stream_text)
+/// message(delta) ─▶ [TextDelta]
+/// tool_use       ─▶ Text(whole) , ToolCall
+/// message(delta) ─▶ [TextDelta]
+/// result         ─▶ Text(whole) , Done(final_text = that last message)
+/// ```
+///
+/// Same contract as Claude's `--include-partial-messages`: deltas first,
+/// then the complete message. A `message` without `delta` is taken as
+/// whole and goes out as `Text` at once.
 #[derive(Debug, Default)]
 pub struct GeminiParser {
+    stream_text: bool,
+    /// The assistant message being written: its chunks so far.
+    pending: String,
+    /// The last whole assistant message, for `Done` (stream-json's
+    /// `result` carries no response text).
     last_text: String,
 }
 
 impl GeminiParser {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(stream_text: bool) -> Self {
+        Self {
+            stream_text,
+            ..Self::default()
+        }
     }
-}
 
-/// Pure: one `stream-json` line in, zero or more normalized events out. Field
-/// names for `message` / `tool_use` / `tool_result` / `result` are assumptions
-/// documented at the module level — adjust once a real run confirms them.
-pub fn parse_line(line: &str, last_text: &mut String) -> Vec<AgentEvent> {
-    let line = line.trim();
-    if line.is_empty() {
-        return vec![];
+    /// One `stream-json` line in, zero or more normalized events out.
+    pub fn parse_line(&mut self, line: &str) -> Vec<AgentEvent> {
+        let line = line.trim();
+        if line.is_empty() {
+            return vec![];
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            return vec![];
+        };
+        match v.get("type").and_then(Value::as_str) {
+            Some("message") => self.message(&v),
+            Some("tool_use") => {
+                let mut out: Vec<AgentEvent> = self.flush().into_iter().collect();
+                out.push(AgentEvent::ToolCall {
+                    id: str_field(&v, "tool_id"),
+                    name: str_field(&v, "tool_name"),
+                    input: v.get("parameters").cloned().unwrap_or(Value::Null),
+                });
+                out
+            }
+            Some("tool_result") => {
+                let ok = v.get("status").and_then(Value::as_str) != Some("error");
+                let output = match v.pointer("/error/message").and_then(Value::as_str) {
+                    Some(err) if !ok => err.to_string(),
+                    _ => str_field(&v, "output"),
+                };
+                vec![AgentEvent::ToolResult {
+                    id: str_field(&v, "tool_id"),
+                    ok,
+                    output,
+                }]
+            }
+            Some("result") => {
+                let mut out: Vec<AgentEvent> = self.flush().into_iter().collect();
+                out.push(result_event(&v, &self.last_text));
+                out
+            }
+            // `init`, and `error` (`severity` warning or error: loop
+            // detected, max turns, blocked): never terminal on their own —
+            // a failed run still ends in `result` with `status: error`, or
+            // in the process exiting.
+            _ => vec![],
+        }
     }
-    let Ok(v) = serde_json::from_str::<Value>(line) else {
-        return vec![];
-    };
-    match v.get("type").and_then(Value::as_str) {
-        Some("message") => message_event(&v, last_text),
-        Some("tool_use") => vec![AgentEvent::ToolCall {
-            id: v
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            name: v
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            input: v.get("input").cloned().unwrap_or(Value::Null),
-        }],
-        Some("tool_result") => vec![AgentEvent::ToolResult {
-            id: v
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            ok: !v.get("error").and_then(Value::as_bool).unwrap_or(false),
-            output: v
-                .get("output")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        }],
-        Some("result") => vec![result_event(&v, last_text)],
-        // `init` and non-terminal `error` (Gemini's docs call these "non-fatal
-        // warnings and system errors", same ambiguity as Codex's top-level
-        // `error`): no reliable terminal signal here, so treated as
-        // informational; the real terminal comes from `result` or process exit.
-        _ => vec![],
-    }
-}
 
-fn message_event(v: &Value, last_text: &mut String) -> Vec<AgentEvent> {
-    if v.get("role").and_then(Value::as_str) != Some("assistant") {
-        return vec![];
-    }
-    let text = v.get("content").and_then(Value::as_str).unwrap_or_default();
-    if text.is_empty() {
-        return vec![];
-    }
-    last_text.push_str(text);
-    if v.get("thought").and_then(Value::as_bool).unwrap_or(false) {
-        vec![AgentEvent::Thinking {
+    fn message(&mut self, v: &Value) -> Vec<AgentEvent> {
+        if v.get("role").and_then(Value::as_str) != Some("assistant") {
+            return vec![];
+        }
+        let text = v.get("content").and_then(Value::as_str).unwrap_or_default();
+        if text.is_empty() {
+            return vec![];
+        }
+        if v.get("thought").and_then(Value::as_bool).unwrap_or(false) {
+            return vec![AgentEvent::Thinking {
+                text: text.to_string(),
+            }];
+        }
+        if v.get("delta").and_then(Value::as_bool).unwrap_or(false) {
+            self.pending.push_str(text);
+            return if self.stream_text {
+                vec![AgentEvent::TextDelta {
+                    text: text.to_string(),
+                }]
+            } else {
+                vec![]
+            };
+        }
+        let mut out: Vec<AgentEvent> = self.flush().into_iter().collect();
+        self.last_text = text.to_string();
+        out.push(AgentEvent::Text {
             text: text.to_string(),
-        }]
-    } else {
-        vec![AgentEvent::Text {
-            text: text.to_string(),
-        }]
+        });
+        out
+    }
+
+    /// The message being written is over: it goes out whole.
+    fn flush(&mut self) -> Option<AgentEvent> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        self.last_text = std::mem::take(&mut self.pending);
+        Some(AgentEvent::Text {
+            text: self.last_text.clone(),
+        })
     }
 }
 
+fn str_field(v: &Value, name: &str) -> String {
+    v.get(name)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `status: error` fails the run, with or without an `error` object (an
+/// invalid model stream ends in a bare `status: error`).
 fn result_event(v: &Value, last_text: &str) -> AgentEvent {
-    if let Some(error) = v.get("error").filter(|e| !e.is_null()) {
+    let error = v.get("error").filter(|e| !e.is_null());
+    if error.is_some() || v.get("status").and_then(Value::as_str) == Some("error") {
         let message = error
-            .get("message")
+            .and_then(|e| e.get("message"))
             .and_then(Value::as_str)
             .unwrap_or("gemini reported an error");
         return AgentEvent::Error {
@@ -208,7 +264,7 @@ fn gemini_usage(stats: &Value) -> Usage {
 
 impl LineParser for GeminiParser {
     fn on_line(&mut self, line: &str) -> Vec<AgentEvent> {
-        parse_line(line, &mut self.last_text)
+        self.parse_line(line)
     }
 
     fn on_exit(&mut self, success: bool, stderr_tail: &str) -> AgentEvent {
@@ -245,8 +301,97 @@ mod tests {
     use super::*;
 
     fn line(s: &str) -> Vec<AgentEvent> {
-        let mut last = String::new();
-        parse_line(s, &mut last)
+        GeminiParser::new(false).parse_line(s)
+    }
+
+    fn run(stream_text: bool, lines: &str) -> Vec<AgentEvent> {
+        let mut p = GeminiParser::new(stream_text);
+        lines.lines().flat_map(|l| p.parse_line(l)).collect()
+    }
+
+    /// v0.66.0's stream-json snapshot (`nonInteractiveCli.test.ts.snap`,
+    /// "should emit appropriate events for streaming JSON output"), the
+    /// final answer split in two chunks the way a model streams it.
+    const STREAM: &str = r#"{"type":"init","timestamp":"2026-10-31T00:00:00.000Z","session_id":"test-session-id","model":"test-model"}
+{"type":"message","timestamp":"2026-10-31T00:00:00.000Z","role":"user","content":"Stream test"}
+{"type":"message","timestamp":"2026-10-31T00:00:00.000Z","role":"assistant","content":"Thinking...","delta":true}
+{"type":"tool_use","timestamp":"2026-10-31T00:00:00.000Z","tool_name":"testTool","tool_id":"tool-1","parameters":{"arg1":"value1"}}
+{"type":"tool_result","timestamp":"2026-10-31T00:00:00.000Z","tool_id":"tool-1","status":"success","output":"Tool executed successfully"}
+{"type":"message","timestamp":"2026-10-31T00:00:00.000Z","role":"assistant","content":"Final ","delta":true}
+{"type":"message","timestamp":"2026-10-31T00:00:00.000Z","role":"assistant","content":"answer","delta":true}
+{"type":"result","timestamp":"2026-10-31T00:00:00.000Z","status":"success","stats":{"total_tokens":12,"input_tokens":10,"output_tokens":2,"cached":0,"input":10,"duration_ms":5,"tool_calls":1,"models":{}}}"#;
+
+    fn tool_call() -> AgentEvent {
+        AgentEvent::ToolCall {
+            id: "tool-1".into(),
+            name: "testTool".into(),
+            input: serde_json::json!({"arg1": "value1"}),
+        }
+    }
+
+    fn tool_result() -> AgentEvent {
+        AgentEvent::ToolResult {
+            id: "tool-1".into(),
+            ok: true,
+            output: "Tool executed successfully".into(),
+        }
+    }
+
+    fn done() -> AgentEvent {
+        AgentEvent::Done {
+            final_text: "Final answer".into(),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 2,
+                usd: 0.0,
+            },
+        }
+    }
+
+    fn text(s: &str) -> AgentEvent {
+        AgentEvent::Text { text: s.into() }
+    }
+
+    fn delta(s: &str) -> AgentEvent {
+        AgentEvent::TextDelta { text: s.into() }
+    }
+
+    #[test]
+    fn streamed_chunks_go_out_as_deltas_then_the_whole_message() {
+        assert_eq!(
+            run(true, STREAM),
+            vec![
+                delta("Thinking..."),
+                text("Thinking..."),
+                tool_call(),
+                tool_result(),
+                delta("Final "),
+                delta("answer"),
+                text("Final answer"),
+                done(),
+            ]
+        );
+    }
+
+    #[test]
+    fn without_stream_text_each_message_is_one_text() {
+        assert_eq!(
+            run(false, STREAM),
+            vec![
+                text("Thinking..."),
+                tool_call(),
+                tool_result(),
+                text("Final answer"),
+                done(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_message_without_delta_is_whole() {
+        let lines = r#"{"type":"message","role":"assistant","content":"a","delta":true}
+{"type":"message","role":"assistant","content":"whole"}"#;
+        assert_eq!(run(true, lines), vec![delta("a"), text("a"), text("whole")]);
     }
 
     #[test]
@@ -274,31 +419,23 @@ mod tests {
     }
 
     #[test]
-    fn tool_use_and_result_round_trip() {
+    fn a_failed_tool_reports_its_error() {
         assert_eq!(
-            line(r#"{"type":"tool_use","id":"t1","name":"read_file","input":{"path":"a.rs"}}"#),
-            vec![AgentEvent::ToolCall {
-                id: "t1".into(),
-                name: "read_file".into(),
-                input: serde_json::json!({"path": "a.rs"}),
-            }]
-        );
-        assert_eq!(
-            line(r#"{"type":"tool_result","id":"t1","output":"contents"}"#),
+            line(
+                r#"{"type":"tool_result","tool_id":"t1","status":"error","error":{"type":"x","message":"no such file"}}"#
+            ),
             vec![AgentEvent::ToolResult {
                 id: "t1".into(),
-                ok: true,
-                output: "contents".into()
+                ok: false,
+                output: "no such file".into()
             }]
         );
     }
 
     #[test]
     fn result_becomes_done() {
-        let mut last = "built up".to_string();
-        let events = parse_line(
+        let events = line(
             r#"{"type":"result","response":"ok","stats":{"input_tokens":10,"output_tokens":2}}"#,
-            &mut last,
         );
         assert_eq!(
             events,
@@ -309,6 +446,17 @@ mod tests {
                     output_tokens: 2,
                     usd: 0.0
                 }
+            }]
+        );
+    }
+
+    #[test]
+    fn a_bare_error_status_is_an_error() {
+        assert_eq!(
+            line(r#"{"type":"result","status":"error","stats":{}}"#),
+            vec![AgentEvent::Error {
+                message: "gemini reported an error".into(),
+                stderr_tail: String::new()
             }]
         );
     }

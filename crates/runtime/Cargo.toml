@@ -24,6 +24,7 @@ theodore-telemetry.workspace = true
 theodore-fixtures = { path = "../fixtures" }
 theodore-sandbox = { path = "../sandbox" }
 theodore-account-workos = { path = "../account-workos" }
+theodore-code-intel.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 serde_json.workspace = true

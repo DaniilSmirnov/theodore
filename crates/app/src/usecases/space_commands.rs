@@ -244,6 +244,19 @@ impl Core {
                 format!("{file}: unknown keys ignored: {}", keys.join(", ")),
             ));
         }
+        let mut ignored: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (file, key) in &merged.ignored {
+            ignored.entry(file).or_default().push(key);
+        }
+        for (file, keys) in ignored {
+            problems.push((
+                format!("{file}\0ignored\0{}", keys.join(",")),
+                format!(
+                    "{file}: ignored, a repo's file can't set {} (set it in your own config)",
+                    keys.join(", ")
+                ),
+            ));
+        }
         for (section, e) in &merged.errors {
             problems.push((
                 format!("{section}\0type\0{e}"),

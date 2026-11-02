@@ -249,7 +249,7 @@ export const SetupStage = observer(function SetupStage({
   space: Space;
 }) {
   const store = useRootStore();
-  const [busy, setBusy] = useState<'retry' | 'skip' | null>(null);
+  const [busy, setBusy] = useState<'retry' | 'skip' | 'fix' | null>(null);
   const setup = space.setup;
   const lines = store.ephemeral.spaceLogs.get(space.id) ?? EMPTY;
   if (!setup || setupView(space) !== 'stage') return null;
@@ -257,6 +257,16 @@ export const SetupStage = observer(function SetupStage({
     setBusy(action);
     try {
       await api.spaceSetup({ space: space.id, action });
+    } catch {
+      // toasted by api.ts
+    } finally {
+      setBusy(null);
+    }
+  };
+  const fix = async () => {
+    setBusy('fix');
+    try {
+      await api.spaceFixSetup(space.id);
     } catch {
       // toasted by api.ts
     } finally {
@@ -318,6 +328,18 @@ export const SetupStage = observer(function SetupStage({
             >
               Continue without setup
             </Button>
+            {setup.status === 'failed' && (
+              <Button
+                size="sm"
+                variant="secondary"
+                className="space-setup-fix"
+                isDisabled={busy != null}
+                isPending={busy === 'fix'}
+                onPress={() => void fix()}
+              >
+                Fix with agent
+              </Button>
+            )}
             {setup.status === 'failed' && (
               <Button
                 size="sm"

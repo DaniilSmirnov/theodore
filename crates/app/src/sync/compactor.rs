@@ -185,13 +185,26 @@ mod tests {
     /// `time::advance` that happens to land before that poll would see no
     /// effect. Retries in small steps rather than a single large advance
     /// so this can't itself overshoot past the next scheduled pass.
+    ///
+    /// `compact` itself runs on the blocking pool, a real thread that paused
+    /// time doesn't wait for: each step also gives it a little wall-clock
+    /// time, bounded by a real deadline rather than a step count, so a
+    /// loaded CI runner can't exhaust the steps before the thread records
+    /// its call.
     async fn wait_for_call_count(spy: &CountingStore, expected: usize) {
-        for _ in 0..50 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut steps = 0;
+        while std::time::Instant::now() < deadline {
             tokio::task::yield_now().await;
             if spy.calls.lock().unwrap().len() >= expected {
                 return;
             }
-            tokio::time::advance(Duration::from_millis(REAL_TICK_MS / 10 + 1)).await;
+            std::thread::sleep(Duration::from_millis(1));
+            // Paused time only needs to cover one tick of `run`'s loop.
+            if steps < 50 {
+                steps += 1;
+                tokio::time::advance(Duration::from_millis(REAL_TICK_MS / 10 + 1)).await;
+            }
         }
         panic!(
             "compact was not called {expected} time(s) in time; saw {:?}",

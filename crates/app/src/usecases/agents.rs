@@ -4,9 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use theodore_contract::{
-    AskRequest, ChatMessage, Ephemeral, RunSkillRequest, RunStatus, SkillRun, models,
-};
+use theodore_contract::{AskRequest, ChatMessage, RunSkillRequest, RunStatus, SkillRun, models};
 use theodore_domain::{AgentId, Author, Finding, FindingId, Fix, PrId};
 use theodore_ports::{
     AgentAttachment, AgentEvent, AgentMode, AgentRequest, NewAction, SyncActionCode,
@@ -17,6 +15,8 @@ use tracing::Instrument as _;
 use crate::core::{Core, RunHandle};
 use crate::error::{AppError, AppResult};
 use crate::usecases::attachments::{agent_attachments, with_attachments};
+use crate::usecases::code_intel::code_prompt;
+use crate::usecases::live::LiveRun;
 
 impl Core {
     pub async fn run_skill(&self, req: RunSkillRequest) -> AppResult<String> {
@@ -122,6 +122,7 @@ impl Core {
             at: now,
             failed: None,
             attachments: attachments.clone(),
+            queued: None,
         };
         let data = serde_json::to_value(&question).map_err(|e| AppError::Invalid(e.to_string()))?;
         self.apply(vec![NewAction {
@@ -393,7 +394,7 @@ async fn drive_skill_run(
     // The user's own MCP servers are for spaces only (issue #16).
     let user_mcp = false;
     // The repo's `review.instructions` / `review.context`.
-    let system = core.review_rules_of(&pr).await.with_system(None);
+    let rules = core.review_rules_of(&pr).await;
     let started = std::time::Instant::now();
     let findings_before = count_findings(core, &pr, &skill).await;
     let agent_count = agents.len() as u32;
@@ -405,11 +406,11 @@ async fn drive_skill_run(
         if cancel.is_cancelled() {
             break;
         }
-        let mcp = core.pr_tools(&run_id, &pr, agent).await;
+        let (mcp, code) = core.pr_tools(&run_id, &pr, agent).await;
         let req = AgentRequest {
             agent,
             prompt: skill_prompt(&skill, agent, &cwd, &core.0.deps.claude_home),
-            system: system.clone(),
+            system: rules.with_system(code_prompt(code).map(str::to_string)),
             cwd: cwd.clone(),
             mode: AgentMode::ReadOnly,
             mcp: mcp.clone(),
@@ -420,35 +421,24 @@ async fn drive_skill_run(
             user_mcp,
             attachments: vec![],
             resume: None,
-            stream_text: false,
+            stream_text: true,
         };
         let _guard = ToolsGuard { core, mcp };
+        let mut live = LiveRun::new(run_id.as_str(), agent).with_thinking();
         match core.0.deps.agents.run(req).await {
             Ok(mut run) => loop {
                 tokio::select! {
                     _ = cancel.cancelled() => { run.cancel.cancel(); break; }
                     event = run.events.recv() => {
                         let Some(event) = event else { break };
+                        live.show(core, &event);
                         match event {
-                            AgentEvent::Text { text } | AgentEvent::Thinking { text } => {
-                                core.emit(Ephemeral::AgentDelta { run: run_id.clone(), agent, text });
-                            }
-                            AgentEvent::ToolCall { name, input, .. } => {
-                                core.emit(Ephemeral::RunLog { run: run_id.clone(), agent, line: tool_log_line_with(&name, &input) });
-                            }
-                            AgentEvent::ToolResult { ok, .. } => {
-                                core.emit(Ephemeral::RunLog { run: run_id.clone(), agent, line: format!("tool result ok={ok}") });
-                            }
-                            AgentEvent::Stalled => {
-                                core.emit(Ephemeral::RunLog { run: run_id.clone(), agent, line: "stalled".into() });
-                                core.emit(Ephemeral::RunStalled { run: run_id.clone(), agent });
-                            }
-                            AgentEvent::Usage { .. } | AgentEvent::Session { .. } | AgentEvent::TextDelta { .. } => {}
                             AgentEvent::Done { .. } => break,
                             AgentEvent::Error { message, .. } => {
                                 error = Some(message);
                                 break;
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -465,6 +455,12 @@ async fn drive_skill_run(
     } else {
         RunStatus::Done
     };
+    // The chat message first: whoever waits for the run's final status
+    // (the UI, tests) must find it already there.
+    if cancelled || error.is_some() {
+        let text = error.clone().unwrap_or_else(|| "cancelled".into());
+        persist_failed_message(core, &pr, last_agent, &text).await;
+    }
     let data = serde_json::json!({ "status": status, "error": error });
     let _ = core
         .apply(vec![NewAction {
@@ -506,10 +502,6 @@ async fn drive_skill_run(
             findings,
             ms,
         });
-    }
-    if cancelled || error.is_some() {
-        let text = error.unwrap_or_else(|| "cancelled".into());
-        persist_failed_message(core, &pr, last_agent, &text).await;
     }
     core.0.runs.write().await.remove(&run_id);
 }
@@ -553,6 +545,7 @@ pub(crate) async fn persist_failed_message(core: &Core, pr: &PrId, agent: AgentI
         at: core.0.deps.clock.now(),
         failed: Some(text.to_string()),
         attachments: vec![],
+        queued: None,
     };
     if let Ok(data) = serde_json::to_value(&message) {
         let _ = core
@@ -590,13 +583,17 @@ fn tool_target(input: &serde_json::Value) -> Option<String> {
     } else if let Some(p) = s("file_path")
         .or_else(|| s("path"))
         .or_else(|| s("notebook_path"))
+        .or_else(|| s("file"))
     {
         let parts: Vec<&str> = p.trim_end_matches('/').rsplit('/').take(2).collect();
         parts.into_iter().rev().collect::<Vec<_>>().join("/")
     } else {
         s("pattern")
             .or_else(|| s("query"))
-            .or_else(|| s("url"))?
+            .or_else(|| s("url"))
+            // Theodore's `set_base` and `ship`.
+            .or_else(|| s("branch"))
+            .or_else(|| s("action"))?
             .trim()
             .to_string()
     };
@@ -625,11 +622,26 @@ pub(crate) fn tool_log_line(name: &str) -> String {
         "app_status" => "app status",
         "read_logs" => "read the logs",
         "space_info" => "space info",
+        "ship" => "ship the change",
+        "get_space_diff" => "read the diff",
+        "get_review_comments" => "read the review comments",
+        "add_review_comment" => "leave a review comment",
+        "set_base" => "change the base branch",
+        "update_progress" => "update the progress",
         "get_pr_context" => "read the PR",
         "get_group" => "read a group",
         "get_base_file" => "read a file before the change",
         "add_finding" => "add a finding",
         "propose_patch" => "propose a fix",
+        "find_symbol" => "find a symbol",
+        "get_symbol" => "read a symbol",
+        "references" => "find references",
+        "definition" => "go to definition",
+        "diagnostics" => "read diagnostics",
+        "code_status" => "code intelligence status",
+        "replace_symbol_body" => "replace a symbol",
+        "insert_after_symbol" => "insert after a symbol",
+        "rename_symbol" => "rename a symbol",
         _ => name,
     };
     format!("tool: {label}")
@@ -670,6 +682,7 @@ fn skill_prompt(skill: &str, agent: AgentId, worktree: &Path, claude_home: &Path
 }
 
 async fn fail_run(core: &Core, run_id: &str, pr: &PrId, agent: AgentId, message: &str) {
+    persist_failed_message(core, pr, agent, message).await;
     let data = serde_json::json!({ "status": RunStatus::Failed, "error": message });
     let _ = core
         .apply(vec![NewAction {
@@ -679,7 +692,6 @@ async fn fail_run(core: &Core, run_id: &str, pr: &PrId, agent: AgentId, message:
             data: Some(data),
         }])
         .await;
-    persist_failed_message(core, pr, agent, message).await;
     core.0.runs.write().await.remove(run_id);
 }
 
@@ -709,11 +721,14 @@ async fn drive_ask(
     cwd: PathBuf,
     cancel: CancellationToken,
 ) {
-    let mcp = core.pr_tools(&run_id, &pr, agent).await;
+    let (mcp, code) = core.pr_tools(&run_id, &pr, agent).await;
     let system = core
         .review_rules_of(&pr)
         .await
-        .with_system(Some(ASK_SYSTEM.into()));
+        .with_system(Some(match code_prompt(code) {
+            Some(hint) => format!("{ASK_SYSTEM}\n{hint}"),
+            None => ASK_SYSTEM.into(),
+        }));
     let req = AgentRequest {
         agent,
         prompt: question.prompt,
@@ -729,9 +744,10 @@ async fn drive_ask(
         user_mcp: false,
         attachments: question.attachments,
         resume: None,
-        stream_text: false,
+        stream_text: true,
     };
     let _guard = ToolsGuard { core, mcp };
+    let mut live = LiveRun::new(run_id.as_str(), agent);
     let mut text = String::new();
     let mut error = None;
     match core.0.deps.agents.run(req).await {
@@ -740,14 +756,9 @@ async fn drive_ask(
                 _ = cancel.cancelled() => { run.cancel.cancel(); break; }
                 event = run.events.recv() => {
                     let Some(event) = event else { break };
+                    live.show(core, &event);
                     match event {
-                        AgentEvent::Text { text: t } => {
-                            text.push_str(&t);
-                            core.emit(Ephemeral::AgentDelta { run: run_id.clone(), agent, text: t });
-                        }
-                        AgentEvent::Stalled => {
-                            core.emit(Ephemeral::RunStalled { run: run_id.clone(), agent });
-                        }
+                        AgentEvent::Text { text: t } => text.push_str(&t),
                         AgentEvent::Done { final_text, .. } => {
                             text = final_text;
                             break;
@@ -786,6 +797,7 @@ async fn drive_ask(
         at: now,
         failed: None,
         attachments: vec![],
+        queued: None,
     };
     if let Ok(data) = serde_json::to_value(&reply) {
         let _ = core
@@ -848,6 +860,37 @@ mod tool_label_tests {
                 .count(),
             "tool: Bash · ".chars().count() + 80
         );
+        assert_eq!(
+            tool_log_line_with(
+                "mcp__space-tools__ship",
+                &serde_json::json!({ "action": "open_pr" })
+            ),
+            "tool: ship the change · open_pr"
+        );
+        assert_eq!(
+            tool_log_line_with(
+                "space-tools__get_space_diff",
+                &serde_json::json!({ "file": "src/auth/login.ts" })
+            ),
+            "tool: read the diff · auth/login.ts"
+        );
+        assert_eq!(
+            tool_log_line_with(
+                "mcp__space-tools__set_base",
+                &serde_json::json!({ "branch": "release" })
+            ),
+            "tool: change the base branch · release"
+        );
+        for (name, label) in [
+            ("get_review_comments", "read the review comments"),
+            ("add_review_comment", "leave a review comment"),
+            ("update_progress", "update the progress"),
+        ] {
+            assert_eq!(
+                tool_log_line(&format!("mcp__space-tools__{name}")),
+                format!("tool: {label}")
+            );
+        }
         assert_eq!(
             tool_log_line("mcp__other__run_check"),
             "tool: mcp__other__run_check",

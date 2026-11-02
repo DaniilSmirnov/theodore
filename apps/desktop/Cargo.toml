@@ -22,6 +22,7 @@ tauri-build = { workspace = true, features = ["codegen"] }
 
 [dependencies]
 theodore-app.workspace = true
+theodore-agents.workspace = true
 theodore-ports.workspace = true
 theodore-runtime = { path = "../../crates/runtime" }
 theodore-sandbox = { path = "../../crates/sandbox" }

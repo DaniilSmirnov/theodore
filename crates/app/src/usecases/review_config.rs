@@ -197,7 +197,7 @@ impl Core {
             .any(|g| glob_match(g, path))
     }
 
-    async fn open_entry(&self, pr: &PrId) -> Option<Arc<crate::core::RevisionEntry>> {
+    pub(crate) async fn open_entry(&self, pr: &PrId) -> Option<Arc<crate::core::RevisionEntry>> {
         let head = self.0.current_head.read().await.get(pr).cloned()?;
         self.0
             .revisions

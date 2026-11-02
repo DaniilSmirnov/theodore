@@ -45,6 +45,7 @@ import type {
   OpenBranchRequest,
   OpenPrRequest,
   OpenPrResponse,
+  OpenTerminalRequest,
   Person,
   ProblemReport,
   PrId,
@@ -54,6 +55,7 @@ import type {
   ReplyRequest,
   ReportedIssue,
   RerunCheckRequest,
+  ResizeTerminalRequest,
   Revision,
   RevisionRequest,
   ResolveRequest,
@@ -65,18 +67,24 @@ import type {
   CreateSpaceRequest,
   ShipSpaceRequest,
   Space,
+  SpaceBaseStatus,
   SpaceFeedbackRequest,
+  SpaceFixCiRequest,
   SpaceReviewRequest,
+  SpaceQueuedRequest,
   SpaceSendRequest,
   SpaceConfigView,
   SpaceLogLine,
   SpaceRunRequest,
   SpaceSetupRequest,
+  SpaceTerminalInfo,
   SpaceTrustRequest,
   EffectiveConfig,
   GlobalConfigInfo,
   ConfigDraft,
   CheckConfigRequest,
+  CodeIntelLspRequest,
+  CodeIntelStatus,
   ConfigCheck,
   SaveConfigRequest,
   SaveConfigResult,
@@ -96,6 +104,7 @@ import type {
   UiEvent,
   TriageRequest,
   UpdateInfo,
+  WriteTerminalRequest,
 } from '../gen/contract';
 
 /** A fresh operation id: 16 lowercase hex chars. Sent with every command
@@ -274,6 +283,11 @@ export const api = {
   listSpaces: (project: string | null) =>
     call<Space[]>('list_spaces', { project }),
   spaceSend: (req: SpaceSendRequest) => call<string>('space_send', { req }),
+  /** "Send now": into the running turn when it can take it, else queued. */
+  spaceSendNow: (req: SpaceSendRequest) =>
+    call<string>('space_send_now', { req }),
+  /** Send / Cancel / Edit on a queued message (docs/spaces.md §8). */
+  spaceQueued: (req: SpaceQueuedRequest) => call<null>('space_queued', { req }),
   spaceStop: (space: string) => call<null>('space_stop', { space }),
   spaceSkills: (space: string) => call<SkillInfo[]>('space_skills', { space }),
   spaceReview: (req: SpaceReviewRequest) =>
@@ -284,6 +298,18 @@ export const api = {
   unarchiveSpace: (space: string) => call<Space>('unarchive_space', { space }),
   spaceSendFeedback: (req: SpaceFeedbackRequest) =>
     call<string>('space_send_feedback', { req }),
+  /** "Base moved: N commits behind", from the copy on this Mac. A passive
+   *  read: a failure just hides it, it isn't toasted. */
+  spaceBaseStatus: (space: string) =>
+    call<SpaceBaseStatus>('space_base_status', { space }, true),
+  /** Update from base; while conflicts are resolving, completes the merge. */
+  updateSpaceFromBase: (space: string) =>
+    call<Space>('update_space_from_base', { space }),
+  abortSpaceUpdate: (space: string) =>
+    call<Space>('abort_space_update', { space }),
+  /** "Fix with agent": the space PR's failing checks' logs as the next
+   *  turn. */
+  spaceFixCi: (req: SpaceFixCiRequest) => call<string>('space_fix_ci', { req }),
   /** What a space runs, where each command comes from, and trust. */
   spaceConfig: (space: string) =>
     call<SpaceConfigView>('space_config', { space }),
@@ -291,9 +317,30 @@ export const api = {
   spaceTrust: (req: SpaceTrustRequest) => call<Space>('space_trust', { req }),
   /** Retry a failed setup, or continue without it. */
   spaceSetup: (req: SpaceSetupRequest) => call<Space>('space_setup', { req }),
+  /** "Set up with agent": no `spaces:` commands yet — ask the agent to
+   *  look at the repo and write them. */
+  spaceSetupAssist: (space: string) =>
+    call<Space>('space_setup_assist', { space }),
+  /** "Fix with agent": setup failed — ask the agent to fix the cause. */
+  spaceFixSetup: (space: string) => call<Space>('space_fix_setup', { space }),
   /** Starts or stops the space's `run` command. */
   spaceRun: (req: SpaceRunRequest) => call<Space>('space_run', { req }),
   spaceLogs: (space: string) => call<SpaceLogLine[]>('space_logs', { space }),
+  /** Starts a terminal in the space's worktree (docs/spaces.md "Terminal"). */
+  openSpaceTerminal: (req: OpenTerminalRequest) =>
+    call<SpaceTerminalInfo>('open_space_terminal', { req }),
+  /** Bytes typed or pasted into it. */
+  writeSpaceTerminal: (req: WriteTerminalRequest) =>
+    call<null>('write_space_terminal', { req }),
+  /** A new size in cells. */
+  resizeSpaceTerminal: (req: ResizeTerminalRequest) =>
+    call<null>('resize_space_terminal', { req }),
+  /** Kills its shell. */
+  closeSpaceTerminal: (terminal: string) =>
+    call<null>('close_space_terminal', { terminal }),
+  /** The space's open (or just-exited) terminals, with scrollback. */
+  listSpaceTerminals: (space: string) =>
+    call<SpaceTerminalInfo[]>('list_space_terminals', { space }),
   /** A project's merged config, read-only (Settings → Labs). */
   projectConfig: (project: string) =>
     call<EffectiveConfig>('project_config', { project }),
@@ -306,6 +353,20 @@ export const api = {
     call<ConfigCheck>('check_config', { req }, true),
   saveConfig: (req: SaveConfigRequest) =>
     call<SaveConfigResult>('save_config', { req }),
+  /** Settings → Languages, polled while something downloads: shown
+   *  inline, never toasted. */
+  codeIntelStatus: (project: string) =>
+    call<CodeIntelStatus>('code_intel_status', { project }, true),
+  /** A language's grammar and server: Settings → Languages → Install, or
+   *  an install suggestion's Download. */
+  codeIntelInstall: (language: string) =>
+    call<null>('code_intel_install', { language }),
+  /** An install suggestion's Not now: not suggested again. */
+  codeIntelDecline: (language: string) =>
+    call<null>('code_intel_decline', { language }),
+  /** Language servers in reviews or in spaces, on or off. */
+  codeIntelSetLsp: (req: CodeIntelLspRequest) =>
+    call<null>('code_intel_set_lsp', { req }),
   globalConfig: () => call<GlobalConfigInfo>('global_config'),
   /** Creates the global config from a template when missing, then opens
    *  it in the default editor. */

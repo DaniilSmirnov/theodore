@@ -21,6 +21,7 @@ import { useRootStore, useUi } from '../stores/context';
 import { AgentTag, Btn, Empty, Hints, K, Spinner } from './bits';
 import { useContextMenu, type ContextMenuItem } from './ContextMenu';
 import { PatchView } from './Patch';
+import { TaskLive } from './RunLive';
 import { ViewHeader } from './List';
 import { latinKey, useViewKeys } from './keys';
 import { TaskIcon } from './StatusIcon';
@@ -149,11 +150,12 @@ export const TaskRow = observer(function TaskRow({
     },
   ]);
 
-  // The fix to review and the reject form: inside the title column in the
+  // The fix running, the fix to review and the reject form: inside the title column in the
   // full list, on their own full-width row in the narrow side panel (where
   // sharing a row with the buttons squeezed the patch to a sliver).
   const details = (
     <>
+      {t.status === 'progress' && <TaskLive task={t.id} />}
       {t.fix?.patch && t.status === 'review' && (
         <div
           className="task-patch mt-1.5 max-w-[720px]"

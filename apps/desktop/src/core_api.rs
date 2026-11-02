@@ -18,6 +18,9 @@ use theodore_contract::{
     SubmitReviewRequest, SymbolHit, SyncFrame, TaskDecision, Transaction, TransactionResult,
     TriageRequest, UpdateInfo,
 };
+use theodore_contract::{
+    OpenTerminalRequest, ResizeTerminalRequest, SpaceTerminalInfo, WriteTerminalRequest,
+};
 use theodore_contract::{SandboxFaultRequest, SandboxStatus};
 use theodore_domain::{AgentId, HostKind, HostRepo, Person, PrId, Revision};
 
@@ -225,6 +228,20 @@ pub trait CoreApi: Send + Sync {
     ) -> Result<String, CommandError> {
         Err(not_ready())
     }
+    /// "Send now": into the running turn, or queued like `space_send`.
+    async fn space_send_now(
+        &self,
+        _req: theodore_contract::SpaceSendRequest,
+    ) -> Result<String, CommandError> {
+        Err(not_ready())
+    }
+    /// Send / Cancel / Edit on a queued message.
+    async fn space_queued(
+        &self,
+        _req: theodore_contract::SpaceQueuedRequest,
+    ) -> Result<(), CommandError> {
+        Err(not_ready())
+    }
     async fn space_stop(&self, _space: String) -> Result<(), CommandError> {
         Err(not_ready())
     }
@@ -270,6 +287,36 @@ pub trait CoreApi: Send + Sync {
     ) -> Result<String, CommandError> {
         Err(not_ready())
     }
+    /// Commits the space's base has that it doesn't (no network).
+    async fn space_base_status(
+        &self,
+        _space: String,
+    ) -> Result<theodore_contract::SpaceBaseStatus, CommandError> {
+        Err(not_ready())
+    }
+    /// Update from base: merge the base's tip into the space (or complete
+    /// the merge being resolved).
+    async fn update_space_from_base(
+        &self,
+        _space: String,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        Err(not_ready())
+    }
+    /// Abort the update from base being resolved.
+    async fn abort_space_update(
+        &self,
+        _space: String,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        Err(not_ready())
+    }
+    /// "Fix with agent": the space PR's failing checks' logs as the next
+    /// turn (docs/spaces.md "Fix CI").
+    async fn space_fix_ci(
+        &self,
+        _req: theodore_contract::SpaceFixCiRequest,
+    ) -> Result<String, CommandError> {
+        Err(not_ready())
+    }
     // ── project config (docs/config.md) ──────────────────────────────────
 
     /// What a space runs, where each command comes from, trust.
@@ -293,6 +340,21 @@ pub trait CoreApi: Send + Sync {
     ) -> Result<theodore_contract::Space, CommandError> {
         Err(not_ready())
     }
+    /// "Set up with agent": no `spaces:` commands yet — ask the space's
+    /// agent to look at the repo and write them.
+    async fn space_setup_assist(
+        &self,
+        _space: String,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        Err(not_ready())
+    }
+    /// "Fix with agent": setup failed — ask the agent to fix the cause.
+    async fn space_fix_setup(
+        &self,
+        _space: String,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        Err(not_ready())
+    }
     /// Starts or stops the space's `run` command.
     async fn space_run(
         &self,
@@ -307,6 +369,33 @@ pub trait CoreApi: Send + Sync {
     ) -> Result<Vec<theodore_contract::SpaceLogLine>, CommandError> {
         Err(not_ready())
     }
+    /// Starts a terminal in the space's worktree (docs/spaces.md "Terminal").
+    async fn open_space_terminal(
+        &self,
+        _req: OpenTerminalRequest,
+    ) -> Result<SpaceTerminalInfo, CommandError> {
+        Err(not_ready())
+    }
+    /// Bytes typed or pasted into it.
+    async fn write_space_terminal(&self, _req: WriteTerminalRequest) -> Result<(), CommandError> {
+        Err(not_ready())
+    }
+    /// A new size in cells.
+    async fn resize_space_terminal(&self, _req: ResizeTerminalRequest) -> Result<(), CommandError> {
+        Err(not_ready())
+    }
+    /// Kills its shell.
+    async fn close_space_terminal(&self, _terminal: String) -> Result<(), CommandError> {
+        Err(not_ready())
+    }
+    /// The space's open (or just-exited) terminals, with scrollback to seed
+    /// `xterm.js`.
+    async fn list_space_terminals(
+        &self,
+        _space: String,
+    ) -> Result<Vec<SpaceTerminalInfo>, CommandError> {
+        Err(not_ready())
+    }
     /// A project's merged config, with each value's file.
     async fn project_config(
         &self,
@@ -316,6 +405,28 @@ pub trait CoreApi: Send + Sync {
     }
     /// `~/.theodore/config.yaml`: path and whether it exists.
     async fn global_config(&self) -> Result<theodore_contract::GlobalConfigInfo, CommandError> {
+        Err(not_ready())
+    }
+    /// Settings → Languages: each language of a project (docs/code-intel.md §9).
+    async fn code_intel_status(
+        &self,
+        _project: String,
+    ) -> Result<theodore_contract::CodeIntelStatus, CommandError> {
+        Err(not_ready())
+    }
+    /// Downloads a language's grammar and server.
+    async fn code_intel_install(&self, _language: String) -> Result<(), CommandError> {
+        Err(not_ready())
+    }
+    /// Settings → Languages: language servers in reviews / in spaces.
+    async fn code_intel_set_lsp(
+        &self,
+        _req: theodore_contract::CodeIntelLspRequest,
+    ) -> Result<(), CommandError> {
+        Err(not_ready())
+    }
+    /// No to an install suggestion; remembered.
+    async fn code_intel_decline(&self, _language: String) -> Result<(), CommandError> {
         Err(not_ready())
     }
     /// Same, created from a commented template when missing.

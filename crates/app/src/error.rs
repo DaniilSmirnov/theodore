@@ -81,6 +81,7 @@ impl AppError {
                 | AppError::Git(theodore_ports::GitError::Network(_))
                 | AppError::Grouper(GrouperError::Offline(_))
                 | AppError::Git(theodore_ports::GitError::Refused(_))
+                | AppError::Git(theodore_ports::GitError::Busy(_))
                 | AppError::Git(theodore_ports::GitError::Unsupported(_))
         )
     }

@@ -10,6 +10,10 @@
 //!          └─ connection failure in message/stderr ─▶ Error agent.offline
 //! ```
 //!
+//! With an [`Input`] (`spawn_with_input`) stdin stays open: the first
+//! message goes in at once, steered ones as they come, and stdin closes
+//! when the parser's terminal event says the run is over.
+//!
 //! Stream parsing is CLI-specific (see `claude`, `codex`, `gemini`); this
 //! module only owns the process, the channel, cancellation and stalls.
 
@@ -19,10 +23,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use theodore_ports::agent::{
-    AGENT_OFFLINE_CODE, AgentError, AgentEvent, AgentRun, is_connection_failure, offline_message,
+    AGENT_OFFLINE_CODE, AgentError, AgentEvent, AgentRun, SteerMessage, is_connection_failure,
+    offline_message,
 };
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -44,6 +49,13 @@ pub const MAX_STDOUT_LINE_BYTES: usize = 1024 * 1024;
 /// forever). `0` disables it. `AgentCli` sets this to `DEFAULT_MAX_RUNTIME_MS`
 /// unless a future config wires up something else.
 pub const DEFAULT_MAX_RUNTIME_MS: u64 = 30 * 60 * 1000;
+/// A run whose last result is in but that still waits for a written
+/// message to be taken this long closes stdin anyway: the CLI then finishes
+/// with what it has instead of waiting for input forever.
+pub const INPUT_GRACE: Duration = Duration::from_secs(30);
+/// How long a run fed through stdin gets to exit on its own once stdin is
+/// closed (it saves its session) before it is killed.
+const EXIT_AFTER_INPUT: Duration = Duration::from_secs(5);
 
 /// Turns one stdout line into zero or more `AgentEvent`s. Each call is a pure
 /// function of `(self, line)`: no I/O, deterministic, unit-testable directly
@@ -57,6 +69,55 @@ pub trait LineParser: Send + 'static {
     /// connect" when the run then goes quiet.
     fn is_transport_notice(&self, _line: &str) -> bool {
         false
+    }
+    /// A message was written to the CLI's stdin ([`Input`] runs only).
+    fn on_input(&mut self) {}
+    /// The CLI finished a turn but hasn't taken every written message yet:
+    /// after [`INPUT_GRACE`] of that, stdin is closed.
+    fn awaiting_input(&self) -> bool {
+        false
+    }
+}
+
+/// Messages fed to a CLI that reads them from stdin while it runs.
+pub struct Input {
+    /// The first message, already one line of the CLI's input format.
+    pub first: String,
+    /// Steered messages, as plain text.
+    pub messages: mpsc::Receiver<SteerMessage>,
+    /// Plain text → one line of the CLI's input format.
+    pub encode: fn(&str) -> String,
+}
+
+/// The run's open stdin, while it takes messages.
+struct Feed {
+    stdin: Option<ChildStdin>,
+    messages: Option<mpsc::Receiver<SteerMessage>>,
+    encode: fn(&str) -> String,
+}
+
+impl Feed {
+    /// The next steered message; never resolves once stdin is closed.
+    async fn next(&mut self) -> Option<SteerMessage> {
+        match (&self.stdin, &mut self.messages) {
+            (Some(_), Some(rx)) => rx.recv().await,
+            _ => std::future::pending().await,
+        }
+    }
+
+    async fn write(&mut self, line: &str) -> bool {
+        let Some(stdin) = self.stdin.as_mut() else {
+            return false;
+        };
+        let mut bytes = line.as_bytes().to_vec();
+        bytes.push(b'\n');
+        stdin.write_all(&bytes).await.is_ok() && stdin.flush().await.is_ok()
+    }
+
+    /// EOF for the CLI; anything still being steered is refused.
+    fn close(&mut self) {
+        self.stdin = None;
+        self.messages = None;
     }
 }
 
@@ -158,13 +219,34 @@ pub fn spawn_and_stream(
     spec: SpawnSpec,
     parser: Box<dyn LineParser>,
 ) -> Result<AgentRun, AgentError> {
+    spawn(spec, parser, None)
+}
+
+/// [`spawn_and_stream`] with stdin kept open for `input`.
+pub fn spawn_with_input(
+    spec: SpawnSpec,
+    parser: Box<dyn LineParser>,
+    input: Input,
+) -> Result<AgentRun, AgentError> {
+    spawn(spec, parser, Some(input))
+}
+
+fn spawn(
+    spec: SpawnSpec,
+    parser: Box<dyn LineParser>,
+    input: Option<Input>,
+) -> Result<AgentRun, AgentError> {
     let stall_after = Duration::from_millis(spec.stall_after_ms.max(1));
     let mut cmd = Command::new(&spec.program);
     cmd.args(&spec.args)
         .current_dir(&spec.cwd)
         .env_clear()
         .envs(spec.env)
-        .stdin(std::process::Stdio::null())
+        .stdin(if input.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -199,6 +281,14 @@ pub fn spawn_and_stream(
     }
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
+    let input = input.map(|i| {
+        let feed = Feed {
+            stdin: child.stdin.take(),
+            messages: Some(i.messages),
+            encode: i.encode,
+        };
+        (feed, i.first)
+    });
 
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
     let cancel = CancellationToken::new();
@@ -221,6 +311,7 @@ pub fn spawn_and_stream(
             parser,
             guards,
             log,
+            input,
         ),
         span,
     ));
@@ -251,8 +342,25 @@ async fn run_loop(
     mut parser: Box<dyn LineParser>,
     _guards: Vec<Box<dyn std::any::Any + Send>>,
     log: RunLog,
+    input: Option<(Feed, String)>,
 ) {
     let mut reader = BufReader::new(stdout);
+    let fed = input.is_some();
+    let mut feed = match input {
+        Some((mut feed, first)) => {
+            if feed.write(&first).await {
+                parser.on_input();
+            }
+            feed
+        }
+        None => Feed {
+            stdin: None,
+            messages: None,
+            encode: |s| s.to_string(),
+        },
+    };
+    // Set while the parser waits for a written message to be taken.
+    let mut input_deadline: Option<tokio::time::Instant> = None;
     let mut terminal_sent = false;
     let mut stalled_notified = false;
     let mut exit_success: Option<bool> = None;
@@ -332,7 +440,13 @@ async fn run_loop(
                         } else if !l.trim().is_empty() {
                             output_at = log.ms().max(1);
                         }
-                        for ev in parser.on_line(&l) {
+                        let events = parser.on_line(&l);
+                        input_deadline = match (parser.awaiting_input(), feed.stdin.is_some()) {
+                            (true, true) => input_deadline
+                                .or_else(|| Some(tokio::time::Instant::now() + INPUT_GRACE)),
+                            _ => None,
+                        };
+                        for ev in events {
                             let terminal = is_terminal(&ev);
                             if terminal && terminal_sent {
                                 continue;
@@ -348,6 +462,28 @@ async fn run_loop(
                     Ok(None) => break, // stdout closed; fall through to exit handling
                     Err(_) => break,
                 }
+            }
+            msg = feed.next() => {
+                if let Some(msg) = msg {
+                    let line = (feed.encode)(&msg.text);
+                    if feed.write(&line).await {
+                        parser.on_input();
+                        let _ = msg.delivered.send(());
+                    }
+                    // Not written: dropping `delivered` tells the sender.
+                } else {
+                    // Nobody can steer any more; stdin stays open for the run.
+                    feed.messages = None;
+                }
+            }
+            _ = sleep_until_or_pending(input_deadline) => {
+                tracing::warn!(
+                    agent = %log.agent,
+                    duration_ms = log.ms(),
+                    "agent never took a steered message; closing its input"
+                );
+                feed.close();
+                input_deadline = None;
             }
             // Once stalled, this keeps re-checking every `stall_after` (no
             // second `Stalled`): the connection error may come after the
@@ -383,6 +519,14 @@ async fn run_loop(
                     return;
                 }
             }
+        }
+    }
+
+    if fed {
+        // The run is over: EOF lets the CLI save its session and exit.
+        feed.close();
+        if exit_success.is_none() && terminal_sent {
+            let _ = tokio::time::timeout(EXIT_AFTER_INPUT, child.wait()).await;
         }
     }
 

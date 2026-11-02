@@ -717,6 +717,28 @@ pub async fn space_send(
     op.run(async move { core.space_send(req).await }).await
 }
 
+/// "Send now": into the running turn when it takes messages, else queued.
+#[tauri::command]
+#[specta::specta]
+pub async fn space_send_now(
+    op: crate::op::Op,
+    req: theodore_contract::SpaceSendRequest,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<String, CommandError> {
+    op.run(async move { core.space_send_now(req).await }).await
+}
+
+/// Send / Cancel / Edit on a queued message.
+#[tauri::command]
+#[specta::specta]
+pub async fn space_queued(
+    op: crate::op::Op,
+    req: theodore_contract::SpaceQueuedRequest,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<(), CommandError> {
+    op.run(async move { core.space_queued(req).await }).await
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn space_stop(
@@ -798,6 +820,49 @@ pub async fn space_send_feedback(
 ) -> Result<String, CommandError> {
     op.run(async move { core.space_send_feedback(req).await })
         .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn space_base_status(
+    op: crate::op::Op,
+    space: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::SpaceBaseStatus, CommandError> {
+    op.run(async move { core.space_base_status(space).await })
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn update_space_from_base(
+    op: crate::op::Op,
+    space: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::Space, CommandError> {
+    op.run(async move { core.update_space_from_base(space).await })
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn abort_space_update(
+    op: crate::op::Op,
+    space: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::Space, CommandError> {
+    op.run(async move { core.abort_space_update(space).await })
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn space_fix_ci(
+    op: crate::op::Op,
+    req: theodore_contract::SpaceFixCiRequest,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<String, CommandError> {
+    op.run(async move { core.space_fix_ci(req).await }).await
 }
 
 #[tauri::command]
@@ -935,6 +1000,31 @@ pub async fn space_setup(
     op.run(async move { core.space_setup(req).await }).await
 }
 
+/// "Set up with agent": no `spaces:` commands yet — ask the space's agent
+/// to look at the repo and write them (docs/config.md §2, §8).
+#[tauri::command]
+#[specta::specta]
+pub async fn space_setup_assist(
+    op: crate::op::Op,
+    space: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::Space, CommandError> {
+    op.run(async move { core.space_setup_assist(space).await })
+        .await
+}
+
+/// "Fix with agent": setup failed — ask the agent to fix the cause.
+#[tauri::command]
+#[specta::specta]
+pub async fn space_fix_setup(
+    op: crate::op::Op,
+    space: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::Space, CommandError> {
+    op.run(async move { core.space_fix_setup(space).await })
+        .await
+}
+
 /// Starts or stops the space's `run` command.
 #[tauri::command]
 #[specta::specta]
@@ -957,6 +1047,67 @@ pub async fn space_logs(
     op.run(async move { core.space_logs(space).await }).await
 }
 
+/// Starts a terminal in the space's worktree (docs/spaces.md "Terminal").
+#[tauri::command]
+#[specta::specta]
+pub async fn open_space_terminal(
+    op: crate::op::Op,
+    req: theodore_contract::OpenTerminalRequest,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::SpaceTerminalInfo, CommandError> {
+    op.run(async move { core.open_space_terminal(req).await })
+        .await
+}
+
+/// Bytes typed or pasted into it.
+#[tauri::command]
+#[specta::specta]
+pub async fn write_space_terminal(
+    op: crate::op::Op,
+    req: theodore_contract::WriteTerminalRequest,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<(), CommandError> {
+    op.run(async move { core.write_space_terminal(req).await })
+        .await
+}
+
+/// A new size in cells.
+#[tauri::command]
+#[specta::specta]
+pub async fn resize_space_terminal(
+    op: crate::op::Op,
+    req: theodore_contract::ResizeTerminalRequest,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<(), CommandError> {
+    op.run(async move { core.resize_space_terminal(req).await })
+        .await
+}
+
+/// Kills its shell.
+#[tauri::command]
+#[specta::specta]
+pub async fn close_space_terminal(
+    op: crate::op::Op,
+    terminal: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<(), CommandError> {
+    op.run(async move { core.close_space_terminal(terminal).await })
+        .await
+}
+
+/// The space's open (or just-exited) terminals, with scrollback to seed
+/// `xterm.js`.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_space_terminals(
+    op: crate::op::Op,
+    space: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<Vec<theodore_contract::SpaceTerminalInfo>, CommandError> {
+    op.run(async move { core.list_space_terminals(space).await })
+        .await
+}
+
 /// A project's merged config, with each value's file.
 #[tauri::command]
 #[specta::specta]
@@ -966,6 +1117,57 @@ pub async fn project_config(
     core: State<'_, Arc<dyn CoreApi>>,
 ) -> Result<theodore_contract::EffectiveConfig, CommandError> {
     op.run(async move { core.project_config(project).await })
+        .await
+}
+
+/// Settings → Languages: each language of a project, its grammar, server
+/// and index progress (docs/code-intel.md §9).
+#[tauri::command]
+#[specta::specta]
+pub async fn code_intel_status(
+    op: crate::op::Op,
+    project: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::CodeIntelStatus, CommandError> {
+    op.run(async move { core.code_intel_status(project).await })
+        .await
+}
+
+/// Downloads a language's grammar and server (an install suggestion's
+/// Yes, or Settings → Languages → Install).
+#[tauri::command]
+#[specta::specta]
+pub async fn code_intel_install(
+    op: crate::op::Op,
+    language: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<(), CommandError> {
+    op.run(async move { core.code_intel_install(language).await })
+        .await
+}
+
+/// Settings → Languages: language servers in reviews (a PR's code may
+/// run) or in spaces, on or off. A global or local config file wins.
+#[tauri::command]
+#[specta::specta]
+pub async fn code_intel_set_lsp(
+    op: crate::op::Op,
+    req: theodore_contract::CodeIntelLspRequest,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<(), CommandError> {
+    op.run(async move { core.code_intel_set_lsp(req).await })
+        .await
+}
+
+/// An install suggestion's No: not suggested again.
+#[tauri::command]
+#[specta::specta]
+pub async fn code_intel_decline(
+    op: crate::op::Op,
+    language: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<(), CommandError> {
+    op.run(async move { core.code_intel_decline(language).await })
         .await
 }
 

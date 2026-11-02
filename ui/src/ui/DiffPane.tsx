@@ -18,6 +18,8 @@ import {
   ArrowRight,
   Check,
   CircleExclamation,
+  ChevronDown,
+  ChevronRight,
   ChevronsDown,
   ChevronsUp,
   CircleCheckFill,
@@ -64,8 +66,8 @@ import type {
   Side,
 } from '../gen/contract';
 import {
-  ask,
   askAboutLine,
+  askPending,
   dismissLineAsk,
   markGroupRead,
   markHunkRead,
@@ -1162,10 +1164,39 @@ function FileBlockInner({
   const local = store.models.prSummaries.get(pr)?.pr.repo.host === 'local';
   const fileSince = sinceCountsFor(file.hunks, since);
   const fileSinceCount = fileSince.new + fileSince.changed;
-  const [shown, setShown] = useState(false);
+  // A jump here (J/K, `E`, `C`, a peek) needs its hunk in the DOM.
+  const arrival =
+    [
+      focusHunk,
+      expandHunk && `${expandHunk.hunk}:${expandHunk.nonce}`,
+      composer && `c:${composer.side}:${composer.line}`,
+      peek && `p:${peek.line}`,
+    ]
+      .filter(Boolean)
+      .join('|') || null;
+  // Generated, deleted and Viewed files start folded (#51); the chevron,
+  // menu and "Show diff" override that until Viewed flips, or a jump moves
+  // on a hand-folded file. Checked in render: a plain focus move costs no
+  // extra render.
+  const [fold, setFold] = useState<{
+    closed: boolean;
+    viewed: boolean;
+    arrival: string | null;
+  } | null>(null);
+  if (
+    fold &&
+    (fold.viewed !== isViewed || (fold.closed && fold.arrival !== arrival))
+  ) {
+    setFold(null);
+  }
+  const foldTo = (closed: boolean) =>
+    setFold({ closed, viewed: isViewed, arrival });
   const md = isMarkdown(file.path) && file.status !== 'deleted';
   const [preview, setPreview] = useState(false);
   const generatedFlag = file.flags.find((f) => f.kind === 'generated');
+  const collapsedFile = fold
+    ? fold.closed
+    : (!!generatedFlag || file.status === 'deleted' || isViewed) && !arrival;
   // Built when the menu opens, not on every render.
   const fileMenu = (e: React.MouseEvent) =>
     contextMenuHandler(store.ui, (): ContextMenuItem[] => {
@@ -1189,13 +1220,11 @@ function FileBlockInner({
           onAction: () => openExternal(`${summaryForMenu.url}/files`),
         });
       }
-      if (generatedFlag || file.status === 'deleted') {
-        items.push({
-          id: 'collapse',
-          label: shown ? 'Collapse' : 'Expand',
-          onAction: () => setShown((v) => !v),
-        });
-      }
+      items.push({
+        id: 'collapse',
+        label: collapsedFile ? 'Expand' : 'Collapse',
+        onAction: () => foldTo(!collapsedFile),
+      });
       return items;
     })(e);
 
@@ -1217,8 +1246,6 @@ function FileBlockInner({
     );
   }
 
-  const collapsedFile =
-    (!!generatedFlag || file.status === 'deleted') && !shown;
   const gaps = gapsAbove(file.hunks);
   const last = file.hunks[file.hunks.length - 1];
 
@@ -1228,6 +1255,21 @@ function FileBlockInner({
         className="file-h sticky top-0 z-[2] flex items-center gap-3 border-b border-separator bg-surface px-4 py-2.5 text-sm"
         onContextMenu={fileMenu}
       >
+        <Button
+          isIconOnly
+          size="sm"
+          variant="ghost"
+          aria-label={collapsedFile ? 'Expand file' : 'Collapse file'}
+          aria-expanded={!collapsedFile}
+          className="fold-file -ml-1 size-6 min-w-6 shrink-0 text-muted"
+          onPress={() => foldTo(!collapsedFile)}
+        >
+          {collapsedFile ? (
+            <ChevronRight className="size-3.5" />
+          ) : (
+            <ChevronDown className="size-3.5" />
+          )}
+        </Button>
         <FileCode className="size-4 shrink-0 text-muted" />
         {/* `dir="rtl"` truncates from the start so the filename (the end of
          *  the path) stays visible; the inner `dir="ltr"` keeps old→new
@@ -1361,7 +1403,25 @@ function FileBlockInner({
           {local ? 'Read' : 'Viewed'}
         </ToggleButton>
       </header>
-      {md && preview ? (
+      {collapsedFile ? (
+        <div className="collapsed-file flex items-center gap-3 bg-surface-secondary px-4 py-3 text-sm text-muted">
+          <span className="flex-1">
+            {generatedFlag
+              ? `Generated file — ${generatedFlag.reason}`
+              : file.status === 'deleted'
+                ? `Whole file deleted: ${plural(file.deletions, 'line', 'lines')}`
+                : `${plural(file.hunks.length, 'hunk', 'hunks')} hidden`}
+          </span>
+          <Button
+            size="sm"
+            variant="tertiary"
+            className="show-file"
+            onPress={() => foldTo(false)}
+          >
+            Show diff
+          </Button>
+        </div>
+      ) : md && preview ? (
         <MarkdownDiff
           pr={pr}
           base={base}
@@ -1369,22 +1429,6 @@ function FileBlockInner({
           path={file.path}
           oldPath={file.old_path}
         />
-      ) : collapsedFile ? (
-        <div className="collapsed-file flex items-center gap-3 bg-surface-secondary px-4 py-3 text-sm text-muted">
-          <span className="flex-1">
-            {generatedFlag
-              ? `Generated file — ${generatedFlag.reason}`
-              : `Whole file deleted: ${plural(file.deletions, 'line', 'lines')}`}
-          </span>
-          <Button
-            size="sm"
-            variant="tertiary"
-            className="show-file"
-            onPress={() => setShown(true)}
-          >
-            Show diff
-          </Button>
-        </div>
       ) : !mounted ? (
         <div
           aria-hidden
@@ -1514,7 +1558,7 @@ function openHunkMenu(
             id: 'ask-agent',
             label: 'Ask agent',
             onAction: () =>
-              void ask(store, {
+              void askPending(store, {
                 pr,
                 question: `about the hunk at ${path}:${h.new_start}`,
                 about: null,

@@ -86,8 +86,9 @@ pub struct AgentRequest {
     pub resume: Option<String>,
     /// Also report the answer's text as it is generated
     /// ([`AgentEvent::TextDelta`]), not only per finished message. Claude
-    /// Code: `--include-partial-messages`; the other CLIs ignore it. Off for
-    /// everything but grouping runs that stream groups.
+    /// Code: `--include-partial-messages`; a CLI that can't ignores it. On
+    /// for every run the window shows live (chat, skills, space turns,
+    /// fixes) and for grouping runs that stream groups.
     #[serde(default)]
     pub stream_text: bool,
 }
@@ -224,6 +225,38 @@ pub struct AgentRun {
     pub cancel: CancellationToken,
 }
 
+/// Sends more of your messages into a run while it works ("Send now",
+/// docs/spaces.md §8): the CLI takes each at its next step, in the same
+/// turn. Only CLIs that read messages while running give one
+/// ([`AgentPort::run_steerable`]); a closed run refuses.
+#[derive(Debug, Clone)]
+pub struct Steer(mpsc::Sender<SteerMessage>);
+
+/// One message for a running agent, and who to tell once the CLI has it.
+#[derive(Debug)]
+pub struct SteerMessage {
+    pub text: String,
+    pub delivered: tokio::sync::oneshot::Sender<()>,
+}
+
+impl Steer {
+    /// The handle, and the end the runner reads.
+    pub fn channel() -> (Steer, mpsc::Receiver<SteerMessage>) {
+        let (tx, rx) = mpsc::channel(16);
+        (Steer(tx), rx)
+    }
+
+    /// `true` once the message is written to the CLI; `false` when the run
+    /// already finished (or is finishing) and can't take it.
+    pub async fn send(&self, text: String) -> bool {
+        let (delivered, ack) = tokio::sync::oneshot::channel();
+        if self.0.send(SteerMessage { text, delivered }).await.is_err() {
+            return false;
+        }
+        ack.await.is_ok()
+    }
+}
+
 /// One model an agent CLI can run, and the effort levels it takes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelInfo {
@@ -244,6 +277,15 @@ pub struct ModelInfo {
 pub trait AgentPort: Send + Sync {
     async fn detect(&self) -> Vec<AgentInfo>;
     async fn run(&self, req: AgentRequest) -> Result<AgentRun, AgentError>;
+    /// [`run`](Self::run), plus a [`Steer`] when this agent's CLI takes
+    /// messages while it runs (Claude Code). `None`: the caller queues
+    /// them for the next run instead (Codex, Gemini).
+    async fn run_steerable(
+        &self,
+        req: AgentRequest,
+    ) -> Result<(AgentRun, Option<Steer>), AgentError> {
+        self.run(req).await.map(|run| (run, None))
+    }
     /// The models `agent` can run, for the model picker. Never fails: an
     /// agent that can't list them (not installed, no listing) gives `[]`.
     async fn models(&self, _agent: AgentId) -> Vec<ModelInfo> {

@@ -203,13 +203,13 @@ pub fn parse_codex_models(json: &str) -> Result<Vec<ModelInfo>, serde_json::Erro
 /// Run `<codex> debug models` and parse it. `Err` carries a one-line reason
 /// for the log.
 pub async fn codex_models(program: &Path) -> Result<Vec<ModelInfo>, String> {
-    let fut = tokio::process::Command::new(program)
-        .args(["debug", "models"])
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(["debug", "models"])
         .env_clear()
         .envs(crate::env::filtered_env())
         .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
+        .kill_on_drop(true);
+    let fut = crate::exit_output::output_after_exit(cmd);
     let output = tokio::time::timeout(CODEX_MODELS_TIMEOUT, fut)
         .await
         .map_err(|_| format!("timed out after {}s", CODEX_MODELS_TIMEOUT.as_secs()))?

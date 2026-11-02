@@ -91,10 +91,10 @@ Failures are logged with a stable dotted `error.code`, plus context: `agent` and
 | Grouping | `grouping.invalid_output`, `grouping.agent_failed`, `grouping.repaired` (a repair round or the Other fallback was needed) |
 | Host | `host.unauthorized` (401), `host.forbidden` (403), `host.rate_limited`, `host.not_found`, `host.conflict`, `host.validation`, `host.network`, `host.server_error`, `host.protocol`, `host.auth` (as the app sees 401/403), `host.forbidden` also for a GraphQL mutation refused as `FORBIDDEN` |
 | Agent | `agent.crashed` (non-zero exit / error, with `stderr_tail` ≤ 2 KB), `agent.timed_out`, `agent.stalled`, `agent.spawn_failed`, `agent.not_installed`, `agent.offline` (info: the CLI couldn't reach its servers — a run, a grouping, a space turn) |
-| Git | `git.command_failed`, `git.auth`, `git.network` (the remote can't be reached; expected, logged at info), `git.not_installed`, `git.refused`, `git.unsupported`, `git.parse`, `git.io` |
+| Git | `git.command_failed`, `git.auth`, `git.network` (the remote can't be reached; expected, logged at info), `git.not_installed`, `git.refused`, `git.not_a_worktree` (a space dir git wouldn't resolve as its worktree), `git.busy` (a rebase or conflict unfinished in a space; expected, logged at info), `git.unsupported`, `git.parse`, `git.io` |
 | Store | `store.db`, `store.serde`, `store.migration` |
 | Outbox | `outbox.gave_up` |
-| Spaces | `space.command_failed`, `space.command_timed_out`, `space.turn_failed` |
+| Spaces | `space.command_failed`, `space.command_timed_out`, `space.turn_failed`, `space.worktree_moved_aside` (a space dir that wasn't its worktree, moved to `spaces/.moved-aside/`) |
 | Account | `account.refresh_rejected`, `account.rejected`, `account.network`, `account.invalid_token`, `account.config`, `account.protocol`, `account.required` |
 | Other | `skill.failed`, `app.not_found`, `app.invalid`, `app.internal`, `app.start_failed`, `app.offline_not_cached`, `app.offline` (offline and the project was never cloned), `panic` |
 | UI | `ui.uncaught`, `ui.unhandled_rejection`, `ui.render_crash` |

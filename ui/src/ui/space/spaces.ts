@@ -4,10 +4,14 @@
  * says, and which "branch reviews" are really a space's live diff.
  */
 import type {
+  AgentId,
   PrId,
   PrSummary,
+  SkillInfo,
+  SkillRun,
   Setting,
   Space,
+  SpaceFeedback,
   SpaceMode,
   SpaceTurn,
 } from '../../gen/contract';
@@ -90,7 +94,7 @@ export function spaceGlyph(
  *  not looking at the space. `null` when nothing finished. */
 export function turnEnded(
   prev: Pick<Space, 'status'> | undefined,
-  next: Pick<Space, 'status' | 'name' | 'error' | 'goal'>,
+  next: Pick<Space, 'status' | 'name' | 'error' | 'goal' | 'title'>,
 ): { level: 'info' | 'error'; text: string } | null {
   if (prev?.status !== 'running' || next.status === 'running') return null;
   if (next.status === 'failed') {
@@ -147,14 +151,18 @@ export function unshipped(s: Pick<Space, 'shipped' | 'head_sha'>): boolean {
   return s.shipped != null && s.shipped.head !== s.head_sha;
 }
 
-/** The title Open PR / Merge locally proposes: the goal's first line,
- *  else the space's name. */
-/** What a space is called on screen: the first line of what you asked
- *  for, as you wrote it. The slug (`name`) is only for its branch. */
-export function spaceTitle(s: Pick<Space, 'goal' | 'name'>): string {
+/** What a space is called on screen: the chat agent's proposed title
+ *  (GitHub #78 — a raw first line reads as a run-on sentence), else the
+ *  first line of what you asked for, as you wrote it, else the space's
+ *  name. The slug (`name`) is only for its branch; the goal's first line
+ *  is still what Open PR / Merge locally defaults their own title to
+ *  (`defaultTitle`, unrelated to this one). */
+export function spaceTitle(s: Pick<Space, 'goal' | 'name' | 'title'>): string {
+  const proposed = s.title?.trim();
+  const raw = proposed && proposed.length > 0 ? proposed : defaultTitle(s);
   // Short enough for a sidebar row or a notification: no trailing period
   // (it reads as "formatter.: turn done"), cut at a word near 60 chars.
-  const t = defaultTitle(s).replace(/[.。!]+$/u, '');
+  const t = raw.replace(/[.。!]+$/u, '');
   if (t.length <= 60) return t;
   const cut = t.slice(0, 60);
   const word = cut.lastIndexOf(' ');
@@ -235,6 +243,89 @@ export function spaceOfReview(spaces: Space[], pr: PrId): Space | undefined {
   );
 }
 
+// ── review with agent (docs/spaces.md §3) ───────────────────────────────────
+
+/** The reviewer agent setting (`Settings → Spaces`'s picker lives in the
+ *  Review menu itself): sticky per machine, independent of the space's own
+ *  writing agent. */
+export const REVIEW_AGENT_KEY = 'spaces.review_agent';
+
+/** The built-in skill "Review with agent" runs when none is picked: a
+ *  general review, the same one `/bugs` runs by hand. */
+export const DEFAULT_REVIEW_SKILL = 'bugs';
+
+/** Which skill id "Review with agent" runs: the default built-in if it's
+ *  still offered (not forked away under the same id), else any other
+ *  built-in, else whatever the list offers — there is always something
+ *  once skills have loaded. */
+export function defaultReviewSkill(
+  skills: Pick<SkillInfo, 'id' | 'source'>[],
+): string {
+  const builtins = skills.filter((s) => s.source === 'built-in');
+  return (
+    builtins.find((s) => s.id === DEFAULT_REVIEW_SKILL)?.id ??
+    builtins[0]?.id ??
+    skills[0]?.id ??
+    DEFAULT_REVIEW_SKILL
+  );
+}
+
+/** The reviewer agent a space's "Review with agent" starts from: your
+ *  sticky pick, else the one `agents.skills` runs by default, else the
+ *  first agent on offer. */
+export function reviewAgentDefault(
+  settings: Pick<Setting, 'key' | 'scope' | 'value'>[],
+  agents: AgentId[],
+): AgentId {
+  const picked = userSetting(settings, REVIEW_AGENT_KEY)?.value;
+  if (typeof picked === 'string' && agents.includes(picked as AgentId)) {
+    return picked as AgentId;
+  }
+  const skillDefaults = userSetting(settings, 'agents.skills')?.value;
+  const fromSkills = Array.isArray(skillDefaults)
+    ? skillDefaults.find((a): a is AgentId => agents.includes(a as AgentId))
+    : undefined;
+  return fromSkills ?? agents[0] ?? 'claude';
+}
+
+/** A "Review with agent" run on the space's own review (`run_skill` on
+ *  `Space.review_pr`) still going — shown as "Reviewing…" without
+ *  touching `Space.status`, which stays the writing agent's. */
+export function reviewRunning(
+  runs: readonly Pick<SkillRun, 'status'>[],
+): boolean {
+  return runs.some((r) => r.status === 'running');
+}
+
+// ── send all to agent (docs/spaces.md §3) ───────────────────────────────────
+
+/** Same item, independent of object identity — `SpaceFeedback` is a plain
+ *  `{ kind, id }` tag. */
+function sameFeedback(a: SpaceFeedback, b: SpaceFeedback): boolean {
+  return a.kind === b.kind && a.id === b.id;
+}
+
+/** The turn `item` rode as part of a "Send N to agent", `undefined` if it
+ *  was never sent that way (the per-item "Send to agent" doesn't mark
+ *  anything, so an item sent only that way still reads as unsent here). */
+export function sentTurnOf(
+  space: Pick<Space, 'sent_feedback'>,
+  item: SpaceFeedback,
+): number | undefined {
+  return (space.sent_feedback ?? []).find((s) => sameFeedback(s.item, item))
+    ?.turn;
+}
+
+/** The turn that carried `turn` has run to completion (failed or not): a
+ *  finding it addressed can be dismissed in bulk, and the space is done
+ *  enough to try again. */
+export function sentTurnDone(
+  space: Pick<Space, 'status' | 'turns'>,
+  turn: number,
+): boolean {
+  return space.status !== 'running' && space.turns >= turn;
+}
+
 export type UndoState =
   | { ok: true; turn: SpaceTurn }
   | { ok: false; turn: SpaceTurn | null; reason: string };
@@ -284,7 +375,7 @@ export function undoneMessages(s: Pick<Space, 'turn_log'>): Set<string> {
   return new Set(
     (s.turn_log ?? [])
       .filter((t) => t.undone)
-      .flatMap((t) => [t.message, t.reply]),
+      .flatMap((t) => [t.message, t.reply, ...(t.steered ?? [])]),
   );
 }
 
@@ -302,7 +393,7 @@ export function notifyOn(
  *  did: "<space>: turn finished" / "<space>: turn failed". */
 export function nativeNotice(
   prev: Pick<Space, 'status'> | undefined,
-  next: Pick<Space, 'status' | 'name' | 'error' | 'goal'>,
+  next: Pick<Space, 'status' | 'name' | 'error' | 'goal' | 'title'>,
 ): { title: string; body?: string } | null {
   if (prev?.status !== 'running' || next.status === 'running') return null;
   if (next.status === 'failed') {

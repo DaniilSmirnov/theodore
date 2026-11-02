@@ -44,7 +44,9 @@ import { MergeDialog } from './Merge';
 import { Overview } from './review/Overview';
 import { closeBranchReview } from './project/closeReview';
 import { isBranchReview } from './project/sections';
-import { reviewTitle } from './space/mode';
+import { isBuildMode, reviewTitle } from './space/mode';
+import { SendAllToAgentFooter } from './space/SendAllToAgent';
+import { spaceOfReview } from './space/spaces';
 import {
   groupsInRevision,
   nextReviewableGroup,
@@ -529,6 +531,11 @@ export const Review = observer(function Review({ pr }: { pr: PrId }) {
   const finished = summary?.state === 'merged' || summary?.state === 'closed';
   const mine =
     !!summary && store.ephemeral.viewer?.login === summary.author.login;
+  // A space's own review, drafting or in review: "Send N to agent"
+  // (below) takes the place of "Submit review" there.
+  const mySpace = isBuildMode(store)
+    ? spaceOfReview(store.models.spaces.all(), pr)
+    : undefined;
   const mergeBlock = !summary
     ? ''
     : local
@@ -604,7 +611,7 @@ export const Review = observer(function Review({ pr }: { pr: PrId }) {
           </Btn>
         )}
         {/* A merged or closed PR takes no more reviews, reviewers or merges. */}
-        {!finished && !branchReview && (
+        {!finished && !branchReview && !mySpace && (
           <Btn
             tone="primary"
             className="shrink-0"
@@ -900,6 +907,7 @@ export const Review = observer(function Review({ pr }: { pr: PrId }) {
           );
         })()
       )}
+      {mySpace && <SendAllToAgentFooter pr={pr} />}
       {tab === 'diff' && (
         <Hints>
           <K>J</K>
