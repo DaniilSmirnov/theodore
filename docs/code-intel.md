@@ -186,10 +186,17 @@ grammars.toml (repo, commit) ─▶ cc parser.c + scanner.c ─▶ arm64
   (`ts_language_version`) is checked against the range the linked tree-sitter
   runtime supports; out of range → not loaded, the language has no syntax
   layer, nothing crashes.
-- Signing: the app is signed ad-hoc without hardened runtime today
-  (`docs/plan.md` §11.2), so library validation does not apply. With a
-  Developer ID and hardened runtime, CI signs the dylibs with the same Team ID
-  and they keep loading.
+- Signing: the app is signed ad-hoc **with** the hardened runtime
+  (`codesign … -o runtime`, as Tauri bundles it). Its library validation
+  loads only dylibs of the app's own Team ID, and an ad-hoc signature has
+  none, so the app carries `com.apple.security.cs.disable-library-validation`
+  (`apps/desktop/Entitlements.plist`). The sha256 check above is what stands
+  between a download and `dlopen`.
+
+  | App signature | Grammar dylib | Loads |
+  | --- | --- | --- |
+  | ad-hoc + runtime | ad-hoc | only with the entitlement |
+  | Developer ID + runtime | same Team ID | yes; the entitlement can go |
 - No language packs (several languages in one file): they download languages
   nobody asked for and save little.
 

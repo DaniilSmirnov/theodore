@@ -38,6 +38,7 @@ import { SandboxBadge } from './sandbox/SandboxBadge';
 import { WorkspaceSwitcher } from './WorkspaceSwitcher';
 import { spaceSeen } from './space/seen';
 import { isBuildMode } from './space/mode';
+import { PrGlyph } from './space/SpacePr';
 import {
   spaceGlyph,
   spaceTitle,
@@ -201,12 +202,27 @@ export const Sidebar = observer(function Sidebar() {
             id: 'spaces',
             title: 'Spaces',
             items: [
-              ...spaces.map((s): NavItem => ({
-                key: routeKey({ name: 'space', id: s.id }),
-                icon: <SpaceGlyphIcon g={spaceGlyph(s, spaceSeen.get(s.id))} />,
-                label: spaceTitle(s),
-                route: { name: 'space', id: s.id },
-              })),
+              ...spaces.map((s): NavItem => {
+                const g = spaceGlyph(s, spaceSeen.get(s.id));
+                // In review: `⎇ #n`, tinted by the PR's checks, unless a
+                // turn runs, failed or waits for you.
+                const pr = s.pr
+                  ? store.models.prSummaries.get(s.pr)
+                  : undefined;
+                return {
+                  key: routeKey({ name: 'space', id: s.id }),
+                  icon:
+                    s.pr && g === 'idle' ? (
+                      <PrGlyph pr={pr} />
+                    ) : (
+                      <SpaceGlyphIcon g={g} />
+                    ),
+                  label: pr
+                    ? `#${pr.pr.number} ${spaceTitle(s)}`
+                    : spaceTitle(s),
+                  route: { name: 'space', id: s.id },
+                };
+              }),
               {
                 key: 'new-space',
                 icon: <Plus />,

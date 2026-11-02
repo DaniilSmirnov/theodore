@@ -214,6 +214,15 @@ pub trait CoreApi: Send + Sync {
     ) -> Result<theodore_contract::Space, CommandError> {
         Err(not_ready())
     }
+    /// New space's "From an issue" picker: the project's own open issues
+    /// assigned to the viewer (`Capabilities::issues`; empty when the host
+    /// doesn't support it).
+    async fn project_issues(
+        &self,
+        _req: theodore_contract::ProjectIssuesRequest,
+    ) -> Result<Vec<theodore_contract::SpaceIssue>, CommandError> {
+        Err(not_ready())
+    }
     /// Spaces of one project, or all.
     async fn list_spaces(
         &self,
@@ -263,6 +272,20 @@ pub trait CoreApi: Send + Sync {
     async fn ship_space(
         &self,
         _req: theodore_contract::ShipSpaceRequest,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        Err(not_ready())
+    }
+    /// Merges the space's PR: default method, auto-merge when blocked.
+    async fn merge_space(
+        &self,
+        _req: theodore_contract::MergeSpaceRequest,
+    ) -> Result<theodore_contract::MergeSpaceResult, CommandError> {
+        Err(not_ready())
+    }
+    /// Continue after merge: a new branch on the base's fresh tip.
+    async fn continue_space(
+        &self,
+        _space: String,
     ) -> Result<theodore_contract::Space, CommandError> {
         Err(not_ready())
     }

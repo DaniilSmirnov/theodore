@@ -141,6 +141,7 @@ async fn one_turn(f: &Fixtures, core: &Core, project: &Project, goal: &str) -> S
             base: None,
             agent: None,
             model: None,
+            start_from: None,
         })
         .await
         .unwrap();
@@ -260,7 +261,13 @@ async fn open_as_draft_and_an_edited_title() {
     let calls = f.host.create_pr_calls.lock().unwrap().clone();
     assert!(calls[0].1.draft);
     assert_eq!(calls[0].1.title, "Export orders as CSV");
-    assert_eq!(calls[0].1.body, "Add CSV export\nQuote commas too.");
+    assert!(
+        calls[0]
+            .1
+            .body
+            .starts_with("Add CSV export\nQuote commas too.\n\n<!-- theodore-space:"),
+        "the goal, then the link back"
+    );
     assert_eq!(
         f.git.ship.lock().unwrap().commits[0].1.message,
         "Export orders as CSV\n\nAdd CSV export\nQuote commas too."
@@ -338,6 +345,47 @@ async fn a_branch_name_taken_on_the_host_is_refused() {
     assert!(f.git.ship.lock().unwrap().pushes.is_empty());
 }
 
+fn patch_space(f: &Fixtures, id: &str, data: serde_json::Value) {
+    f.store
+        .apply(vec![NewAction {
+            model: models::SPACE.into(),
+            model_id: id.into(),
+            action: SyncActionCode::C,
+            data: Some(data),
+        }])
+        .unwrap();
+}
+
+/// A space adopted from an existing branch or PR (`Space::fork_sha`,
+/// docs/spaces.md §3 "New space from an issue/branch/PR") ships onto that
+/// branch's own tip, not `base_sha` — and isn't refused as "already
+/// exists" the way a fresh `<login>/<slug>` space would be.
+#[tokio::test]
+async fn an_adopted_branch_ships_onto_its_own_fork_point_not_base() {
+    let f = fixtures();
+    let (core, _recv, project) = host_project(&f).await;
+    let s = one_turn(&f, &core, &project, "Fix the redirect").await;
+    let fork_sha = Sha::new("fork000");
+    patch_space(&f, &s.id, json!({ "fork_sha": fork_sha.0 }));
+    f.git
+        .ship
+        .lock()
+        .unwrap()
+        .remote
+        .insert(s.branch.clone(), fork_sha.clone());
+
+    core.ship_space(ship(&s, ShipAction::OpenPr)).await.unwrap();
+    with_pr(&f, &s.id).await;
+
+    let ship = f.git.ship.lock().unwrap();
+    assert_eq!(ship.commits.len(), 1);
+    assert_eq!(
+        ship.commits[0].1.parent, fork_sha,
+        "squashed onto the fork point"
+    );
+    assert_eq!(ship.pushes.len(), 1);
+}
+
 #[tokio::test]
 async fn nothing_to_ship_without_changes() {
     let f = fixtures();
@@ -352,6 +400,7 @@ async fn nothing_to_ship_without_changes() {
             base: None,
             agent: None,
             model: None,
+            start_from: None,
         })
         .await
         .unwrap();

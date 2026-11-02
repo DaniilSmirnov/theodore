@@ -82,6 +82,7 @@ fn request(project: &Project, goal: &str) -> CreateSpaceRequest {
         base: None,
         agent: None,
         model: None,
+        start_from: None,
     }
 }
 

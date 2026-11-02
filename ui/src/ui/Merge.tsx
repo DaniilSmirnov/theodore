@@ -45,7 +45,7 @@ import { api } from '../core/api';
 import { useRootStore } from '../stores/context';
 import { Btn, Spinner } from './bits';
 
-const CONFLICT_KIND_LABEL: Record<ConflictKind, string> = {
+export const CONFLICT_KIND_LABEL: Record<ConflictKind, string> = {
   content: 'content conflict',
   add_add: 'added on both sides',
   modify_delete: 'modified on one side, deleted on the other',
@@ -56,7 +56,7 @@ const CONFLICT_KIND_LABEL: Record<ConflictKind, string> = {
   other: 'conflict',
 };
 
-const METHOD: Record<MergeMethod, string> = {
+export const METHOD: Record<MergeMethod, string> = {
   squash: 'Squash and merge',
   merge: 'Create a merge commit',
   rebase: 'Rebase and merge',
@@ -64,7 +64,7 @@ const METHOD: Record<MergeMethod, string> = {
 
 const AGENTS: AgentId[] = ['claude', 'codex', 'gemini'];
 
-const STATE_LABEL: Record<MergeInfo['state'], string> = {
+export const STATE_LABEL: Record<MergeInfo['state'], string> = {
   clean: 'Ready to merge',
   blocked: 'Blocked by required checks or reviews',
   behind: 'Out of date with the base branch',
@@ -171,7 +171,14 @@ export const MergeDialog = observer(function MergeDialog({
       .then((i) => {
         if (!live) return;
         setInfo(i);
-        if (i.allowed_methods.length && !i.allowed_methods.includes(method)) {
+        // The host's pick (your last method, else the repo's default).
+        const d = i.default_method;
+        if (d && (!i.allowed_methods.length || i.allowed_methods.includes(d))) {
+          setMethod(d);
+        } else if (
+          i.allowed_methods.length &&
+          !i.allowed_methods.includes(method)
+        ) {
           setMethod(i.allowed_methods[0]!);
         }
       })

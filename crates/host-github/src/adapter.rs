@@ -10,7 +10,7 @@ use theodore_host_http::{HttpClient, TokenSource};
 use theodore_ports::{
     Capabilities, Changes, Clock, CreatedIssue, Fetched, HostAdapter, HostError, HostResult,
     InboxSection, IssueTracker, MergeMethod, MergeState, MergeStatus, NewIssue, NewPr,
-    ReviewComment, ReviewSubmission, SubmittedReview,
+    ReviewComment, ReviewSubmission, SubmittedReview, TrackedIssue,
 };
 
 use crate::{anchor, graphql, logs, pagination, rest, time};
@@ -273,6 +273,7 @@ impl HostAdapter for GithubAdapter {
             merge_queue: true,
             auto_merge: true,
             reactions: true,
+            issues: true,
         }
     }
 
@@ -355,6 +356,17 @@ impl HostAdapter for GithubAdapter {
     async fn create_pr(&self, repo: &RepoRef, pr: &NewPr) -> HostResult<PrRef> {
         let pull = rest::create_pull(&self.rest, &repo.owner, &repo.name, pr).await?;
         Ok(pull_to_pr_ref(repo, pull))
+    }
+
+    async fn my_open_issues(&self, repo: &RepoRef) -> HostResult<Vec<TrackedIssue>> {
+        let me = self.viewer().await?.login;
+        let issues = rest::list_assigned_issues(&self.rest, &repo.owner, &repo.name, &me).await?;
+        Ok(issues.into_iter().map(gh_issue_to_tracked).collect())
+    }
+
+    async fn get_issue(&self, repo: &RepoRef, number: u64) -> HostResult<TrackedIssue> {
+        let issue = rest::get_issue(&self.rest, &repo.owner, &repo.name, number).await?;
+        Ok(gh_issue_to_tracked(issue))
     }
 
     async fn set_viewed(&self, pr: &PrRef, path: &str, viewed: bool) -> HostResult<()> {
@@ -560,6 +572,12 @@ impl HostAdapter for GithubAdapter {
             required_approvals: None,
             auto_merge_allowed: settings.auto_merge_allowed,
             merge_queue: status.is_merge_queue_enabled,
+            default_method: match settings.viewer_default_merge_method.as_deref() {
+                Some("MERGE") => Some(MergeMethod::Merge),
+                Some("SQUASH") => Some(MergeMethod::Squash),
+                Some("REBASE") => Some(MergeMethod::Rebase),
+                _ => None,
+            },
         })
     }
 
@@ -937,6 +955,15 @@ fn pull_to_pr_ref(repo: &RepoRef, pull: rest::GhPull) -> PrRef {
         repo: repo.clone(),
         number: pull.number,
         host_id: pull.node_id,
+    }
+}
+
+fn gh_issue_to_tracked(issue: rest::GhIssueFull) -> TrackedIssue {
+    TrackedIssue {
+        number: issue.number,
+        title: issue.title,
+        body: issue.body.unwrap_or_default(),
+        url: issue.html_url,
     }
 }
 

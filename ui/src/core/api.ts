@@ -50,6 +50,7 @@ import type {
   ProblemReport,
   PrId,
   Project,
+  ProjectIssuesRequest,
   ProjectWorkingState,
   ReactRequest,
   ReplyRequest,
@@ -65,11 +66,14 @@ import type {
   SandboxFaultRequest,
   SandboxStatus,
   CreateSpaceRequest,
+  MergeSpaceRequest,
+  MergeSpaceResult,
   ShipSpaceRequest,
   Space,
   SpaceBaseStatus,
   SpaceFeedbackRequest,
   SpaceFixCiRequest,
+  SpaceIssue,
   SpaceReviewRequest,
   SpaceQueuedRequest,
   SpaceSendRequest,
@@ -240,7 +244,9 @@ export const api = {
     getTransport()
       .invoke<ProjectWorkingState>('project_working_state', { project })
       .catch(() => null),
-  mergeInfo: (pr: PrId) => call<MergeInfo>('merge_info', { pr }),
+  /** `quiet`: the caller shows the failure itself (a status line). */
+  mergeInfo: (pr: PrId, quiet = false) =>
+    call<MergeInfo>('merge_info', { pr }, quiet),
   mergePr: (req: MergeRequest) => call<null>('merge_pr', { req }),
   /** A passive read (the @-mention list, the reviewer picker): a failure
    *  just leaves the list empty, it isn't toasted. */
@@ -280,6 +286,9 @@ export const api = {
   // ── spaces (docs/spaces.md; hidden behind build mode) ──
   createSpace: (req: CreateSpaceRequest) =>
     call<Space>('create_space', { req }),
+  /** New space's "From an issue" picker. */
+  projectIssues: (req: ProjectIssuesRequest) =>
+    call<SpaceIssue[]>('project_issues', { req }),
   listSpaces: (project: string | null) =>
     call<Space[]>('list_spaces', { project }),
   spaceSend: (req: SpaceSendRequest) => call<string>('space_send', { req }),
@@ -295,6 +304,12 @@ export const api = {
   archiveSpace: (space: string) => call<null>('archive_space', { space }),
   shipSpace: (req: ShipSpaceRequest) => call<Space>('ship_space', { req }),
   undoSpaceTurn: (space: string) => call<Space>('undo_space_turn', { space }),
+  /** Merge the space's PR: the host's default method, auto-merge when it
+   *  can't merge yet (docs/spaces.md §3). */
+  mergeSpace: (req: MergeSpaceRequest) =>
+    call<MergeSpaceResult>('merge_space', { req }),
+  /** Continue after merge: a new branch on the base's fresh tip (§7). */
+  continueSpace: (space: string) => call<Space>('continue_space', { space }),
   unarchiveSpace: (space: string) => call<Space>('unarchive_space', { space }),
   spaceSendFeedback: (req: SpaceFeedbackRequest) =>
     call<string>('space_send_feedback', { req }),

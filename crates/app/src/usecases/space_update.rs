@@ -85,6 +85,13 @@ impl Core {
             }
             SpaceStatus::Idle | SpaceStatus::Failed => {}
         }
+        if space.pr.is_some() && space.done_at.is_some() {
+            // The merged branch is finished: Continue starts the next one
+            // on the base's tip (space_pr.rs).
+            return Err(AppError::Invalid(
+                "its PR merged; Continue moves it onto the new base".into(),
+            ));
+        }
         if space.setup.as_ref().is_some_and(|s| {
             matches!(
                 s.status,

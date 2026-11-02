@@ -161,6 +161,15 @@ pub(crate) mod loader {
     /// to outlive every `Language`, parser and tree made from it.
     static LIBRARIES: OnceLock<Mutex<HashMap<PathBuf, Library>>> = OnceLock::new();
 
+    /// `e` and what the loader said (`dlerror`: a signature refused, a
+    /// missing file), which `Display` alone leaves out.
+    fn with_source(e: &libloading::Error) -> String {
+        match std::error::Error::source(e) {
+            Some(src) => format!("{e}: {src}"),
+            None => e.to_string(),
+        }
+    }
+
     /// Open `path` (once per process) and build the `Language` its C function
     /// `symbol` returns. The caller checks the ABI before using it.
     #[allow(unsafe_code)]
@@ -174,7 +183,7 @@ pub(crate) mod loader {
             // dylibs whose sha256 matched the manifest compiled into this
             // binary get here, and tree-sitter grammars have no initializers
             // beyond static data.
-            let lib = unsafe { Library::new(path) }.map_err(|e| e.to_string())?;
+            let lib = unsafe { Library::new(path) }.map_err(|e| with_source(&e))?;
             libs.insert(path.to_path_buf(), lib);
         }
         let lib = &libs[path];

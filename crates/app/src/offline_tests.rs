@@ -442,6 +442,7 @@ async fn a_space_starts_and_takes_messages_offline() {
             base: None,
             agent: None,
             model: None,
+            start_from: None,
         })
         .await
         .expect("create_space offline");

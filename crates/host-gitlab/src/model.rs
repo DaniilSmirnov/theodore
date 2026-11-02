@@ -13,6 +13,15 @@ pub(crate) struct GlUser {
     pub avatar_url: Option<String>,
 }
 
+/// The bits of a GitLab issue `get_issue` / `my_open_issues` read.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct GlIssue {
+    pub iid: u64,
+    pub title: String,
+    pub description: Option<String>,
+    pub web_url: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct GlDiffRefs {
     pub base_sha: String,

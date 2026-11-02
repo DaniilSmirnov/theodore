@@ -2,13 +2,16 @@
 //! `theodore://` for production, `theodore-staging://`,
 //! `theodore-nightly://`), registered in the bundle's `Info.plist` from the
 //! bundle config (`plugins.deep-link`: `tauri.conf.json`, with
-//! `tauri.<env>.conf.json` merged in for staging and nightly). Today it
-//! carries one thing: the Theodore account sign-in redirect.
+//! `tauri.<env>.conf.json` merged in for staging and nightly). It carries
+//! the Theodore account sign-in redirect, and the link back to a space a
+//! space's PR body ends with (docs/spaces.md §6).
 //!
 //! ```text
 //! browser ─▶ theodore[-<env>]://callback?code=…&state=… ─▶ macOS "Open …?"
 //!   ─▶ on_open_url ─▶ core.account_sign_in_callback ─▶ state check, exchange
 //!        └─ handled ─▶ main window to the front
+//! PR body ─▶ theodore[-<env>]://space/<id> ─▶ main window to the front
+//!   ─▶ emit `open-space` <id> ─▶ the UI opens the space
 //! ```
 //!
 //! Only an app bundle can receive the scheme; a dev run or a bare binary
@@ -27,7 +30,7 @@ use crate::CoreApi;
 use crate::build_info;
 
 /// This build's scheme; `None` for a dev build.
-fn scheme() -> Option<String> {
+pub fn scheme() -> Option<String> {
     identity::url_scheme(build_info::build_env())
 }
 
@@ -79,6 +82,13 @@ fn open<R: Runtime>(app: &AppHandle<R>, core: Arc<dyn CoreApi>, url: Url) {
     if scheme().as_deref() != Some(url.scheme()) {
         return;
     }
+    if let Some(space) = space_route(&url) {
+        use crate::notify::SpaceWindow;
+        let window = crate::notify::MainWindow(app.clone());
+        window.focus();
+        window.open_space(&space);
+        return;
+    }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         // Never log the URL: it carries the authorization code.
@@ -89,9 +99,40 @@ fn open<R: Runtime>(app: &AppHandle<R>, core: Arc<dyn CoreApi>, url: Url) {
     });
 }
 
+/// `<scheme>://space/<id>` → the space id; `None` for any other URL.
+pub fn space_route(url: &Url) -> Option<String> {
+    if url.host_str() != Some("space") {
+        return None;
+    }
+    let path = url.path().trim_matches('/');
+    let ok = !path.is_empty()
+        && path.len() <= 64
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+    ok.then(|| path.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_space_link_routes_to_its_space() {
+        let route = |s: &str| space_route(&Url::parse(s).unwrap());
+        assert_eq!(
+            route("theodore://space/3f2a9c1b0d4e").as_deref(),
+            Some("3f2a9c1b0d4e")
+        );
+        assert_eq!(
+            route("theodore-staging://space/abc/").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(route("theodore://space/"), None);
+        assert_eq!(route("theodore://space/a/b"), None);
+        assert_eq!(route("theodore://space/..%2Fx"), None);
+        assert_eq!(route("theodore://callback?code=1"), None);
+    }
 
     #[test]
     fn only_an_executable_inside_an_app_bundle_counts() {

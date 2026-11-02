@@ -93,6 +93,7 @@ impl Core {
             required_approvals: status.required_approvals,
             auto_merge_allowed: status.auto_merge_allowed,
             merge_queue: status.merge_queue,
+            default_method: status.default_method.map(to_wire_method),
         })
     }
 

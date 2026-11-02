@@ -5,6 +5,8 @@
  */
 import type {
   AgentId,
+  MergeInfo,
+  MergeMethod,
   PrId,
   PrSummary,
   SkillInfo,
@@ -415,4 +417,78 @@ export function waitingSpaces(
       s.turns > 0 &&
       (seen(s.id) ?? 0) < s.updated_at,
   ).length;
+}
+
+/** The sidebar's `⎇ #n` tint (docs/spaces.md §3): the PR's checks while
+ *  it's open, else how it ended. */
+export type PrTint = 'pass' | 'fail' | 'pending' | 'none' | 'merged' | 'closed';
+
+export function prTint(
+  pr: Pick<PrSummary, 'state' | 'checks'> | undefined,
+): PrTint {
+  if (!pr) return 'none';
+  if (pr.state === 'merged') return 'merged';
+  if (pr.state === 'closed') return 'closed';
+  return pr.checks;
+}
+
+/** The method Merge uses: the host's default if the repo allows it, else
+ *  the first allowed one (the same rule as `merge_space`). */
+export function defaultMergeMethod(info: MergeInfo): MergeMethod {
+  const allowed = info.allowed_methods;
+  const d = info.default_method;
+  if (d && (allowed.length === 0 || allowed.includes(d))) return d;
+  return allowed[0] ?? 'squash';
+}
+
+/** What the space header's Merge does now, or why it can't (mirrors
+ *  `merge_space` in the core). */
+export type SpaceMerge =
+  { kind: 'merge' | 'auto' | 'queue' } | { kind: 'none'; reason: string };
+
+export function spaceMerge(
+  info: MergeInfo | null,
+  s: Pick<Space, 'shipped' | 'head_sha' | 'status'>,
+): SpaceMerge {
+  if (s.status === 'running')
+    return { kind: 'none', reason: 'The agent is still working' };
+  if (s.shipped?.how === 'pr' && unshipped(s))
+    return { kind: 'none', reason: 'Push the new turns first' };
+  if (!info) return { kind: 'none', reason: 'Checking whether it can merge…' };
+  if (info.in_queue) return { kind: 'none', reason: 'In the merge queue' };
+  if (info.auto_merge_enabled)
+    return {
+      kind: 'none',
+      reason: 'Auto-merge is on: it merges once checks and reviews pass',
+    };
+  if (info.merge_queue) return { kind: 'queue' };
+  const ready =
+    info.mergeable !== false &&
+    (info.state === 'clean' || info.state === 'unstable');
+  if (ready) return { kind: 'merge' };
+  if (info.state === 'dirty')
+    return { kind: 'none', reason: 'Conflicts with the base branch' };
+  if (info.auto_merge_allowed) return { kind: 'auto' };
+  return {
+    kind: 'none',
+    reason:
+      info.state === 'blocked'
+        ? "Required checks or reviews haven't passed"
+        : info.state === 'behind'
+          ? 'Behind the base branch'
+          : 'The host is still checking',
+  };
+}
+
+/** "Continue" is offered once the space's PR merged (docs/spaces.md §7). */
+export function canContinue(
+  s: Pick<Space, 'pr' | 'status'>,
+  prState: PrSummary['state'] | undefined,
+): boolean {
+  return (
+    s.pr != null &&
+    s.status !== 'running' &&
+    s.status !== 'archived' &&
+    prState === 'merged'
+  );
 }

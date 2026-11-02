@@ -109,6 +109,7 @@ impl HostAdapter for FixtureHost {
             merge_queue: true,
             auto_merge: true,
             reactions: true,
+            issues: false,
         }
     }
 
@@ -663,6 +664,7 @@ impl HostAdapter for FixtureHost {
             required_approvals: detail.summary.required_approvals,
             auto_merge_allowed: true,
             merge_queue: false,
+            default_method: Some(MergeMethod::Squash),
         })
     }
 

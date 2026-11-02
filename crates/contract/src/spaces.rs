@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use theodore_domain::{AgentId, Millis, PrId, Sha};
 
-use crate::{SpaceCheck, SpaceProcess, SpaceSetup};
+use crate::{MergeMethod, SpaceCheck, SpaceProcess, SpaceSetup};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
@@ -153,6 +153,24 @@ pub struct Space {
     /// set while its merge conflicts (docs/spaces.md §6).
     #[serde(default)]
     pub updating: Option<SpaceUpdate>,
+    /// Earlier rounds, oldest first: each PR of the space that merged
+    /// before "Continue" moved it to a new branch (docs/spaces.md §7).
+    #[serde(default)]
+    pub rounds: Vec<SpaceRound>,
+    /// Told to the agent at the start of the next turn, then cleared: the
+    /// previous PR merged and the work goes on on a new branch.
+    #[serde(default)]
+    pub continue_note: Option<String>,
+    /// Set when the space started on an existing branch or PR
+    /// (`CreateSpaceRequest::start_from`): its tip when the space forked.
+    /// Shipping fast-forwards onto `branch` from here instead of squashing
+    /// onto `base_sha` — `branch` already exists on the host.
+    #[serde(default)]
+    pub fork_sha: Option<Sha>,
+    /// Set when the space started from a host issue: its number in the
+    /// project's repo. `ship_space`'s PR body says "Closes #<n>".
+    #[serde(default)]
+    pub issue: Option<u64>,
 }
 
 /// A merge of the base into the space, left in progress on conflicts
@@ -178,6 +196,19 @@ pub struct SpaceBaseStatus {
     pub base_tip: Sha,
     /// Commits on the base since `base_sha`.
     pub behind: u32,
+}
+
+/// One merged round of a continued space.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct SpaceRound {
+    /// The PR that merged, and its branch.
+    pub pr: PrId,
+    pub branch: String,
+    /// The base the round forked from, and its last pushed checkpoint.
+    pub base_sha: Sha,
+    pub head_sha: Sha,
+    /// When "Continue" started the next round.
+    pub at: Millis,
 }
 
 /// One agent CLI session a space's turns continue (docs/spaces.md §5
@@ -219,15 +250,35 @@ pub struct SpaceTurn {
     pub base_before: Option<Sha>,
 }
 
+/// Where a new space's work starts (docs/spaces.md §3 "New space"), instead
+/// of a fresh branch off the project's default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum SpaceStart {
+    /// A host issue — a pasted URL, or `#<number>` / a bare number in the
+    /// project's repo. `goal` becomes the issue's title + body + a link;
+    /// the number is kept so `ship_space` can say "Closes #<number>".
+    Issue(String),
+    /// An existing remote branch: its tip becomes the worktree, the
+    /// project's default branch stays `base`. Shipping pushes to this same
+    /// branch (fast-forward, never forced) instead of `<login>/<slug>`.
+    Branch(String),
+    /// An existing PR's branch (same as `Branch`), plus `Space::pr` so the
+    /// space opens "In review" right away.
+    Pr(u64),
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 pub struct CreateSpaceRequest {
     pub project: String,
-    /// What should change. Sent as the first turn unless empty.
+    /// What should change. Sent as the first turn unless empty. Ignored
+    /// (replaced by the issue's title + body) with `start_from: Issue`.
     pub goal: String,
     /// Defaults to a slug of the goal.
     #[serde(default)]
     pub name: Option<String>,
-    /// Defaults to `<host login>/<name>` (`space/<name>` without a login).
+    /// Defaults to `<host login>/<name>` (`space/<name>` without a login);
+    /// ignored with `start_from: Branch` / `Pr`, which keep that branch.
     #[serde(default)]
     pub branch: Option<String>,
     /// Defaults to the project's default branch.
@@ -238,6 +289,24 @@ pub struct CreateSpaceRequest {
     pub agent: Option<AgentId>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub start_from: Option<SpaceStart>,
+}
+
+/// New space's "From an issue" picker: the project's own open issues
+/// assigned to the viewer (`HostAdapter::my_open_issues`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct ProjectIssuesRequest {
+    pub project: String,
+}
+
+/// One issue, wire shape of `theodore_ports::TrackedIssue`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct SpaceIssue {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -321,4 +390,23 @@ pub struct SentFeedback {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 pub struct SpaceFixCiRequest {
     pub space: String,
+}
+
+/// Merge a space's PR from the space page (docs/spaces.md §3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct MergeSpaceRequest {
+    pub space: String,
+    /// One of the repo's allowed methods; defaults to the host's default.
+    #[serde(default)]
+    pub method: Option<MergeMethod>,
+}
+
+/// What `merge_space` asked the host for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct MergeSpaceResult {
+    pub method: MergeMethod,
+    /// Auto-merge: the PR merges itself once its checks and reviews pass.
+    pub auto: bool,
+    /// Added to the base branch's merge queue instead.
+    pub queue: bool,
 }

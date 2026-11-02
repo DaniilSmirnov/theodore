@@ -8,8 +8,8 @@ use theodore_ports::{Fetched, HostError, HostResult};
 use crate::anchor::GitlabPosition;
 use crate::model::{
     AwardEmojiBody, CreateDraftNote, CreateMrBody, GlApprovals, GlAwardEmoji, GlChanges, GlCommit,
-    GlDiscussion, GlMergeRequest, GlMrRef, GlNote, GlPipeline, GlProject, GlProjectSettings,
-    GlTodo, GlUser, MergeBody, NoteBody, UpdateMrBody,
+    GlDiscussion, GlIssue, GlMergeRequest, GlMrRef, GlNote, GlPipeline, GlProject,
+    GlProjectSettings, GlTodo, GlUser, MergeBody, NoteBody, UpdateMrBody,
 };
 
 pub(crate) async fn viewer(http: &HttpClient) -> HostResult<GlUser> {
@@ -337,6 +337,26 @@ pub(crate) async fn award_emoji_delete(
     let path =
         format!("projects/{project}/merge_requests/{iid}/notes/{note_id}/award_emoji/{award_id}");
     http.delete(&path).await
+}
+
+// ── issues (docs/spaces.md "New space from an issue") ──────────────────
+
+pub(crate) async fn get_issue(http: &HttpClient, project: &str, iid: u64) -> HostResult<GlIssue> {
+    let path = format!("projects/{project}/issues/{iid}");
+    Ok(http.get::<GlIssue>(&path).await?.value)
+}
+
+/// `GET /projects/:id/issues?state=opened&assignee_username=<login>`.
+pub(crate) async fn list_assigned_issues(
+    http: &HttpClient,
+    project: &str,
+    login: &str,
+) -> HostResult<Vec<GlIssue>> {
+    let path = format!(
+        "projects/{project}/issues?state=opened&assignee_username={}&per_page=50",
+        urlencode(login)
+    );
+    Ok(http.get::<Vec<GlIssue>>(&path).await?.value)
 }
 
 fn urlencode(s: &str) -> String {

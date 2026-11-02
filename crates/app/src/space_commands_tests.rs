@@ -114,6 +114,7 @@ impl Env {
                 base: None,
                 agent: None,
                 model: None,
+                start_from: None,
             })
             .await
             .expect("create_space")

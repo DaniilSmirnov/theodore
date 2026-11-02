@@ -1024,7 +1024,7 @@ platforms later.
 
 | Step | Now (ad-hoc) | With Developer ID (later) |
 | --- | --- | --- |
-| Code signature | `codesign -s -` (ad-hoc, required on Apple Silicon) | Developer ID Application + hardened runtime |
+| Code signature | `codesign -s - -o runtime` (ad-hoc, hardened runtime; `disable-library-validation` so downloaded grammars load, docs/code-intel.md §4.1) | Developer ID Application + hardened runtime |
 | Notarization | none | `notarytool` + staple, app and DMG |
 | First install | Gatekeeper blocks it: System Settings → Privacy & Security → "Open Anyway", or `xattr -dr com.apple.quarantine /Applications/Theodore.app` | opens normally |
 | Updates | work: the updater downloads outside the browser, so no quarantine flag, and checks its own signature | same |

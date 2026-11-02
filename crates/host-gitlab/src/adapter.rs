@@ -9,7 +9,7 @@ use theodore_domain::{
 use theodore_host_http::{HttpClient, TokenSource};
 use theodore_ports::{
     Capabilities, Changes, Clock, Fetched, HostAdapter, HostError, HostResult, InboxSection,
-    MergeMethod, MergeState, MergeStatus, NewPr, ReviewSubmission, SubmittedReview,
+    MergeMethod, MergeState, MergeStatus, NewPr, ReviewSubmission, SubmittedReview, TrackedIssue,
 };
 
 use crate::anchor::{self, DiffRefs};
@@ -193,6 +193,7 @@ impl HostAdapter for GitlabAdapter {
             merge_queue: false,
             auto_merge: true,
             reactions: true,
+            issues: true,
         }
     }
 
@@ -299,6 +300,17 @@ impl HostAdapter for GitlabAdapter {
         )
         .await?;
         Ok(mr_ref_to_pr_ref(repo, &mr))
+    }
+
+    async fn my_open_issues(&self, repo: &RepoRef) -> HostResult<Vec<TrackedIssue>> {
+        let login = self.username().await?.to_string();
+        let issues = rest::list_assigned_issues(&self.http, &project_path(repo), &login).await?;
+        Ok(issues.into_iter().map(gl_issue_to_tracked).collect())
+    }
+
+    async fn get_issue(&self, repo: &RepoRef, number: u64) -> HostResult<TrackedIssue> {
+        let issue = rest::get_issue(&self.http, &project_path(repo), number).await?;
+        Ok(gl_issue_to_tracked(issue))
     }
 
     async fn set_viewed(&self, _pr: &PrRef, _path: &str, _viewed: bool) -> HostResult<()> {
@@ -533,6 +545,17 @@ impl HostAdapter for GitlabAdapter {
             // "Merge when pipeline succeeds" is always available.
             auto_merge_allowed: true,
             merge_queue: false,
+            // GitLab merges by the project's method; squash is a flag.
+            default_method: Some(
+                if matches!(
+                    settings.squash_option.as_deref(),
+                    Some("default_on" | "always")
+                ) {
+                    MergeMethod::Squash
+                } else {
+                    MergeMethod::Merge
+                },
+            ),
         })
     }
 
@@ -883,6 +906,15 @@ fn mr_ref_to_pr_ref(repo: &RepoRef, mr: &GlMrRef) -> PrRef {
         repo: repo.clone(),
         number: mr.iid,
         host_id: Some(mr.project_id.to_string()),
+    }
+}
+
+fn gl_issue_to_tracked(issue: crate::model::GlIssue) -> TrackedIssue {
+    TrackedIssue {
+        number: issue.iid,
+        title: issue.title,
+        body: issue.description.unwrap_or_default(),
+        url: issue.web_url,
     }
 }
 

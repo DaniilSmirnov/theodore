@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Theodore is signed with the hardened runtime. Its library validation only
+  loads dylibs signed by the app's own Team ID, and an ad-hoc signature has
+  none, so the tree-sitter grammars Theodore downloads (docs/code-intel.md
+  §4.1) would never load. Each grammar is checked against the sha256 in the
+  manifest compiled into the app before it is opened.
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>
