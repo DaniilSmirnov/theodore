@@ -108,6 +108,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::space_base_status,
             commands::update_space_from_base,
             commands::abort_space_update,
+            commands::space_fix_ci,
             commands::space_config,
             commands::space_trust,
             commands::space_setup,

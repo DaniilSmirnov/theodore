@@ -1187,6 +1187,9 @@ pub struct FakeHost {
     pub rerun_check_responses: Mutex<VecDeque<HostResult<()>>>,
     /// Every check id `rerun_check` was called with, for assertions.
     pub rerun_check_calls: Mutex<Vec<String>>,
+    pub check_log_responses: Mutex<VecDeque<HostResult<Option<String>>>>,
+    /// Every check id `check_log` was called with, for assertions.
+    pub check_log_calls: Mutex<Vec<String>>,
     pub repo_info_responses: Mutex<VecDeque<HostResult<HostRepo>>>,
     /// Open PRs `create_pr` made, by head branch.
     pub created_prs: Mutex<HashMap<String, PrRef>>,
@@ -1289,6 +1292,12 @@ impl FakeHost {
     }
     pub fn rerun_check_calls(&self) -> Vec<String> {
         self.rerun_check_calls.lock().unwrap().clone()
+    }
+    pub fn push_check_log(&self, r: HostResult<Option<String>>) {
+        self.check_log_responses.lock().unwrap().push_back(r);
+    }
+    pub fn check_log_calls(&self) -> Vec<String> {
+        self.check_log_calls.lock().unwrap().clone()
     }
     pub fn push_repo_info(&self, r: HostResult<HostRepo>) {
         self.repo_info_responses.lock().unwrap().push_back(r);
@@ -1581,6 +1590,18 @@ impl HostAdapter for FakeHost {
             .unwrap()
             .pop_front()
             .unwrap_or(Ok(()))
+    }
+    async fn check_log(
+        &self,
+        _pr: &PrRef,
+        check: &theodore_domain::Check,
+    ) -> HostResult<Option<String>> {
+        self.check_log_calls.lock().unwrap().push(check.id.clone());
+        self.check_log_responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(None))
     }
     async fn repo_info(&self, repo: &RepoRef) -> HostResult<HostRepo> {
         self.repo_info_responses

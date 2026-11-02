@@ -116,6 +116,7 @@ export const commands = {
 	spaceBaseStatus: (space: string) => typedError<SpaceBaseStatus, CommandError>(__TAURI_INVOKE("space_base_status", { space })),
 	updateSpaceFromBase: (space: string) => typedError<Space, CommandError>(__TAURI_INVOKE("update_space_from_base", { space })),
 	abortSpaceUpdate: (space: string) => typedError<Space, CommandError>(__TAURI_INVOKE("abort_space_update", { space })),
+	spaceFixCi: (req: SpaceFixCiRequest) => typedError<string, CommandError>(__TAURI_INVOKE("space_fix_ci", { req })),
 	/**  What a space runs, where each command comes from, trust. */
 	spaceConfig: (space: string) => typedError<SpaceConfigView, CommandError>(__TAURI_INVOKE("space_config", { space })),
 	/**  "Run commands from this repo?": Allow / Not now. */
@@ -1549,6 +1550,15 @@ export type SpaceFeedback =
 export type SpaceFeedbackRequest = {
 	space: string,
 	items: SpaceFeedback[],
+};
+
+/**
+ *  "Fix with agent" on a space PR's failing checks (docs/spaces.md "Fix
+ *  CI"): fetches each failed job's log and sends them to the space's agent
+ *  as one turn.
+ */
+export type SpaceFixCiRequest = {
+	space: string,
 };
 
 /**  One line of a space command's output (`space_logs`, `Ephemeral::SpaceLog`). */

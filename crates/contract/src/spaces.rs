@@ -315,3 +315,10 @@ pub struct SentFeedback {
     pub item: SpaceFeedback,
     pub turn: u32,
 }
+/// "Fix with agent" on a space PR's failing checks (docs/spaces.md "Fix
+/// CI"): fetches each failed job's log and sends them to the space's agent
+/// as one turn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct SpaceFixCiRequest {
+    pub space: String,
+}

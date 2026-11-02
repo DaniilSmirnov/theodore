@@ -1638,6 +1638,15 @@ export type SpaceFeedbackRequest = {
 	items: SpaceFeedback[],
 };
 
+/**
+ *  "Fix with agent" on a space PR's failing checks (docs/spaces.md "Fix
+ *  CI"): fetches each failed job's log and sends them to the space's agent
+ *  as one turn.
+ */
+export type SpaceFixCiRequest = {
+	space: string,
+};
+
 /**  One line of a space command's output (`space_logs`, `Ephemeral::SpaceLog`). */
 export type SpaceLogLine = {
 	kind: SpaceCommandKind,

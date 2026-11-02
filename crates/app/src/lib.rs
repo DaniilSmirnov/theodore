@@ -56,6 +56,8 @@ mod space_agent_tools_tests;
 #[cfg(test)]
 mod space_commands_tests;
 #[cfg(test)]
+mod space_fix_ci_tests;
+#[cfg(test)]
 mod space_queue_tests;
 #[cfg(test)]
 mod space_tools_tests;

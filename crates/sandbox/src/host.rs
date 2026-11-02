@@ -686,4 +686,29 @@ impl HostAdapter for SandboxHost {
         })
         .await
     }
+
+    /// A made-up log for a failing check (docs/spaces.md "Fix CI") — enough
+    /// for a demo or a QA pass to see an attachment and a sensible prompt,
+    /// never a real CI's output.
+    async fn check_log(&self, pr: &PrRef, check: &Check) -> HostResult<Option<String>> {
+        let id = check.id.clone();
+        self.pr_call("check_log", pr, move |l, idx| {
+            let c = l.st.prs[idx]
+                .checks
+                .iter()
+                .find(|c| c.id == id)
+                .ok_or_else(|| Refusal::NotFound(format!("check {id}")))?;
+            if c.status != theodore_domain::CheckStatus::Fail {
+                return Ok(None);
+            }
+            Ok(Some(format!(
+                "##[group]Run {name}\n\
+                 [sandbox] simulated failure for check \"{name}\"\n\
+                 ##[error]Process completed with exit code 1.\n\
+                 ##[endgroup]",
+                name = c.name,
+            )))
+        })
+        .await
+    }
 }

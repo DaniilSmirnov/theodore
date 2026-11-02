@@ -23,6 +23,7 @@ pub mod skills;
 pub mod space_agent_tools;
 pub mod space_commands;
 pub mod space_feedback;
+pub mod space_fix_ci;
 pub(crate) mod space_handoff;
 pub mod space_hooks;
 pub(crate) mod space_naming;

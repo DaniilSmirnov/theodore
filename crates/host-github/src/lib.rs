@@ -4,6 +4,7 @@ mod adapter;
 mod anchor;
 pub mod device_flow;
 mod graphql;
+mod logs;
 mod pagination;
 mod rest;
 pub mod testkit;

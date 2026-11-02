@@ -295,6 +295,24 @@ message. Removed lines read `path:7 (old side, removed lines)`; outdated
 comments say so; `<!-- … -->` metadata is dropped. The draft or thread itself
 is left as it was.
 
+**Fix CI**: "Fix with agent" next to the Checks tab heading, once a check on
+`space.pr` has failed. It fetches each failing check's log (GitHub Actions
+today; a host without one gets a bare link) and starts the space's next turn
+with the list, each check's log attached or linked, and the project's
+`spaces.check` command if one is configured:
+
+```
+space.pr ─▶ fresh checks ─▶ failing ones ─▶ check_log (GitHub Actions)
+                                                │
+                              save_attachment ◀─┴─▶ no log: name + url
+                                    │
+                                    ▼
+                              space_send (one turn, attachments)
+```
+
+Refused without a PR, with nothing failing, or while a turn is running — same
+rules as any other turn.
+
 ### Review of a space
 
 "Review ▸" opens the normal Review tab for the space — groups by meaning, read
@@ -866,6 +884,7 @@ downloaded to this Mac yet".
 | `resize_space_terminal` | a new `cols`/`rows` (`SIGWINCH`) |
 | `close_space_terminal` | kills its process group |
 | `list_space_terminals` | a space's open (or just-exited) terminals, each with scrollback to reseed the view |
+| `space_fix_ci` | "Fix with agent" on the Checks tab: the space PR's failing checks' logs (or links), as one turn |
 
 ## 10. The flag
 
@@ -890,7 +909,7 @@ no row, or `true`, means on. The flag forces them on and locks the switch.
 | **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel`; interactive terminal tabs (§3 "Terminal") over a real PTY, surviving navigation, closed on archive / app quit |
 | **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel`; an agent tool over `space_terminal_tail`; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent" |
 | **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel`; sends while running are queued (held after Stop / a failure / a restart; Send · Edit · Cancel) and Send now steers a running Claude Code turn |
-| **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; `max_parallel`; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; Update from base (merge, never rebase): "Base moved: N commits behind", conflicts resolved by an agent turn, Complete merge / Abort |
+| **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; `max_parallel`; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; Update from base (merge, never rebase): "Base moved: N commits behind", conflicts resolved by an agent turn, Complete merge / Abort; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent" for setup; "Fix with agent" on the Checks tab, sending a failing check's log (GitHub Actions) or link as one turn |
 | **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel` |
 | **Later** | OS sandbox for agents; live diff during a turn (snapshot the working tree through a temporary index); signed shipped commits; spaces started from an issue or a failing check; several agents racing one goal, pick the best diff |
 

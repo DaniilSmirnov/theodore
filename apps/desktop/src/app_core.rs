@@ -1003,6 +1003,12 @@ impl CoreApi for AppCore {
     ) -> Result<theodore_contract::Space, CommandError> {
         self.core.abort_space_update(&space).await.map_err(err)
     }
+    async fn space_fix_ci(
+        &self,
+        req: theodore_contract::SpaceFixCiRequest,
+    ) -> Result<String, CommandError> {
+        self.core.space_fix_ci(req).await.map_err(err)
+    }
     async fn account_status(&self) -> Result<AccountStatus, CommandError> {
         self.core.account_status().await.map_err(err)
     }

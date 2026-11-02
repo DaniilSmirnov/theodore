@@ -13,7 +13,7 @@ use theodore_ports::{
     ReviewComment, ReviewSubmission, SubmittedReview,
 };
 
-use crate::{anchor, graphql, pagination, rest, time};
+use crate::{anchor, graphql, logs, pagination, rest, time};
 
 /// `HostAdapter` for github.com and GitHub Enterprise Server.
 pub struct GithubAdapter {
@@ -614,6 +614,18 @@ impl HostAdapter for GithubAdapter {
         ))
     }
 
+    async fn check_log(&self, pr: &PrRef, check: &Check) -> HostResult<Option<String>> {
+        let (owner, repo) = (pr.repo.owner.as_str(), pr.repo.name.as_str());
+        // Only an Actions job's log is ours to fetch; anything else (a
+        // third-party check-run app, a plain commit status) links out to
+        // wherever it runs — `check.url` is all a caller can show for it.
+        let Some(job_id) = check.url.as_deref().and_then(actions_job_id) else {
+            return Ok(None);
+        };
+        let log = rest::job_log(&self.rest, owner, repo, job_id).await?;
+        Ok(Some(logs::tail(&log, logs::DEFAULT_TAIL_LINES)))
+    }
+
     async fn repo_info(&self, repo: &RepoRef) -> HostResult<HostRepo> {
         let info = graphql::repo_info(&self.graphql, &repo.owner, &repo.name).await?;
         Ok(HostRepo {
@@ -668,6 +680,16 @@ impl IssueTracker for GithubAdapter {
 fn actions_run_id(url: &str) -> Option<&str> {
     let (_, rest) = url.split_once("/actions/runs/")?;
     rest.split('/').next().filter(|s| !s.is_empty())
+}
+
+/// Pulls `{job_id}` out of an Actions check-run `detailsUrl`
+/// (`.../actions/runs/{run_id}/job/{job_id}`), the id `check_log` needs for
+/// `GET .../actions/jobs/{job_id}/logs` — the run id alone isn't enough,
+/// the logs endpoint is per-job.
+fn actions_job_id(url: &str) -> Option<&str> {
+    let (_, rest) = url.split_once("/job/")?;
+    let id = rest.split(['/', '#', '?']).next()?;
+    (!id.is_empty() && id.chars().all(|c| c.is_ascii_digit())).then_some(id)
 }
 
 // ── mapping helpers ─────────────────────────────────────────────────────

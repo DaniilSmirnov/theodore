@@ -69,6 +69,7 @@ import type {
   Space,
   SpaceBaseStatus,
   SpaceFeedbackRequest,
+  SpaceFixCiRequest,
   SpaceReviewRequest,
   SpaceQueuedRequest,
   SpaceSendRequest,
@@ -306,6 +307,9 @@ export const api = {
     call<Space>('update_space_from_base', { space }),
   abortSpaceUpdate: (space: string) =>
     call<Space>('abort_space_update', { space }),
+  /** "Fix with agent": the space PR's failing checks' logs as the next
+   *  turn. */
+  spaceFixCi: (req: SpaceFixCiRequest) => call<string>('space_fix_ci', { req }),
   /** What a space runs, where each command comes from, and trust. */
   spaceConfig: (space: string) =>
     call<SpaceConfigView>('space_config', { space }),
