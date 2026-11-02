@@ -1575,8 +1575,8 @@ impl FakeAgent {
             .unwrap()
             .push((Box::new(matches), events));
     }
-    /// The next `run()` call never emits anything and never closes, until
-    /// the whole fake is dropped.
+    /// The next turn / skill / ask `run()` (`stream_text: true`) never
+    /// emits anything and never closes, until the whole fake is dropped.
     pub fn hang_next_run(&self) {
         *self.hang_next.lock().unwrap() = true;
     }
@@ -1638,7 +1638,9 @@ impl AgentPort for FakeAgent {
             self.utility_requests.lock().unwrap().push(req);
         }
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let hang = std::mem::take(&mut *self.hang_next.lock().unwrap());
+        // Only a turn / skill / ask hangs: a background one-shot call
+        // (naming, handoff) must not take the hang meant for it.
+        let hang = stream_text && std::mem::take(&mut *self.hang_next.lock().unwrap());
         if hang {
             self.kept_alive.lock().unwrap().push(tx);
         } else {
@@ -1655,7 +1657,10 @@ impl AgentPort for FakeAgent {
                     default_done()
                 }
             });
-            let paused = self.paused.lock().unwrap().take();
+            // Like the hang: only a turn waits, never a background call.
+            let paused = stream_text
+                .then(|| self.paused.lock().unwrap().take())
+                .flatten();
             tokio::spawn(async move {
                 if let Some(go) = paused
                     && go.await.is_err()

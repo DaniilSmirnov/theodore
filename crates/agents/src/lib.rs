@@ -20,6 +20,7 @@ pub mod config;
 pub mod detect;
 pub mod edit_guard;
 pub mod env;
+pub mod exit_output;
 pub mod gemini;
 pub mod models;
 pub mod process;
