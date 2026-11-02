@@ -133,6 +133,7 @@ fn squash(head: &Sha, parent: &Sha, message: &str) -> SpaceCommit {
         head: head.clone(),
         parent: parent.clone(),
         replay_from: None,
+        merge_parent: None,
         message: message.into(),
         author: me(),
     }

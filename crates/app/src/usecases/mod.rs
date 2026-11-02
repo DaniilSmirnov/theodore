@@ -29,6 +29,7 @@ pub mod space_queue;
 pub mod space_setup_assist;
 pub mod space_terminal;
 pub mod space_tools;
+pub mod space_update;
 pub mod spaces;
 pub mod suggestions;
 pub mod symbols;

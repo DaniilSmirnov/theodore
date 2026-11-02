@@ -1486,6 +1486,22 @@ export type Space = {
 	 *  when the turn ends.
 	 */
 	progress?: SpaceProgress | null,
+	/**
+	 *  An Update from base Theodore started and the agent is resolving:
+	 *  set while its merge conflicts (docs/spaces.md §6).
+	 */
+	updating?: SpaceUpdate | null,
+};
+
+/**
+ *  How far the space's base branch moved on since its `base_sha`, as of
+ *  the project's last fetch (`space_base_status`).
+ */
+export type SpaceBaseStatus = {
+	/**  The base branch's tip in Theodore's copy of the repo. */
+	base_tip: Sha,
+	/**  Commits on the base since `base_sha`. */
+	behind: number,
 };
 
 /**  `check` after a turn that changed files. */
@@ -1721,6 +1737,26 @@ export type SpaceTurn = {
 	 *  `chat_message` ids, undone with it.
 	 */
 	steered?: string[],
+	/**
+	 *  The turn completed an Update from base: the `base_sha` before it,
+	 *  which Undo puts back.
+	 */
+	base_before?: Sha | null,
+};
+
+/**
+ *  A merge of the base into the space, left in progress on conflicts
+ *  (docs/spaces.md §6 "Update from base"). Theodore commits it once the
+ *  agent has resolved them; Abort goes back to `from`.
+ */
+export type SpaceUpdate = {
+	/**  The base's tip being merged in; `base_sha` once committed. */
+	base_tip: Sha,
+	/**  The checkpoint the merge started from. */
+	from: Sha,
+	/**  Files with conflicts, as of the last look. */
+	conflicts?: string[],
+	started_at: number,
 };
 
 /**

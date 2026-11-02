@@ -287,6 +287,28 @@ pub trait CoreApi: Send + Sync {
     ) -> Result<String, CommandError> {
         Err(not_ready())
     }
+    /// Commits the space's base has that it doesn't (no network).
+    async fn space_base_status(
+        &self,
+        _space: String,
+    ) -> Result<theodore_contract::SpaceBaseStatus, CommandError> {
+        Err(not_ready())
+    }
+    /// Update from base: merge the base's tip into the space (or complete
+    /// the merge being resolved).
+    async fn update_space_from_base(
+        &self,
+        _space: String,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        Err(not_ready())
+    }
+    /// Abort the update from base being resolved.
+    async fn abort_space_update(
+        &self,
+        _space: String,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        Err(not_ready())
+    }
     // ── project config (docs/config.md) ──────────────────────────────────
 
     /// What a space runs, where each command comes from, trust.

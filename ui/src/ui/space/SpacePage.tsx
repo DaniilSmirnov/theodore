@@ -76,6 +76,7 @@ import {
 } from './commands';
 import { GlobalConfigSection, SpaceSetupAssistHint } from './ConfigSection';
 import { SpaceProgress } from './SpaceProgress';
+import { BaseMoved, UpdatingBanner } from './BaseUpdate';
 import {
   CheckChip,
   LogsDrawer,
@@ -324,6 +325,7 @@ export const SpacePage = observer(function SpacePage({ id }: { id: string }) {
         showChanges={showChanges}
         onToggleChanges={toggleChanges}
       />
+      <UpdatingBanner space={space} />
       <div className="flex min-h-0 flex-1">
         <section
           className={
@@ -467,6 +469,7 @@ const SpaceHeader = observer(function SpaceHeader({
         </span>
       )}
       <span className="flex-1" />
+      <BaseMoved space={space} />
       <RunButton space={space} config={config} />
       <PortChips space={space} />
       <LogsToggle open={logsOpen} onToggle={onToggleLogs} />

@@ -194,32 +194,62 @@ impl GitCli {
         if tree.is_empty() {
             return Err(GitError::Parse("no tree for the shipped commit".into()));
         }
+        // The base merged in since (Update from base) as a second parent,
+        // unless `parent`'s history already has it.
+        let merge_parent = match &c.merge_parent {
+            Some(base) if base != &c.parent => {
+                let has = proc(
+                    repo,
+                    &askpass,
+                    &[
+                        "merge-base",
+                        "--is-ancestor",
+                        END_OF_OPTIONS,
+                        base.as_str(),
+                        c.parent.as_str(),
+                    ],
+                )
+                .run_raw()
+                .await?;
+                match has.status {
+                    0 => None,
+                    1 => Some(base.as_str()),
+                    code => {
+                        return Err(GitError::Command {
+                            args: "merge-base --is-ancestor".into(),
+                            code,
+                            stderr: stderr_of(&has),
+                        });
+                    }
+                }
+            }
+            _ => None,
+        };
         let name = format!("user.name={}", c.author.name);
         let email = format!("user.email={}", c.author.email);
         // Author and committer are the user. Unsigned: Theodore can't
         // answer a passphrase prompt (docs/spaces.md §6).
-        let sha = proc(
-            repo,
-            &askpass,
-            &[
-                "-c",
-                &name,
-                "-c",
-                &email,
-                "-c",
-                "commit.gpgsign=false",
-                "commit-tree",
-                &tree,
-                "-p",
-                c.parent.as_str(),
-                "-m",
-                &c.message,
-            ],
-        )
-        .run_text()
-        .await?
-        .trim()
-        .to_string();
+        let mut args = vec![
+            "-c",
+            &name,
+            "-c",
+            &email,
+            "-c",
+            "commit.gpgsign=false",
+            "commit-tree",
+            &tree,
+            "-p",
+            c.parent.as_str(),
+        ];
+        if let Some(base) = merge_parent {
+            args.extend(["-p", base]);
+        }
+        args.extend(["-m", &c.message]);
+        let sha = proc(repo, &askpass, &args)
+            .run_text()
+            .await?
+            .trim()
+            .to_string();
         {
             let _repo = crate::locks::lock(repo).await;
             proc(repo, &askpass, &["update-ref", &shipped_ref(space), &sha])

@@ -169,6 +169,7 @@ impl Core {
             title: None,
             handoff_summary: None,
             progress: None,
+            updating: None,
         };
         self.apply(vec![NewAction {
             model: models::SPACE.into(),
@@ -552,20 +553,25 @@ impl Core {
             })?;
         let mut log = space.turn_log.clone();
         log[i].undone = true;
+        let mut data = serde_json::json!({
+            "status": SpaceStatus::Idle,
+            "head_sha": turn.before,
+            "error": null,
+            "turn_log": log,
+            // The agent's session still holds the undone turn: the next
+            // one starts over from the transcript, which leaves it out.
+            "agent_session": null,
+            "updated_at": self.0.deps.clock.now(),
+        });
+        // The turn completed an update from base: the old base is back.
+        if let Some(base) = &turn.base_before {
+            data["base_sha"] = serde_json::json!(base);
+        }
         self.apply(vec![NewAction {
             model: models::SPACE.into(),
             model_id: space.id.clone(),
             action: SyncActionCode::C,
-            data: Some(serde_json::json!({
-                "status": SpaceStatus::Idle,
-                "head_sha": turn.before,
-                "error": null,
-                "turn_log": log,
-                // The agent's session still holds the undone turn: the next
-                // one starts over from the transcript, which leaves it out.
-                "agent_session": null,
-                "updated_at": self.0.deps.clock.now(),
-            })),
+            data: Some(data),
         }])
         .await?;
         if turn.before != turn.after {
@@ -1002,23 +1008,25 @@ async fn drive_turn(core: &Core, turn: Turn) {
     } else {
         ""
     };
-    let checkpoint = core
-        .0
-        .deps
-        .git
-        .space_checkpoint(
-            &cwd,
-            &space.id,
-            &format!("{}: turn {turn_no}{suffix}", space.name),
-        )
-        .await;
+    // While an update from base resolves, Theodore commits its merge here.
+    let saved = crate::usecases::space_update::turn_checkpoint(
+        core,
+        &space,
+        &cwd,
+        &format!("{}: turn {turn_no}{suffix}", space.name),
+    )
+    .await;
     // A rebase or conflict left in the worktree: the answer stands, the
     // snapshot waits for the next turn, and the space says why.
     let mut skipped = None;
-    let head = match checkpoint {
+    let head = match saved.result {
         Ok(head) => Some(head),
         Err(theodore_ports::GitError::Busy(busy)) => {
-            skipped = Some(format!("checkpoint skipped: {busy}"));
+            skipped = Some(
+                saved
+                    .skipped
+                    .unwrap_or_else(|| format!("checkpoint skipped: {busy}")),
+            );
             None
         }
         Err(e) => {
@@ -1062,6 +1070,9 @@ async fn drive_turn(core: &Core, turn: Turn) {
         "progress": null,
         "updated_at": core.0.deps.clock.now(),
     });
+    if let Some(extra) = saved.patch {
+        crate::usecases::space_update::merge_fields(&mut patch, extra);
+    }
     if let Some(head) = &head {
         patch["head_sha"] = serde_json::json!(head);
         // Nothing else writes the log while a turn runs (undo is refused),
@@ -1086,6 +1097,7 @@ async fn drive_turn(core: &Core, turn: Turn) {
                 started_at: core.0.deps.clock.now(),
                 finished_at: None,
             }),
+            base_before: saved.base_before.clone(),
         });
         patch["turn_log"] = serde_json::json!(log);
     }
@@ -1220,6 +1232,9 @@ pub(crate) fn undoable_turn(space: &Space) -> Result<usize, String> {
         }
         SpaceStatus::Archived => return Err("this space is archived".into()),
         SpaceStatus::Idle | SpaceStatus::Failed => {}
+    }
+    if space.updating.is_some() {
+        return Err("finish or abort the update from base first".into());
     }
     let i = space
         .turn_log

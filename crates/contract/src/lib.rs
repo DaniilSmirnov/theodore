@@ -808,6 +808,8 @@ pub fn types() -> specta::Types {
         .register::<QueuedSend>()
         .register::<QueuedAction>()
         .register::<SpaceQueuedRequest>()
+        .register::<SpaceUpdate>()
+        .register::<SpaceBaseStatus>()
         .register::<ConfigLayer>()
         .register::<ConfigFile>()
         .register::<ConfigEntry>()

@@ -123,6 +123,25 @@ impl SpaceGit<'_> {
         Ok(())
     }
 
+    /// Whether a merge is in progress (`MERGE_HEAD`). Read only; call
+    /// after `verify_root`.
+    pub(crate) async fn merging(&self) -> GitResult<bool> {
+        let p = self
+            .run_text(&[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "MERGE_HEAD",
+            ])
+            .await?;
+        let p = Path::new(p.trim());
+        Ok(if p.is_absolute() {
+            p.exists()
+        } else {
+            self.worktree.join(p).exists()
+        })
+    }
+
     /// The git operation unfinished in the worktree, if any. Read only;
     /// call after `verify_root`.
     pub(crate) async fn busy(&self) -> GitResult<Option<WorktreeBusy>> {

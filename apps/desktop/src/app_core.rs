@@ -967,6 +967,24 @@ impl CoreApi for AppCore {
     ) -> Result<String, CommandError> {
         self.core.space_send_feedback(req).await.map_err(err)
     }
+    async fn space_base_status(
+        &self,
+        space: String,
+    ) -> Result<theodore_contract::SpaceBaseStatus, CommandError> {
+        self.core.space_base_status(&space).await.map_err(err)
+    }
+    async fn update_space_from_base(
+        &self,
+        space: String,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        self.core.update_space_from_base(&space).await.map_err(err)
+    }
+    async fn abort_space_update(
+        &self,
+        space: String,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        self.core.abort_space_update(&space).await.map_err(err)
+    }
     async fn account_status(&self) -> Result<AccountStatus, CommandError> {
         self.core.account_status().await.map_err(err)
     }

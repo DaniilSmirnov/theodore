@@ -228,6 +228,33 @@ turn 1 ─▶ ckpt A ─▶ turn 2 ─▶ ckpt B          Undo: worktree + ref �
                                 └─ shipped? ── refused
 ```
 
+**Update from base**: when the base branch has commits the space doesn't,
+the header shows *Base moved: 3 commits behind · Update* (counted from the
+copy on this Mac, re-read after each turn and each project fetch; no
+network). Update merges the base into the space (§6): clean, the space is on
+the new base at once; on conflicts a banner *Resolving conflicts with main:
+a.ts, b.ts* replaces the button and the agent gets a turn to resolve them.
+
+```
+┌ ○ retry-429 ──────── [⎇ Base moved: 3 commits behind · Update] [Review] [Open PR ▾] ┐
+                    after Update, on conflicts:
+┌ ○ retry-429 ──────────────────────────────────────────── [Review] [Open PR ▾] ──────┐
+│ ⚠ Resolving conflicts with main: src/retry.rs. Theodore commits    [Complete merge] │
+│   the merge once no conflict markers are left.                     [Abort]          │
+```
+
+| Banner action | Does |
+| --- | --- |
+| (the agent's turn ends) | Theodore checks the files; none has markers left → it commits the merge |
+| Complete merge | the same check now, for files fixed by hand; says which files still have markers |
+| Abort | `merge --abort`, worktree and ref back to where the update started, old base |
+
+While it resolves: Ship and Undo are refused ("finish or abort the update
+from base first"), a plain message is a normal turn whose end tries the
+merge again. Undo of the turn that completed the merge takes the merge back
+too, base included; a clean update is not a turn, so Undo stops at it. The
+PR's own "Update branch" on the host is a separate action and stays as is.
+
 ### Space page — in review
 
 The header gains the PR; the right pane gains Threads and Checks tabs
@@ -546,9 +573,10 @@ Details, limits and errors: `docs/config.md` §7.
 ~/.theodore/spaces/<id>/          detached worktree at the checkpoint + live edits
 
 turn ends ─▶ git add -A ─▶ commit "turn N" ─▶ update-ref refs/theodore/spaces/<id> HEAD
+Update    ─▶ fetch ─▶ checkpoint ─▶ git merge <base tip> in the worktree ─▶ base_sha = tip
 Ship      ─▶ commit-tree <checkpoint tree> -p <base> (author: you) ─▶ refs/theodore/shipped/<id>
 Open PR   ─▶ git push origin <shipped>:refs/heads/<login>/<slug>   (never forced)
-Push      ─▶ commit-tree <checkpoint tree> -p <last shipped> ─▶ push (fast-forward)
+Push      ─▶ commit-tree <checkpoint tree> -p <last shipped> [-p <base tip merged since>] ─▶ push (fast-forward)
 Merge     ─▶ (local folder) fetch <cache> <shipped ref> ─▶ git merge into its checked-out branch
 Keep      ─▶ (local folder) fetch <cache> <shipped ref>:refs/heads/space/<slug>
 Keep      ─▶ (local folder) git -C <folder> fetch <cache> <ref>:refs/heads/<branch>
@@ -599,6 +627,43 @@ unfinished there (`GitPort::worktree_busy`, one `WorktreeBusy`):
 | Undo | refused: "can't undo: … finish or abort it first" |
 | Archive, Ship | refused with the same reason; nothing half-done is committed |
 | next turn after it's finished | checkpoints as usual |
+
+That is for an operation nobody told Theodore about (the agent ran `git
+rebase` itself). A merge Theodore started for Update from base is recorded
+on the space (`space.updating`), and its flow owns the end of it.
+
+**Update from base** (owner, 2026-10-31: merge the base in, never rebase or
+force-push, so pushed history and reviewers' comments stay put; shipping
+still squashes):
+
+```
+Update ─▶ fetch the base ─▶ tip == base_sha? ─▶ "already up to date"
+  └─▶ checkpoint "edits before updating from main" (= from)
+      └─▶ git merge --no-edit --ff <tip>   (Theodore's identity, no hooks, merge.conflictStyle=diff3)
+            ├─ clean ─────▶ merge commit = checkpoint "merge main" ─▶ base_sha = tip ─▶ diff vs tip
+            └─ conflicts ─▶ merge left in progress, space.updating = { base_tip, from, conflicts, started_at }
+                              └─▶ agent turn (Edit; an Ask space switches to Edit): the files,
+                                  "resolve the markers, keep both intents, run_check, leave git to Theodore"
+                                  turn ends ─▶ space_merge_finish instead of the checkpoint:
+                                    ├─ no file it listed has a marker line ─▶ add -A, commit = checkpoint,
+                                    │     base_sha = tip, updating cleared, turn_log.base_before = old base
+                                    ├─ markers left ─▶ no checkpoint, failed "conflicts left in b.ts; …"
+                                    ├─ the agent committed the merge itself ─▶ that commit is checkpointed
+                                    └─ the agent aborted it ─▶ checkpoint, old base, updating cleared
+            Abort ─▶ merge --abort, reset --hard <from>, clean -fd, ref → from, updating cleared
+```
+
+- A file counts as resolved when no line starts with `<<<<<<<`, `|||||||`
+  or `>>>>>>>` (or it is deleted): the agent needn't `git add`, which its
+  sandbox may not allow (the index lives in the cache).
+- Shipping after an update: the base is a real parent of the space's head,
+  so the squashed commit stays correct.
+
+  | Ship | the new commit |
+  | --- | --- |
+  | Open PR / first Merge locally | parent = the new `base_sha`, tree = the merged checkpoint: one commit vs the new base |
+  | Push (PR open) | parents = last push + the base tip merged since (dropped when already in its history), tree = the merged checkpoint: fast-forward, and the host's PR diff (vs the merge base) is still the change alone |
+  | Merge locally again | the same second parent |
 
 **Shipping, step by step**
 
@@ -657,6 +722,8 @@ New synced model `space` (core-owned, written only by commands):
 | `handoff_summary` | the earlier conversation, summarized once and cached (§5 "One session per space") |
 | `progress` | the running turn's tracker (`update_progress`): `steps` (label, `pending · active · done`), `note`, `at`; `null` once the turn ends |
 | `turn_log` | per turn: your message and the reply (`chat_message` ids), messages steered into it (`steered`), checkpoint `before` / `after`, `undone` |
+| `turn_log` | per turn: your message and the reply (`chat_message` ids), checkpoint `before` / `after`, `undone`; `base_before` when the turn completed an Update from base (Undo puts that base back) |
+| `updating` | an Update from base resolving its conflicts: `base_tip`, `from` (the checkpoint it started at), `conflicts`, `started_at` (§6) |
 
 | Data | Where |
 | --- | --- |
@@ -692,6 +759,7 @@ Not built yet: **Delete** (archive plus deleting the ref and the chat rows);
 | worktree dir missing | recreated from `refs/theodore/spaces/<id>` |
 | dir there, but not the space's worktree (`.git` gone or foreign) | git refuses to run in it (§6 "Worktree guard"); on reopen or archive it is moved to `spaces/.moved-aside/`, never deleted, and recreated from the ref |
 | a rebase, merge or conflict left in the worktree | no checkpoint or Undo until it is finished or aborted (§6 "Busy worktree") |
+| `updating` set (an Update from base was resolving) | kept: the merge is still in the worktree; Complete merge or Abort from the banner, or send the agent a message |
 | ref missing too | `failed`, transcript kept, "Restart from base" offered |
 
 ---
@@ -787,6 +855,9 @@ downloaded to this Mac yet".
 | `unarchive_space` | recreate the worktree from the ref, reopen the live diff |
 | `undo_space_turn` | worktree and ref back to the last live turn's `before`; the turn is marked undone |
 | `space_send_feedback` | threads / drafts / findings of the space's PR or own review, quoted as one turn |
+| `space_base_status` | the base's tip in the copy on this Mac and how many commits the space is behind it; no network |
+| `update_space_from_base` | merge the base's tip into the space (§6); while `updating`, complete that merge if no markers are left |
+| `abort_space_update` | `merge --abort`, back to `updating.from` on the old base |
 | `ship_space` | `open_pr` · `open_draft_pr` · `push` (host project) or `merge_locally` · `keep_branch` (local folder), with an optional title (§6) |
 | `space_setup_assist` | "Set up with agent": no `spaces:` commands at all — a turn asking the agent to look at the repo and write them (`docs/config.md` §2, §8) |
 | `space_fix_setup` | "Fix with agent": setup failed — a turn with the command, its exit status and the log tail, asking the agent to fix the cause |
@@ -819,7 +890,8 @@ no row, or `true`, means on. The flag forces them on and locks the switch.
 | **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel`; interactive terminal tabs (§3 "Terminal") over a real PTY, surviving navigation, closed on archive / app quit |
 | **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel`; an agent tool over `space_terminal_tail`; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent" |
 | **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel`; sends while running are queued (held after Stop / a failure / a restart; Send · Edit · Cancel) and Send now steers a running Claude Code turn |
-| **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; `max_parallel` |
+| **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; `max_parallel`; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; Update from base (merge, never rebase): "Base moved: N commits behind", conflicts resolved by an agent turn, Complete merge / Abort |
+| **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel` |
 | **Later** | OS sandbox for agents; live diff during a turn (snapshot the working tree through a temporary index); signed shipped commits; spaces started from an issue or a failing check; several agents racing one goal, pick the best diff |
 
 ## 12. Decisions (owner, 2026-10-21)

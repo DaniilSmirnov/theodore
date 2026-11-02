@@ -67,6 +67,7 @@ import type {
   CreateSpaceRequest,
   ShipSpaceRequest,
   Space,
+  SpaceBaseStatus,
   SpaceFeedbackRequest,
   SpaceReviewRequest,
   SpaceQueuedRequest,
@@ -294,6 +295,15 @@ export const api = {
   unarchiveSpace: (space: string) => call<Space>('unarchive_space', { space }),
   spaceSendFeedback: (req: SpaceFeedbackRequest) =>
     call<string>('space_send_feedback', { req }),
+  /** "Base moved: N commits behind", from the copy on this Mac. A passive
+   *  read: a failure just hides it, it isn't toasted. */
+  spaceBaseStatus: (space: string) =>
+    call<SpaceBaseStatus>('space_base_status', { space }, true),
+  /** Update from base; while conflicts are resolving, completes the merge. */
+  updateSpaceFromBase: (space: string) =>
+    call<Space>('update_space_from_base', { space }),
+  abortSpaceUpdate: (space: string) =>
+    call<Space>('abort_space_update', { space }),
   /** What a space runs, where each command comes from, and trust. */
   spaceConfig: (space: string) =>
     call<SpaceConfigView>('space_config', { space }),

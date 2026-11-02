@@ -15,10 +15,11 @@ use theodore_ports::{GitError, GitResult, Worktree, space_ref};
 use crate::GitCli;
 use crate::process::GitProc;
 use crate::safety::END_OF_OPTIONS;
+use crate::space_guard::SpaceGit;
 
 /// A space id becomes a path component and part of a ref name: lowercase
 /// ascii letters, digits and `-` only, never leading with `-`.
-fn validate_space_id(id: &str) -> GitResult<()> {
+pub(crate) fn validate_space_id(id: &str) -> GitResult<()> {
     let ok = !id.is_empty()
         && id.len() <= 64
         && !id.starts_with('-')
@@ -158,40 +159,7 @@ impl GitCli {
         if let Some(busy) = git.busy().await? {
             return Err(GitError::Busy(busy));
         }
-        git.run(&["add", "-A"]).await?;
-        // Exit 1 = something is staged.
-        let staged = git.run_raw(&["diff", "--cached", "--quiet"]).await?;
-        if staged.status == 1 {
-            // Theodore's own snapshot: no user hooks or signing prompts on
-            // every agent turn, a fixed identity like other Theodore commits.
-            git.run(&[
-                "-c",
-                "user.name=Theodore",
-                "-c",
-                "user.email=theodore@localhost",
-                "-c",
-                "commit.gpgsign=false",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "commit",
-                "-q",
-                "-m",
-                message,
-            ])
-            .await?;
-        } else if staged.status != 0 {
-            return Err(GitError::Command {
-                args: "diff --cached --quiet".into(),
-                code: staged.status,
-                stderr: String::from_utf8_lossy(&staged.stderr).into_owned(),
-            });
-        }
-        let head = git.run_text(&["rev-parse", "--verify", "HEAD"]).await?;
-        let head = head.trim().to_string();
-        // Refs outside `refs/heads` and `refs/worktree` are shared by every
-        // worktree, so this lands in the bare cache.
-        git.run(&["update-ref", &space_ref(id), &head]).await?;
-        Ok(Sha::new(head))
+        snapshot(&git, id, message).await
     }
 
     pub(crate) async fn worktree_busy_op(
@@ -352,6 +320,48 @@ impl GitCli {
         .await;
         Ok(())
     }
+}
+
+/// `add -A`, a commit when anything is staged (with a merge in progress,
+/// its merge commit), and the space ref at `HEAD`: one checkpoint. The
+/// caller holds the worktree lock and has run `verify_root`.
+pub(crate) async fn snapshot(git: &SpaceGit<'_>, id: &str, message: &str) -> GitResult<Sha> {
+    git.run(&["add", "-A"]).await?;
+    // Exit 1 = something is staged.
+    let staged = git.run_raw(&["diff", "--cached", "--quiet"]).await?;
+    // A resolved merge may stage nothing new over `HEAD`: still a commit.
+    if staged.status == 1 || (staged.status == 0 && git.merging().await?) {
+        // Theodore's own snapshot: no user hooks or signing prompts on
+        // every agent turn, a fixed identity like other Theodore commits.
+        git.run(&[
+            "-c",
+            "user.name=Theodore",
+            "-c",
+            "user.email=theodore@localhost",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-q",
+            "--no-edit",
+            "-m",
+            message,
+        ])
+        .await?;
+    } else if staged.status != 0 {
+        return Err(GitError::Command {
+            args: "diff --cached --quiet".into(),
+            code: staged.status,
+            stderr: String::from_utf8_lossy(&staged.stderr).into_owned(),
+        });
+    }
+    let head = git.run_text(&["rev-parse", "--verify", "HEAD"]).await?;
+    let head = head.trim().to_string();
+    // Refs outside `refs/heads` and `refs/worktree` are shared by every
+    // worktree, so this lands in the bare cache.
+    git.run(&["update-ref", &space_ref(id), &head]).await?;
+    Ok(Sha::new(head))
 }
 
 #[cfg(test)]

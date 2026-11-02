@@ -90,6 +90,11 @@ impl Core {
             }
             SpaceStatus::Idle | SpaceStatus::Failed => {}
         }
+        if space.updating.is_some() {
+            return Err(AppError::Invalid(
+                "finish or abort the update from base first; nothing half-merged ships".into(),
+            ));
+        }
         let project = self
             .project_row(&space.project)
             .await?
@@ -244,6 +249,7 @@ impl Core {
             head: head.clone(),
             parent: parent.clone(),
             replay_from,
+            merge_parent: merge_parent(parent, space),
             message: message.to_string(),
             author: author.clone(),
         };
@@ -321,6 +327,7 @@ impl Core {
                     head: head.clone(),
                     parent: parent.clone(),
                     replay_from: None,
+                    merge_parent: merge_parent(parent, space),
                     message: message.to_string(),
                     author: author.clone(),
                 },
@@ -509,6 +516,13 @@ impl Core {
             data: Some(data),
         }
     }
+}
+
+/// After the first ship, the space's base (moved on by Update from base)
+/// as the new commit's second parent: the git port leaves it out when the
+/// shipped history already has it.
+fn merge_parent(parent: &Sha, space: &Space) -> Option<Sha> {
+    (parent != &space.base_sha).then(|| space.base_sha.clone())
 }
 
 /// A safety refusal reads as the user's mistake to fix, not a git failure.

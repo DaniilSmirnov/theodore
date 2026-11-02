@@ -449,6 +449,45 @@ pub trait GitPort: Send + Sync {
         let _ = worktree;
         Err(GitError::Unsupported("space_snapshot"))
     }
+    /// Update from base (docs/spaces.md §6): merges `tip` into a space's
+    /// worktree (never a rebase, so pushed history stays). Clean: Theodore
+    /// commits it as a checkpoint (`message`) and `Merged` is the new
+    /// head, ref moved. Conflicts: the merge is left in progress for the
+    /// agent and `Conflicts` lists the files. `Busy` when another operation
+    /// is unfinished there already.
+    async fn space_merge(
+        &self,
+        worktree: &Path,
+        space: &str,
+        tip: &Sha,
+        message: &str,
+    ) -> GitResult<SpaceMerge> {
+        let _ = (worktree, space, tip, message);
+        Err(GitError::Unsupported("space_merge"))
+    }
+
+    /// Completes the merge `space_merge` left in progress: once no file it
+    /// listed still has conflict markers, everything is staged and the
+    /// merge commit written as a checkpoint (`Merged`); otherwise
+    /// `Conflicts` with what is left. A merge concluded in the worktree by
+    /// hand is checkpointed as is; `NotMerging` when it was aborted there.
+    async fn space_merge_finish(
+        &self,
+        worktree: &Path,
+        space: &str,
+        tip: &Sha,
+        message: &str,
+    ) -> GitResult<SpaceMerge> {
+        let _ = (worktree, space, tip, message);
+        Err(GitError::Unsupported("space_merge_finish"))
+    }
+
+    /// Abandons an update from base: `merge --abort`, then the worktree
+    /// and `refs/theodore/spaces/<space>` back at checkpoint `to`.
+    async fn space_merge_abort(&self, worktree: &Path, space: &str, to: &Sha) -> GitResult<()> {
+        let _ = (worktree, space, to);
+        Err(GitError::Unsupported("space_merge_abort"))
+    }
 
     /// Removes a space's worktree directory. The checkpoint ref stays, so
     /// `space_worktree` can bring the space back. A directory that isn't
@@ -586,8 +625,25 @@ pub struct SpaceCommit {
     /// `parent` has moved on since (someone else pushed to the branch):
     /// only `replay_from..head` is applied on top of `parent`.
     pub replay_from: Option<Sha>,
+    /// The base tip merged into the space since (Update from base): a
+    /// second parent, so the host sees the base merged in and the PR's
+    /// diff stays the change alone. Dropped when `parent` already
+    /// contains it.
+    pub merge_parent: Option<Sha>,
     pub message: String,
     pub author: Identity,
+}
+
+/// What `GitPort::space_merge` / `space_merge_finish` left in a space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpaceMerge {
+    /// The merge is committed; the new checkpoint.
+    Merged(Sha),
+    /// Still in progress: these files have conflicts.
+    Conflicts(Vec<String>),
+    /// No merge in progress any more, and the base isn't in `HEAD`: it
+    /// was aborted in the worktree.
+    NotMerging,
 }
 
 /// Where a space's last shipped (squashed) commit is kept in the cache.

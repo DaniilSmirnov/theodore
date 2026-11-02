@@ -149,6 +149,35 @@ pub struct Space {
     /// when the turn ends.
     #[serde(default)]
     pub progress: Option<crate::SpaceProgress>,
+    /// An Update from base Theodore started and the agent is resolving:
+    /// set while its merge conflicts (docs/spaces.md §6).
+    #[serde(default)]
+    pub updating: Option<SpaceUpdate>,
+}
+
+/// A merge of the base into the space, left in progress on conflicts
+/// (docs/spaces.md §6 "Update from base"). Theodore commits it once the
+/// agent has resolved them; Abort goes back to `from`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct SpaceUpdate {
+    /// The base's tip being merged in; `base_sha` once committed.
+    pub base_tip: Sha,
+    /// The checkpoint the merge started from.
+    pub from: Sha,
+    /// Files with conflicts, as of the last look.
+    #[serde(default)]
+    pub conflicts: Vec<String>,
+    pub started_at: Millis,
+}
+
+/// How far the space's base branch moved on since its `base_sha`, as of
+/// the project's last fetch (`space_base_status`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct SpaceBaseStatus {
+    /// The base branch's tip in Theodore's copy of the repo.
+    pub base_tip: Sha,
+    /// Commits on the base since `base_sha`.
+    pub behind: u32,
 }
 
 /// One agent CLI session a space's turns continue (docs/spaces.md §5
@@ -184,6 +213,10 @@ pub struct SpaceTurn {
     /// `chat_message` ids, undone with it.
     #[serde(default)]
     pub steered: Vec<String>,
+    /// The turn completed an Update from base: the `base_sha` before it,
+    /// which Undo puts back.
+    #[serde(default)]
+    pub base_before: Option<Sha>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]

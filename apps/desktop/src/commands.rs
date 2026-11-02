@@ -824,6 +824,39 @@ pub async fn space_send_feedback(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn space_base_status(
+    op: crate::op::Op,
+    space: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::SpaceBaseStatus, CommandError> {
+    op.run(async move { core.space_base_status(space).await })
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn update_space_from_base(
+    op: crate::op::Op,
+    space: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::Space, CommandError> {
+    op.run(async move { core.update_space_from_base(space).await })
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn abort_space_update(
+    op: crate::op::Op,
+    space: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::Space, CommandError> {
+    op.run(async move { core.abort_space_update(space).await })
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn account_status(
     op: crate::op::Op,
     core: State<'_, Arc<dyn CoreApi>>,

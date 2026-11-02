@@ -27,6 +27,7 @@ pub use process::isolate_from_user_config;
 mod safety;
 mod ship;
 mod space_guard;
+mod space_update;
 mod spaces;
 mod worktree;
 
@@ -488,6 +489,30 @@ impl GitPort for GitCli {
 
     async fn space_snapshot(&self, worktree: &Path) -> GitResult<Sha> {
         self.space_snapshot_op(worktree).await
+    }
+    async fn space_merge(
+        &self,
+        worktree: &Path,
+        space: &str,
+        tip: &Sha,
+        message: &str,
+    ) -> GitResult<theodore_ports::SpaceMerge> {
+        self.space_merge_op(worktree, space, tip, message).await
+    }
+
+    async fn space_merge_finish(
+        &self,
+        worktree: &Path,
+        space: &str,
+        tip: &Sha,
+        message: &str,
+    ) -> GitResult<theodore_ports::SpaceMerge> {
+        self.space_merge_finish_op(worktree, space, tip, message)
+            .await
+    }
+
+    async fn space_merge_abort(&self, worktree: &Path, space: &str, to: &Sha) -> GitResult<()> {
+        self.space_merge_abort_op(worktree, space, to).await
     }
 
     async fn remove_space_worktree(&self, repo: &Path, space: &str) -> GitResult<()> {

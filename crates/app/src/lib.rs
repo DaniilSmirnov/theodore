@@ -60,6 +60,8 @@ mod space_tools_tests;
 #[cfg(test)]
 mod space_turns_tests;
 #[cfg(test)]
+mod space_update_tests;
+#[cfg(test)]
 mod spaces_tests;
 
 pub use agent_defaults::AgentDefaults;

@@ -390,6 +390,12 @@ pub struct FakeGit {
     space_root: Mutex<Option<PathBuf>>,
     /// `(space, to)` of every `space_reset`.
     pub resets: Mutex<Vec<(String, Sha)>>,
+    /// Update from base: what the next `space_merge` / `space_merge_finish`
+    /// calls return, in order (empty: `Merged("merged-<tip>")`), and
+    /// `(call, space, sha)` of each — `merge` / `finish` with the tip,
+    /// `abort` with the checkpoint.
+    merge_results: Mutex<VecDeque<theodore_ports::SpaceMerge>>,
+    pub merge_calls: Mutex<Vec<(&'static str, String, Sha)>>,
     /// Shipping a space: identity, squashed commits, pushes, folder ops.
     pub ship: Mutex<FakeShip>,
     // ── offline (a PR opened from its local copy) ──────────────────────
@@ -499,6 +505,8 @@ impl FakeGit {
             removed_spaces: Mutex::new(Vec::new()),
             space_root: Mutex::new(None),
             resets: Mutex::new(Vec::new()),
+            merge_results: Mutex::new(VecDeque::new()),
+            merge_calls: Mutex::new(Vec::new()),
             ship: Mutex::new(FakeShip {
                 identity: Some(theodore_ports::Identity {
                     name: "Ada Lovelace".into(),
@@ -652,6 +660,34 @@ impl FakeGit {
     /// The next `space_checkpoint` fails with `e`.
     pub fn push_checkpoint_error(&self, e: GitError) {
         self.checkpoint_errors.lock().unwrap().push_back(e);
+    }
+
+    /// The next `space_merge` / `space_merge_finish` returns `r`.
+    pub fn push_merge_result(&self, r: theodore_ports::SpaceMerge) {
+        self.merge_results.lock().unwrap().push_back(r);
+    }
+
+    fn merge_call(&self, call: &'static str, space: &str, sha: &Sha) -> theodore_ports::SpaceMerge {
+        self.merge_calls
+            .lock()
+            .unwrap()
+            .push((call, space.to_string(), sha.clone()));
+        let r = self
+            .merge_results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| {
+                theodore_ports::SpaceMerge::Merged(Sha::new(format!("merged-{sha}")))
+            });
+        if let theodore_ports::SpaceMerge::Merged(head) = &r {
+            self.resolve_refs
+                .lock()
+                .unwrap()
+                .insert(theodore_ports::space_ref(space), head.clone());
+            self.ensure_commit(head, call);
+        }
+        r
     }
 
     /// Space worktrees become real directories under `root`.
@@ -924,6 +960,38 @@ impl GitPort for FakeGit {
             .lock()
             .unwrap()
             .push((space.to_string(), to.clone()));
+        self.resolve_refs
+            .lock()
+            .unwrap()
+            .insert(theodore_ports::space_ref(space), to.clone());
+        Ok(())
+    }
+
+    async fn space_merge(
+        &self,
+        _worktree: &Path,
+        space: &str,
+        tip: &Sha,
+        _message: &str,
+    ) -> GitResult<theodore_ports::SpaceMerge> {
+        Ok(self.merge_call("merge", space, tip))
+    }
+
+    async fn space_merge_finish(
+        &self,
+        _worktree: &Path,
+        space: &str,
+        tip: &Sha,
+        _message: &str,
+    ) -> GitResult<theodore_ports::SpaceMerge> {
+        Ok(self.merge_call("finish", space, tip))
+    }
+
+    async fn space_merge_abort(&self, _worktree: &Path, space: &str, to: &Sha) -> GitResult<()> {
+        self.merge_calls
+            .lock()
+            .unwrap()
+            .push(("abort", space.to_string(), to.clone()));
         self.resolve_refs
             .lock()
             .unwrap()
