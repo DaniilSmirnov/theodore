@@ -32,6 +32,9 @@ pub enum AgentMode {
 pub const REVIEW_TOOLS: &str = "review-tools";
 /// The MCP server name a space turn's tools go under (`mcp__space-tools__*`).
 pub const SPACE_TOOLS: &str = "space-tools";
+/// The tool every Theodore MCP server has for Claude Code's permission
+/// prompts (`--permission-prompt-tool mcp__<server>__approve_tool`).
+pub const APPROVE_TOOL: &str = "approve_tool";
 
 fn review_tools() -> String {
     REVIEW_TOOLS.to_string()

@@ -174,7 +174,8 @@ impl ReviewToolsServer {
             tool_router: Self::review_router()
                 + Self::space_router()
                 + Self::space_agent_router()
-                + Self::code_router(),
+                + Self::code_router()
+                + Self::approve_router(),
         }
     }
 

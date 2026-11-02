@@ -145,7 +145,9 @@ async fn the_goal_runs_as_an_edit_turn_and_ends_in_a_checkpoint() {
     assert_eq!(req.prompt, "Fix the login redirect");
     // A space's agent gets the user's own MCP servers (on by default).
     assert!(req.user_mcp);
-    assert!(req.system.unwrap().contains("never run git push"));
+    let system = req.system.unwrap();
+    assert!(system.contains("never run git push"));
+    assert!(system.contains("The user's own MCP servers"), "{system}");
 
     let chat = transcript(&f, &s.id);
     assert_eq!(chat.len(), 2);

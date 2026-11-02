@@ -8,6 +8,7 @@
 //! `review-tools` or `space-tools`. `bridge` proxies a stdio MCP server to
 //! that endpoint, for agent CLIs without HTTP MCP (docs/plan.md §8.3).
 
+pub mod approve;
 pub mod backend;
 pub mod bridge;
 pub mod server;

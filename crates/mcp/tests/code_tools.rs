@@ -259,26 +259,36 @@ fn fake(hits: usize) -> Arc<FakeCode> {
 
 #[tokio::test]
 async fn code_tools_are_listed_only_when_the_run_has_them() {
+    // Every Theodore server also lists the CLI's permission-prompt tool.
+    const APPROVE: &[&str] = &[theodore_ports::APPROVE_TOOL];
     let handle = server(fake(0)).await;
     for (run, want) in [
-        (review(CodeTools::Off), sorted(&[REVIEW_TOOL_NAMES])),
+        (
+            review(CodeTools::Off),
+            sorted(&[APPROVE, REVIEW_TOOL_NAMES]),
+        ),
         (
             review(CodeTools::Read),
-            sorted(&[REVIEW_TOOL_NAMES, CODE_TOOL_NAMES]),
+            sorted(&[APPROVE, REVIEW_TOOL_NAMES, CODE_TOOL_NAMES]),
         ),
         // A PR run never edits, whatever it was registered with.
         (
             review(CodeTools::Edit),
-            sorted(&[REVIEW_TOOL_NAMES, CODE_TOOL_NAMES]),
+            sorted(&[APPROVE, REVIEW_TOOL_NAMES, CODE_TOOL_NAMES]),
         ),
-        (space(CodeTools::Off), sorted(&[SPACE_TOOL_NAMES])),
+        (space(CodeTools::Off), sorted(&[APPROVE, SPACE_TOOL_NAMES])),
         (
             space(CodeTools::Read),
-            sorted(&[SPACE_TOOL_NAMES, CODE_TOOL_NAMES]),
+            sorted(&[APPROVE, SPACE_TOOL_NAMES, CODE_TOOL_NAMES]),
         ),
         (
             space(CodeTools::Edit),
-            sorted(&[SPACE_TOOL_NAMES, CODE_TOOL_NAMES, CODE_EDIT_TOOL_NAMES]),
+            sorted(&[
+                APPROVE,
+                SPACE_TOOL_NAMES,
+                CODE_TOOL_NAMES,
+                CODE_EDIT_TOOL_NAMES,
+            ]),
         ),
     ] {
         let endpoint = handle.register_run(run.clone());

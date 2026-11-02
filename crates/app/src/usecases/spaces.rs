@@ -462,6 +462,7 @@ impl Core {
                     &space,
                     self.0.deps.tools.is_some(),
                     code,
+                    self.user_mcp_allowed().await,
                 )))
                 .unwrap_or_default(),
             env: self.space_agent_env(&space).await,
@@ -1490,7 +1491,12 @@ pub(crate) const SPACE_TOOLS_PROMPT: &str = "Theodore's space-tools MCP server r
      the user asks; update_progress shows your plan above the user's message box, for \
      work with several steps.";
 
-fn system_prompt(space: &Space, tools: bool, code: CodeTools) -> String {
+/// Told to the agent when its turn has the user's own MCP servers.
+const USER_MCP_PROMPT: &str = "The user's own MCP servers (Linear, GitHub, docs and \
+     the like, as connected in their agent CLI) are available too: use them when the \
+     task points at an issue, a thread or a document there.";
+
+fn system_prompt(space: &Space, tools: bool, code: CodeTools, user_mcp: bool) -> String {
     let mut prompt = base_system_prompt(space);
     if tools {
         prompt.push('\n');
@@ -1499,6 +1505,10 @@ fn system_prompt(space: &Space, tools: bool, code: CodeTools) -> String {
     if let Some(hint) = crate::usecases::code_intel::code_prompt(code) {
         prompt.push('\n');
         prompt.push_str(hint);
+    }
+    if user_mcp {
+        prompt.push('\n');
+        prompt.push_str(USER_MCP_PROMPT);
     }
     prompt
 }

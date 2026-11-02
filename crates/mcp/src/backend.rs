@@ -117,6 +117,10 @@ impl RunContext {
 
     /// Whether this run may list and call `tool`.
     pub fn allows(&self, tool: &str) -> bool {
+        // The CLI's permission prompts, on every server (`crate::approve`).
+        if tool == theodore_ports::APPROVE_TOOL {
+            return true;
+        }
         if CODE_TOOL_NAMES.contains(&tool) {
             return self.code != CodeTools::Off;
         }

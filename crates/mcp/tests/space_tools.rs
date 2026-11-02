@@ -173,6 +173,9 @@ async fn names(client: &RunningService<rmcp::RoleClient, ()>) -> Vec<String> {
         .iter()
         .map(|t| t.name.to_string())
         .collect();
+    // On every server, whatever the run: the CLI's permission prompts.
+    let approve = names.iter().position(|n| n == theodore_ports::APPROVE_TOOL);
+    names.remove(approve.expect("approve_tool listed"));
     names.sort();
     names
 }
@@ -368,5 +371,43 @@ async fn a_plain_review_gets_no_space_tools() {
     assert!(r.is_err());
     assert!(spaces.calls().is_empty());
     drop(client);
+    handle.shutdown().await;
+}
+
+/// Claude Code's permission prompts (issue #83): an MCP tool the run
+/// couldn't pre-approve goes through with its input; built-in tools stay
+/// denied, on both servers.
+#[tokio::test]
+async fn approve_tool_lets_mcp_tools_through_and_denies_the_rest() {
+    let handle = McpServer::start_with_spaces(Arc::new(EmptyReview), FakeSpaces::new(true))
+        .await
+        .unwrap();
+    let review = RunContext::review(RunId::new("r1"), PrId::new("github:o/r#1"), AgentId::Claude);
+    for run in [space_run(), review] {
+        let endpoint = handle.register_run(run);
+        let client = connect(&endpoint.url, &endpoint.token).await;
+        let ask = |tool: &str| json!({ "tool_name": tool, "input": { "id": "ENG-1" }, "tool_use_id": "toolu_1" });
+        let allowed = json_of(
+            &call(
+                &client,
+                "approve_tool",
+                ask("mcp__claude_ai_Linear__get_issue"),
+            )
+            .await,
+        );
+        assert_eq!(
+            allowed,
+            json!({ "behavior": "allow", "updatedInput": { "id": "ENG-1" } }),
+            "{}",
+            endpoint.name
+        );
+        for tool in ["Bash", "Edit", "Write"] {
+            let denied = json_of(&call(&client, "approve_tool", ask(tool)).await);
+            assert_eq!(denied["behavior"], "deny", "{tool} on {}", endpoint.name);
+            assert!(denied["message"].is_string());
+            assert!(denied.get("updatedInput").is_none());
+        }
+        drop(client);
+    }
     handle.shutdown().await;
 }
