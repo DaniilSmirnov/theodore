@@ -36,10 +36,34 @@
 #                repo instead, and if that's missing too, skips packaging a
 #                tags query for that language (symbols/refs just aren't
 #                available yet, nothing fails).
+#   tags_query_local
+#                path to one of our own queries, relative to *this* repo's
+#                root (not the grammar's checkout) — e.g.
+#                "crates/code-intel-toolchain/queries/rust-tags.scm". Unlike
+#                the automatic per-language fallback above (which only
+#                kicks in when `tags_query` is absent), this key always
+#                applies when set, on top of whatever `tags_query` names.
+#   tags_query_local_mode
+#                "replace" (default) or "append" — whether
+#                `tags_query_local`'s content stands in for `tags_query`'s,
+#                or is concatenated after it (upstream's patterns still
+#                run, ours run in addition — tree-sitter-tags unions every
+#                pattern in a `tags.scm`, so this just needs the bytes of
+#                both files, in order). Ignored without `tags_query_local`.
+#                A package with several languages applies the same
+#                tags_query_local / mode to all of them (matching how
+#                `tags_query` is already shared, e.g. typescript + tsx).
 #
 # No tags query upstream, falls back to our own
-# (crates/code-intel-toolchain/queries/<id>-tags.scm — not written yet):
-#   json, yaml, toml, bash, markdown, markdown_inline.
+# (crates/code-intel-toolchain/queries/<id>-tags.scm):
+#   json, yaml, toml, bash, markdown. markdown_inline has no definitions or
+#   references of its own (it's emphasis/links inside a block markdown
+#   already tagged) and is skipped — no markdown_inline-tags.scm.
+#
+# The release tag (below, GRAMMARS_RELEASE_TAG) is content-addressed from
+# this file's bytes *and* every file under crates/code-intel-toolchain/
+# queries/ — editing a query here, with no other change, still produces a
+# new tag, so CI publishes new tags.scm assets under it.
 #
 # tree-sitter-swift pins the `-with-generated-files` tag, not the plain
 # release tag: alex-pinkus/tree-sitter-swift does not commit the generated
@@ -55,6 +79,14 @@ tag = "v0.24.2"
 rev = "77a3747266f4d621d0757825e6b11edcbf991ca5"
 version = "0.24.2"
 tags_query = "queries/tags.scm"
+# Upstream's query misses scoped calls (`Foo::new()`) and impl containers
+# whose trait/type is scoped or generic (`impl fmt::Display for X`,
+# `impl Foo<T> for X`, `impl Foo<T> { .. }`) — see the comment at the top
+# of rust-tags.scm. Appended, not a replacement: upstream's definitions
+# (struct/enum/fn/trait/mod/macro) and its plain calls and impls are still
+# good and there is no reason to duplicate them by hand.
+tags_query_local = "crates/code-intel-toolchain/queries/rust-tags.scm"
+tags_query_local_mode = "append"
 
 [[grammar.languages]]
 id = "rust"
@@ -166,7 +198,7 @@ tag = "v0.24.8"
 rev = "ee35a6ebefcef0c5c416c0d1ccec7370cfca5a24"
 version = "0.24.8"
 # No tags.scm upstream (JSON has no defs/refs to speak of): falls back to
-# crates/code-intel-toolchain/queries/json-tags.scm, not written yet.
+# crates/code-intel-toolchain/queries/json-tags.scm (top-level object keys).
 
 [[grammar.languages]]
 id = "json"
@@ -179,8 +211,9 @@ repo = "https://github.com/tree-sitter-grammars/tree-sitter-yaml.git"
 tag = "v0.7.2"
 rev = "7708026449bed86239b1cd5bce6e3c34dbca6415"
 version = "0.7.2"
-# No tags.scm upstream: crates/code-intel-toolchain/queries/yaml-tags.scm,
-# not written yet.
+# No tags.scm upstream: falls back to
+# crates/code-intel-toolchain/queries/yaml-tags.scm (mapping keys, top two
+# levels).
 
 [[grammar.languages]]
 id = "yaml"
@@ -193,8 +226,8 @@ repo = "https://github.com/tree-sitter-grammars/tree-sitter-toml.git"
 tag = "v0.7.0"
 rev = "64b56832c2cffe41758f28e05c756a3a98d16f41"
 version = "0.7.0"
-# No tags.scm upstream: crates/code-intel-toolchain/queries/toml-tags.scm,
-# not written yet.
+# No tags.scm upstream: falls back to
+# crates/code-intel-toolchain/queries/toml-tags.scm (tables and keys).
 
 [[grammar.languages]]
 id = "toml"
@@ -207,8 +240,10 @@ repo = "https://github.com/tree-sitter-grammars/tree-sitter-markdown.git"
 tag = "v0.5.4"
 rev = "41ff24a6c775492c543b09228aeb98d1cd2b3a0f"
 version = "0.5.4"
-# No tags.scm in either sub-grammar upstream: crates/code-intel-toolchain/
-# queries/markdown-tags.scm and markdown_inline-tags.scm, not written yet.
+# No tags.scm in either sub-grammar upstream. markdown falls back to
+# crates/code-intel-toolchain/queries/markdown-tags.scm (ATX/setext
+# headings); markdown_inline has nothing to tag and is skipped on purpose
+# — no markdown_inline-tags.scm file, see grammars.toml's header comment.
 
 [[grammar.languages]]
 id = "markdown"
@@ -226,8 +261,9 @@ repo = "https://github.com/tree-sitter/tree-sitter-bash.git"
 tag = "v0.25.1"
 rev = "a06c2e4415e9bc0346c6b86d401879ffb44058f7"
 version = "0.25.1"
-# No tags.scm upstream: crates/code-intel-toolchain/queries/bash-tags.scm,
-# not written yet.
+# No tags.scm upstream: falls back to
+# crates/code-intel-toolchain/queries/bash-tags.scm (function definitions,
+# command calls as references).
 
 [[grammar.languages]]
 id = "bash"

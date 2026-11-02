@@ -181,7 +181,21 @@ grammars.toml (repo, commit) ─▶ cc parser.c + scanner.c ─▶ arm64
   (and `lipo` for a universal file).
 - One CI job builds every grammar from a pinned list. A new language is one
   line in `grammars.toml`.
-- The tags query (`tags.scm`, defs and refs) ships next to its dylib.
+- The tags query (`tags.scm`, defs and refs) ships next to its dylib. Most
+  come from upstream; a few languages ship none (json, yaml, toml, bash,
+  markdown — `markdown_inline` has nothing of its own to tag and stays
+  without one on purpose), so `scripts/build-grammars.sh` falls back to our
+  own, hand-written against that language's own node types:
+  `crates/code-intel-toolchain/queries/<id>-tags.scm`. A grammar can also
+  name one of these explicitly (`tags_query_local` in `grammars.toml`) to
+  **replace** upstream's query or **append** to it
+  (`tags_query_local_mode`) — rust uses `append` to add scoped calls
+  (`Foo::new()`) and generic/scoped impl containers (`impl Foo<T> for X`,
+  `impl fmt::Display for X`) that upstream's query misses, on top of
+  upstream's own definitions. The release tag CI publishes under
+  (content-addressed from `grammars.toml`) also hashes every file in that
+  queries directory, so editing one of our own queries alone still
+  produces a new release.
 - Loaded with `libloading`. Before use, the grammar's ABI version
   (`ts_language_version`) is checked against the range the linked tree-sitter
   runtime supports; out of range → not loaded, the language has no syntax
