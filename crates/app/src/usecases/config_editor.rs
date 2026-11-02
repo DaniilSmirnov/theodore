@@ -132,7 +132,7 @@ impl Core {
         let merged = config::merge(&ed.with(req.layer, &req.text));
         let repo = self.repo_commands_of(&merged, &project.id).await;
         Ok(ConfigCheck {
-            problems: editor::validate(&req.text),
+            problems: editor::validate_layer(&req.text, req.layer),
             preview: effective(&merged, repo),
         })
     }

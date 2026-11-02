@@ -105,6 +105,9 @@ pub(crate) struct Inner {
     pub review_lock: tokio::sync::Mutex<()>,
     /// `review.auto_skills` runs at all (`Core::set_auto_skills`).
     pub auto_skills: std::sync::atomic::AtomicBool,
+    /// Worktrees open on the code-intelligence port, and the install
+    /// suggestions already made (`usecases::code_intel`).
+    pub code_intel: crate::usecases::code_intel::CodeIntelState,
     /// A space's open terminals (docs/spaces.md "Terminal"), by terminal
     /// id: purely in memory, like `space_rt` — never synced, gone on
     /// restart (the PTYs themselves don't survive one either).
@@ -159,6 +162,7 @@ impl Core {
             config_repos: std::sync::Mutex::new(HashMap::new()),
             review_lock: tokio::sync::Mutex::new(()),
             auto_skills: std::sync::atomic::AtomicBool::new(true),
+            code_intel: Default::default(),
             term_rt: std::sync::Mutex::new(HashMap::new()),
             space_queue: Default::default(),
         });

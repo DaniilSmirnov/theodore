@@ -3,6 +3,7 @@
 pub mod account;
 pub mod agents;
 pub mod attachments;
+pub mod code_intel;
 pub mod config_editor;
 pub mod grouping;
 pub mod host;

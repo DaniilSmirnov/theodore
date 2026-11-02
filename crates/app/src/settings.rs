@@ -215,7 +215,7 @@ impl Core {
         pending == 0
     }
 
-    async fn setting_value_scoped(
+    pub(crate) async fn setting_value_scoped(
         &self,
         key: &str,
         repo_scope: Option<&str>,

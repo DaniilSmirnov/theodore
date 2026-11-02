@@ -399,6 +399,28 @@ pub trait CoreApi: Send + Sync {
     async fn global_config(&self) -> Result<theodore_contract::GlobalConfigInfo, CommandError> {
         Err(not_ready())
     }
+    /// Settings → Languages: each language of a project (docs/code-intel.md §9).
+    async fn code_intel_status(
+        &self,
+        _project: String,
+    ) -> Result<theodore_contract::CodeIntelStatus, CommandError> {
+        Err(not_ready())
+    }
+    /// Downloads a language's grammar and server.
+    async fn code_intel_install(&self, _language: String) -> Result<(), CommandError> {
+        Err(not_ready())
+    }
+    /// Settings → Languages: language servers in reviews / in spaces.
+    async fn code_intel_set_lsp(
+        &self,
+        _req: theodore_contract::CodeIntelLspRequest,
+    ) -> Result<(), CommandError> {
+        Err(not_ready())
+    }
+    /// No to an install suggestion; remembered.
+    async fn code_intel_decline(&self, _language: String) -> Result<(), CommandError> {
+        Err(not_ready())
+    }
     /// Same, created from a commented template when missing.
     async fn ensure_global_config(
         &self,

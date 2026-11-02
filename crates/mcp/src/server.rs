@@ -1,6 +1,7 @@
 //! The `review-tools` / `space-tools` MCP server: a Streamable HTTP endpoint
 //! on `127.0.0.1:<random>`, one bearer token per registered run (plan §8.3,
-//! §9). The token decides the tool set (`RunContext::allows`).
+//! §9). The token decides the tool set (`RunContext::allows`), code tools
+//! included (docs/code-intel.md §7).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -30,11 +31,15 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::backend::{
-    BackendError, NoSpaceTools, ReviewToolsBackend, RunContext, SpaceToolError, SpaceToolsBackend,
+    BackendError, CODE_EDIT_TOOL_NAMES, CodeTools, CodeToolsBackend, NoCodeTools, NoSpaceTools,
+    ReviewToolsBackend, RunContext, SpaceToolError, SpaceToolsBackend, ToolSet,
 };
 use crate::tools::{
-    AddFindingParams, AddFindingResult, BaseFileResult, GetBaseFileParams, GetGroupParams,
-    GroupResult, PrContextResult, ProposePatchParams, ProposePatchResult, ReadLogsParams,
+    AddFindingParams, AddFindingResult, BaseFileResult, CodeAnswerResult, CodeEditResult,
+    CodeStatusResult, DiagnosticItem, DiagnosticsParams, FindSymbolParams, GetBaseFileParams,
+    GetGroupParams, GetSymbolParams, GroupResult, HitItem, InsertAfterSymbolParams, PositionParams,
+    PrContextResult, ProposePatchParams, ProposePatchResult, ReadLogsParams, RenameSymbolParams,
+    ReplaceSymbolBodyParams, SymbolBodyResult, SymbolItem,
 };
 
 /// Live run registrations: bearer token → run context. Shared between the auth
@@ -104,6 +109,15 @@ fn backend_error_result(err: BackendError) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(err.to_string())])
 }
 
+fn code_result<T: serde::Serialize>(
+    result: Result<T, BackendError>,
+) -> Result<CallToolResult, ErrorData> {
+    match result {
+        Ok(v) => Ok(CallToolResult::success(vec![ContentBlock::json(v)?])),
+        Err(err) => Ok(backend_error_result(err)),
+    }
+}
+
 pub(crate) fn space_result<T: serde::Serialize>(
     result: Result<T, SpaceToolError>,
 ) -> Result<CallToolResult, ErrorData> {
@@ -142,16 +156,25 @@ fn request_run(context: &RequestContext<RoleServer>) -> Option<RunContext> {
 pub(crate) struct ReviewToolsServer {
     backend: Arc<dyn ReviewToolsBackend>,
     pub(crate) spaces: Arc<dyn SpaceToolsBackend>,
+    code: Arc<dyn CodeToolsBackend>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router(router = review_router)]
 impl ReviewToolsServer {
-    fn new(backend: Arc<dyn ReviewToolsBackend>, spaces: Arc<dyn SpaceToolsBackend>) -> Self {
+    fn new(
+        backend: Arc<dyn ReviewToolsBackend>,
+        spaces: Arc<dyn SpaceToolsBackend>,
+        code: Arc<dyn CodeToolsBackend>,
+    ) -> Self {
         Self {
             backend,
             spaces,
-            tool_router: Self::review_router() + Self::space_router() + Self::space_agent_router(),
+            code,
+            tool_router: Self::review_router()
+                + Self::space_router()
+                + Self::space_agent_router()
+                + Self::code_router(),
         }
     }
 
@@ -324,6 +347,146 @@ impl ReviewToolsServer {
     }
 }
 
+/// Code intelligence (docs/code-intel.md §7): listed only for runs whose
+/// project has it on ([`RunContext::code`]); the edits only on a space
+/// turn that may write.
+#[tool_router(router = code_router)]
+impl ReviewToolsServer {
+    #[tool(
+        description = "Definitions named `name` (exact, case-sensitive), optionally of one kind. Returns file:line with the symbol's kind and container, and `source` (lsp: exact, syntax: by name, text: a search). Prefer this to grepping for code."
+    )]
+    async fn find_symbol(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<FindSymbolParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let run = run_context(&parts)?;
+        let answer = self
+            .code
+            .find_symbol(&run, &p.name, p.kind.map(Into::into))
+            .await;
+        code_result(answer.map(|a| CodeAnswerResult::from_answer(a, SymbolItem::from)))
+    }
+
+    #[tool(
+        description = "The source of one symbol (signature and body) in a file, instead of reading the whole file."
+    )]
+    async fn get_symbol(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<GetSymbolParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let run = run_context(&parts)?;
+        let found = self.code.get_symbol(&run, &p.path, &p.name).await;
+        code_result(found.map(|(s, body)| SymbolBodyResult::new(s, &body)))
+    }
+
+    #[tool(
+        description = "Uses of the symbol at path:line:col (1-based; col in characters): call sites with a line of context, same file first."
+    )]
+    async fn references(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<PositionParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let run = run_context(&parts)?;
+        let answer = self.code.references(&run, &p.path, p.at()).await;
+        code_result(answer.map(|a| CodeAnswerResult::from_answer(a, HitItem::from)))
+    }
+
+    #[tool(
+        description = "Where the symbol at path:line:col (1-based; col in characters) is defined."
+    )]
+    async fn definition(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<PositionParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let run = run_context(&parts)?;
+        let answer = self.code.definition(&run, &p.path, p.at()).await;
+        code_result(answer.map(|a| CodeAnswerResult::from_answer(a, HitItem::from)))
+    }
+
+    #[tool(
+        description = "Errors and warnings from the language server: of one file, or of every file it reported on. Empty with source syntax when no server runs."
+    )]
+    async fn diagnostics(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<DiagnosticsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let run = run_context(&parts)?;
+        let answer = self.code.diagnostics(&run, p.path.as_deref()).await;
+        code_result(answer.map(|a| CodeAnswerResult::from_answer(a, DiagnosticItem::from)))
+    }
+
+    #[tool(
+        description = "Code intelligence per language: grammar, language server (installed, warming, ready) and how much of the worktree is indexed."
+    )]
+    async fn code_status(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let run = run_context(&parts)?;
+        let status = self.code.code_status(&run).await;
+        code_result(status.map(|langs| CodeStatusResult {
+            languages: langs.into_iter().map(Into::into).collect(),
+        }))
+    }
+
+    #[tool(
+        description = "Replace a symbol's whole definition (signature and body) in a file with `body`, without matching old text by hand. Returns the files written."
+    )]
+    async fn replace_symbol_body(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<ReplaceSymbolBodyParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let run = run_context(&parts)?;
+        let done = self
+            .code
+            .replace_symbol_body(&run, &p.path, &p.name, &p.body)
+            .await;
+        code_result(done.map(CodeEditResult::from))
+    }
+
+    #[tool(
+        description = "Insert `text` on the line after a symbol's definition (a new function after another, a new method in an impl). Returns the files written."
+    )]
+    async fn insert_after_symbol(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<InsertAfterSymbolParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let run = run_context(&parts)?;
+        let done = self
+            .code
+            .insert_after_symbol(&run, &p.path, &p.name, &p.text)
+            .await;
+        code_result(done.map(CodeEditResult::from))
+    }
+
+    #[tool(
+        description = "Rename the symbol at path:line:col everywhere it is used, through the language server. Returns the files written."
+    )]
+    async fn rename_symbol(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<RenameSymbolParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let run = run_context(&parts)?;
+        let at = theodore_ports::Position {
+            line: p.line,
+            col: p.col,
+        };
+        let done = self
+            .code
+            .rename_symbol(&run, &p.path, at, &p.new_name)
+            .await;
+        code_result(done.map(CodeEditResult::from))
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ReviewToolsServer {
     fn get_info(&self) -> ServerConfig {
@@ -357,6 +520,19 @@ impl ServerHandler for ReviewToolsServer {
         let run = request_run(&context)
             .ok_or_else(|| ErrorData::internal_error("missing run context", None))?;
         if !run.allows(&request.name) {
+            // A space turn that may not write hears why, instead of a
+            // tool that doesn't exist.
+            if run.tools == ToolSet::Space
+                && run.code == CodeTools::Read
+                && CODE_EDIT_TOOL_NAMES.contains(&request.name.as_ref())
+            {
+                return Ok(CallToolResponse::Complete(CallToolResult::error(vec![
+                    ContentBlock::text(
+                        "code edits are off: this turn is in Ask mode. Ask the user to switch \
+                         the space to Edit",
+                    ),
+                ])));
+            }
             return Err(ErrorData::invalid_params("tool not found", None));
         }
         let tcc = ToolCallContext::new(self, request, context);
@@ -420,9 +596,18 @@ impl McpServer {
         Self::start_with_spaces(backend, Arc::new(NoSpaceTools)).await
     }
 
+    /// Without code intelligence: no run lists the code tools.
     pub async fn start_with_spaces(
         backend: Arc<dyn ReviewToolsBackend>,
         spaces: Arc<dyn SpaceToolsBackend>,
+    ) -> std::io::Result<McpHandle> {
+        Self::start_with_code(backend, spaces, Arc::new(NoCodeTools)).await
+    }
+
+    pub async fn start_with_code(
+        backend: Arc<dyn ReviewToolsBackend>,
+        spaces: Arc<dyn SpaceToolsBackend>,
+        code: Arc<dyn CodeToolsBackend>,
     ) -> std::io::Result<McpHandle> {
         let registry = Arc::new(RunRegistry::default());
         let shutdown = CancellationToken::new();
@@ -435,7 +620,13 @@ impl McpServer {
             StreamableHttpService::new(
                 {
                     let backend = backend.clone();
-                    move || Ok(ReviewToolsServer::new(backend.clone(), spaces.clone()))
+                    move || {
+                        Ok(ReviewToolsServer::new(
+                            backend.clone(),
+                            spaces.clone(),
+                            code.clone(),
+                        ))
+                    }
                 },
                 session_manager,
                 http_config,

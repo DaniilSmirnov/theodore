@@ -1,6 +1,8 @@
 import { autorun } from 'mobx';
 import { describe, expect, it } from 'vitest';
 import type { AppInfo } from '../gen/contract';
+import { setTransport } from '../core/transport';
+import { FakeTransport } from '../test/fakeTransport';
 import { EphemeralStore } from './EphemeralStore';
 
 const APP_INFO: AppInfo = {
@@ -164,6 +166,55 @@ describe('EphemeralStore app info', () => {
     expect(document.documentElement.dataset.build).toBe('staging');
     e.setAppInfo({ ...APP_INFO, build_env: 'production' });
     expect(document.documentElement.dataset.build).toBe('production');
+  });
+});
+
+describe('EphemeralStore code intelligence suggestion', () => {
+  const suggest = {
+    type: 'code_intel_suggest' as const,
+    project: 'github:acme/widget',
+    language: 'cpp',
+    server: 'clangd',
+  };
+
+  it('asks with Download and Not now', () => {
+    const e = new EphemeralStore();
+    e.handle(suggest);
+    expect(e.toasts).toHaveLength(1);
+    expect(e.toasts[0]).toMatchObject({
+      level: 'info',
+      text: 'C++: download clangd for exact references?',
+    });
+    expect(e.toasts[0]!.action?.label).toBe('Download');
+    expect(e.toasts[0]!.secondary?.label).toBe('Not now');
+  });
+
+  it('Download installs, Not now declines, for that language', async () => {
+    const t = new FakeTransport();
+    setTransport(t);
+    t.onCall('code_intel_install', () => null);
+    t.onCall('code_intel_decline', () => null);
+    const e = new EphemeralStore();
+    e.handle(suggest);
+    e.toasts[0]!.action!.onAction();
+    e.toasts[0]!.secondary!.onAction();
+    await Promise.resolve();
+    expect(t.calls).toEqual([
+      { cmd: 'code_intel_install', args: { language: 'cpp' } },
+      { cmd: 'code_intel_decline', args: { language: 'cpp' } },
+    ]);
+  });
+
+  it('a failed install does not throw out of the toast', async () => {
+    const t = new FakeTransport();
+    setTransport(t);
+    t.onCall('code_intel_install', () => {
+      throw { code: 'invalid', message: 'off' };
+    });
+    const e = new EphemeralStore();
+    e.handle(suggest);
+    expect(() => e.toasts[0]!.action!.onAction()).not.toThrow();
+    await new Promise((r) => setTimeout(r, 0));
   });
 });
 

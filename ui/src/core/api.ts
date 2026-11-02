@@ -82,6 +82,8 @@ import type {
   GlobalConfigInfo,
   ConfigDraft,
   CheckConfigRequest,
+  CodeIntelLspRequest,
+  CodeIntelStatus,
   ConfigCheck,
   SaveConfigRequest,
   SaveConfigResult,
@@ -347,6 +349,20 @@ export const api = {
     call<ConfigCheck>('check_config', { req }, true),
   saveConfig: (req: SaveConfigRequest) =>
     call<SaveConfigResult>('save_config', { req }),
+  /** Settings → Languages, polled while something downloads: shown
+   *  inline, never toasted. */
+  codeIntelStatus: (project: string) =>
+    call<CodeIntelStatus>('code_intel_status', { project }, true),
+  /** A language's grammar and server: Settings → Languages → Install, or
+   *  an install suggestion's Download. */
+  codeIntelInstall: (language: string) =>
+    call<null>('code_intel_install', { language }),
+  /** An install suggestion's Not now: not suggested again. */
+  codeIntelDecline: (language: string) =>
+    call<null>('code_intel_decline', { language }),
+  /** Language servers in reviews or in spaces, on or off. */
+  codeIntelSetLsp: (req: CodeIntelLspRequest) =>
+    call<null>('code_intel_set_lsp', { req }),
   globalConfig: () => call<GlobalConfigInfo>('global_config'),
   /** Creates the global config from a template when missing, then opens
    *  it in the default editor. */

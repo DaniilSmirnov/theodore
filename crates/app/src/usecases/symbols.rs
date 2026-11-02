@@ -1,14 +1,23 @@
-//! `find_symbol` (plan "symbols"): go-to-definition / find-references
-//! without a full LSP. Greps the PR head worktree for a whole-word match of
-//! the clicked identifier, classifies each hit as a definition (it matches
-//! one of the language's declaration patterns) or a plain reference, and
-//! ranks definitions and same-language/near-path hits first.
+//! `find_symbol` (plan "symbols"): go-to-definition / find-references.
+//! Asks code intelligence first (docs/code-intel.md) when it is on;
+//! otherwise, or when it answers nothing or fails, greps the PR head
+//! worktree for a whole-word match of the clicked identifier, classifies
+//! each hit as a definition (it matches one of the language's declaration
+//! patterns) or a plain reference, and ranks definitions and
+//! same-language/near-path hits first.
+//!
+//! ```text
+//! click ─▶ code intel on? ─yes─▶ at a position: definition + references
+//!              │                  else: find_symbol + references at the first one
+//!              │                     └─ nothing / error ─┐
+//!              └─no──────────────────────────────────────┴─▶ grep
+//! ```
 
 use std::collections::HashSet;
 use std::path::Path;
 
-use theodore_contract::{FindSymbolRequest, SymbolHit, SymbolKind};
-use theodore_ports::GitPort;
+use theodore_contract::{FindSymbolRequest, SymbolHit, SymbolKind, SymbolSource};
+use theodore_ports::{CodeHit, CodeIntelPort, GitPort, Position, Source};
 
 use crate::core::Core;
 use crate::error::{AppError, AppResult};
@@ -192,6 +201,7 @@ pub(crate) async fn search_symbol(
                         line: h.line,
                         kind: SymbolKind::Definition,
                         preview: h.text.trim().to_string(),
+                        source: Some(SymbolSource::Text),
                     });
                 }
             }
@@ -205,6 +215,7 @@ pub(crate) async fn search_symbol(
                 line: h.line,
                 kind: SymbolKind::Reference,
                 preview: h.text.trim().to_string(),
+                source: Some(SymbolSource::Text),
             });
         }
     }
@@ -263,6 +274,80 @@ fn sort_key(
     )
 }
 
+fn source_of(s: Source) -> SymbolSource {
+    match s {
+        Source::Lsp => SymbolSource::Lsp,
+        Source::Syntax => SymbolSource::Syntax,
+        Source::Text => SymbolSource::Text,
+    }
+}
+
+fn hit_of(h: CodeHit) -> SymbolHit {
+    SymbolHit {
+        path: h.location.path,
+        line: h.location.range.start.line,
+        kind: if h.is_definition {
+            SymbolKind::Definition
+        } else {
+            SymbolKind::Reference
+        },
+        preview: h
+            .preview
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+        source: Some(source_of(h.source)),
+    }
+}
+
+/// The port's answer for a click: at the clicked position when the UI
+/// sent one, else the definitions of the name and the references of the
+/// first. One hit per line, definitions first.
+async fn intel_hits(
+    port: &dyn CodeIntelPort,
+    root: &Path,
+    req: &FindSymbolRequest,
+) -> Result<Vec<SymbolHit>, theodore_ports::CodeIntelError> {
+    let mut hits: Vec<SymbolHit> = Vec::new();
+    match (req.from_path.as_deref(), req.line, req.col) {
+        (Some(path), Some(line), Some(col)) => {
+            let at = Position { line, col };
+            let defs = port.definition(root, path, at).await?;
+            hits.extend(defs.items.into_iter().map(|mut h| {
+                h.is_definition = true;
+                hit_of(h)
+            }));
+            let refs = port.references(root, path, at).await?;
+            hits.extend(refs.items.into_iter().map(hit_of));
+        }
+        _ => {
+            let defs = port.find_symbol(root, &req.name, None).await?;
+            let first = defs.items.first().cloned();
+            hits.extend(defs.items.into_iter().map(|s| {
+                SymbolHit {
+                    path: s.path,
+                    line: s.name_range.start.line,
+                    kind: SymbolKind::Definition,
+                    preview: s
+                        .container
+                        .map(|c| format!("{c} › {}", s.name))
+                        .unwrap_or(s.name),
+                    source: Some(source_of(s.source)),
+                }
+            }));
+            if let Some(s) = first {
+                let refs = port.references(root, &s.path, s.name_range.start).await?;
+                hits.extend(refs.items.into_iter().map(hit_of));
+            }
+        }
+    }
+    let mut seen: HashSet<(String, u32)> = HashSet::new();
+    hits.retain(|h| seen.insert((h.path.clone(), h.line)));
+    Ok(hits)
+}
+
 impl Core {
     /// Go-to-definition / find-references for the identifier under a
     /// ⌘-click in the diff (plan "symbols"). Searches the PR's current head
@@ -284,6 +369,18 @@ impl Core {
             .lang
             .clone()
             .or_else(|| lang_from_path(req.from_path.as_deref()).map(str::to_string));
+
+        if let Some(port) = self.0.deps.code_intel.clone()
+            && self.review_code_tools(&req.pr).await != crate::deps::CodeTools::Off
+        {
+            match intel_hits(&*port, &worktree.path, &req).await {
+                Ok(hits) if !hits.is_empty() => {
+                    return Ok(rank(hits, lang.as_deref(), req.from_path.as_deref()));
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!(error = %e, "code intelligence failed; grepping"),
+            }
+        }
 
         let hits = search_symbol(
             &*self.0.deps.git,
@@ -409,12 +506,14 @@ mod tests {
                 line: 1,
                 kind: SymbolKind::Reference,
                 preview: String::new(),
+                source: None,
             },
             SymbolHit {
                 path: "b.rs".into(),
                 line: 1,
                 kind: SymbolKind::Definition,
                 preview: String::new(),
+                source: None,
             },
         ];
         let ranked = rank(hits, None, None);
@@ -430,24 +529,28 @@ mod tests {
                 line: 1,
                 kind: SymbolKind::Definition,
                 preview: String::new(),
+                source: None,
             },
             SymbolHit {
                 path: "src/app.py".into(),
                 line: 1,
                 kind: SymbolKind::Definition,
                 preview: String::new(),
+                source: None,
             },
             SymbolHit {
                 path: "src/lib.rs".into(),
                 line: 1,
                 kind: SymbolKind::Definition,
                 preview: String::new(),
+                source: None,
             },
             SymbolHit {
                 path: "src/other.rs".into(),
                 line: 1,
                 kind: SymbolKind::Definition,
                 preview: String::new(),
+                source: None,
             },
         ];
         // Clicked from a Rust file under src/: both Rust hits should sort
@@ -467,6 +570,7 @@ mod tests {
                 line: 1,
                 kind: SymbolKind::Reference,
                 preview: String::new(),
+                source: None,
             })
             .collect();
         assert_eq!(rank(hits, None, None).len(), MAX_HITS);

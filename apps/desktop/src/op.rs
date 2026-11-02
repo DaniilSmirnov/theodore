@@ -31,6 +31,7 @@ const CHATTY: &[&str] = &[
     "find_symbol",
     "space_logs",
     "space_config",
+    "code_intel_status",
     "list_spaces",
     "list_skills",
     "space_skills",

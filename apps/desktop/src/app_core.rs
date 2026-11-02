@@ -875,6 +875,24 @@ impl CoreApi for AppCore {
     async fn global_config(&self) -> Result<theodore_contract::GlobalConfigInfo, CommandError> {
         self.core.global_config().await.map_err(err)
     }
+    async fn code_intel_status(
+        &self,
+        project: String,
+    ) -> Result<theodore_contract::CodeIntelStatus, CommandError> {
+        self.core.code_intel_status(&project).await.map_err(err)
+    }
+    async fn code_intel_install(&self, language: String) -> Result<(), CommandError> {
+        self.core.code_intel_install(&language).await.map_err(err)
+    }
+    async fn code_intel_set_lsp(
+        &self,
+        req: theodore_contract::CodeIntelLspRequest,
+    ) -> Result<(), CommandError> {
+        self.core.code_intel_set_lsp(req).await.map_err(err)
+    }
+    async fn code_intel_decline(&self, language: String) -> Result<(), CommandError> {
+        self.core.code_intel_decline(&language).await.map_err(err)
+    }
     async fn ensure_global_config(
         &self,
     ) -> Result<theodore_contract::GlobalConfigInfo, CommandError> {

@@ -29,6 +29,10 @@ theodore-store = { path = "crates/store" }
 theodore-secrets = { path = "crates/secrets" }
 theodore-grouping = { path = "crates/grouping" }
 theodore-telemetry = { path = "crates/telemetry" }
+theodore-code-intel-lsp = { path = "crates/code-intel-lsp" }
+theodore-code-intel-toolchain = { path = "crates/code-intel-toolchain" }
+theodore-code-intel-syntax = { path = "crates/code-intel-syntax" }
+theodore-code-intel = { path = "crates/code-intel" }
 
 # shared
 serde = { version = "1", features = ["derive"] }
@@ -49,6 +53,14 @@ regex = "1"
 url = "2"
 which = "8"
 dirs = "6"
+sha1 = "0.10"
+memchr = "2"
+ignore = "0.4"
+
+# code intelligence: one tree-sitter runtime shared by every grammar and crate
+tree-sitter = "0.27.1"
+tree-sitter-tags = "0.27.1"
+
 
 # types to TS
 specta = { version = "=2.0.0-rc.25", features = ["derive", "serde_json"] }
@@ -65,6 +77,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 rmcp = { version = "3", features = ["server", "transport-streamable-http-server", "transport-io"] }
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
+lsp-types = "0.97"
 
 # tauri (v2 stable line)
 tauri = { version = "2", features = [] }

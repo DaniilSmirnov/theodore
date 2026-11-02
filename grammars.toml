@@ -1,0 +1,235 @@
+# Pinned tree-sitter grammar sources for `scripts/build-grammars.sh`
+# (docs/code-intel.md §4.1).
+#
+# One [[grammar]] per upstream package, one dylib per package. A package
+# with several grammars (e.g. tree-sitter-typescript ships `typescript` and
+# `tsx`) compiles all of them into that one dylib — their parsers and
+# external scanners use distinct `tree_sitter_*` symbol names, so they never
+# collide.
+#
+# Fields:
+#   package      upstream package name, used in the dylib file name
+#   repo         git URL to shallow-fetch
+#   tag          the upstream release tag `rev` was resolved from — for
+#                humans bumping the pin; the build only ever reads `rev`.
+#   rev          full commit sha the tag pointed to when pinned (pin by sha,
+#                not by tag, so a re-tag upstream can't change what we
+#                build). Resolve with `git ls-remote --tags <repo>` and take
+#                the peeled `refs/tags/<tag>^{}` line's sha when one exists
+#                (an annotated tag: that line is the commit, the un-peeled
+#                `refs/tags/<tag>` line is the *tag object*, not a commit) —
+#                or just `git clone --depth 1 --branch <tag> <repo> && git
+#                rev-parse HEAD`, which always resolves to the commit.
+#                `build-grammars.sh` checks this on every run and fails loud
+#                if a pinned rev and its tag ever disagree.
+#   version      display version baked into file names and the manifest
+#                (the tag with no leading "v")
+#   [[grammar.languages]]
+#     id         manifest language id (docs/code-intel.md §3)
+#     symbol     the grammar's exported `TSLanguage *tree_sitter_<symbol>()`
+#     src        directory, relative to the repo root, holding parser.c
+#                (+ scanner.c if present) and tree_sitter/parser.h
+#   tags_query   path to `tags.scm`, relative to the repo root, when the
+#                grammar ships one. Omitted when it doesn't — see "no tags
+#                query" below; the build then looks for
+#                `crates/code-intel-toolchain/queries/<id>-tags.scm` in this
+#                repo instead, and if that's missing too, skips packaging a
+#                tags query for that language (symbols/refs just aren't
+#                available yet, nothing fails).
+#
+# No tags query upstream, falls back to our own
+# (crates/code-intel-toolchain/queries/<id>-tags.scm — not written yet):
+#   json, yaml, toml, bash, markdown, markdown_inline.
+#
+# tree-sitter-swift pins the `-with-generated-files` tag, not the plain
+# release tag: alex-pinkus/tree-sitter-swift does not commit the generated
+# `src/parser.c` on its normal tags (it's `.gitignore`d there and built by
+# `tree-sitter generate` in their CI); the `-with-generated-files` tag is a
+# second tag, at a different commit, with the generated parser committed so
+# consumers like us don't need the tree-sitter CLI or Node to build it.
+
+[[grammar]]
+package = "tree-sitter-rust"
+repo = "https://github.com/tree-sitter/tree-sitter-rust.git"
+tag = "v0.24.2"
+rev = "77a3747266f4d621d0757825e6b11edcbf991ca5"
+version = "0.24.2"
+tags_query = "queries/tags.scm"
+
+[[grammar.languages]]
+id = "rust"
+symbol = "tree_sitter_rust"
+src = "src"
+
+[[grammar]]
+package = "tree-sitter-typescript"
+repo = "https://github.com/tree-sitter/tree-sitter-typescript.git"
+tag = "v0.23.2"
+rev = "f975a621f4e7f532fe322e13c4f79495e0a7b2e7"
+version = "0.23.2"
+# Shared by both languages: written against node types common to the
+# typescript and tsx grammars.
+tags_query = "queries/tags.scm"
+
+[[grammar.languages]]
+id = "typescript"
+symbol = "tree_sitter_typescript"
+src = "typescript/src"
+
+[[grammar.languages]]
+id = "tsx"
+symbol = "tree_sitter_tsx"
+src = "tsx/src"
+
+[[grammar]]
+package = "tree-sitter-javascript"
+repo = "https://github.com/tree-sitter/tree-sitter-javascript.git"
+tag = "v0.25.0"
+rev = "44c892e0be055ac465d5eeddae6d3e194424e7de"
+version = "0.25.0"
+tags_query = "queries/tags.scm"
+
+[[grammar.languages]]
+id = "javascript"
+symbol = "tree_sitter_javascript"
+src = "src"
+
+[[grammar]]
+package = "tree-sitter-python"
+repo = "https://github.com/tree-sitter/tree-sitter-python.git"
+tag = "v0.25.0"
+rev = "293fdc02038ee2bf0e2e206711b69c90ac0d413f"
+version = "0.25.0"
+tags_query = "queries/tags.scm"
+
+[[grammar.languages]]
+id = "python"
+symbol = "tree_sitter_python"
+src = "src"
+
+[[grammar]]
+package = "tree-sitter-go"
+repo = "https://github.com/tree-sitter/tree-sitter-go.git"
+tag = "v0.25.0"
+rev = "1547678a9da59885853f5f5cc8a99cc203fa2e2c"
+version = "0.25.0"
+tags_query = "queries/tags.scm"
+
+[[grammar.languages]]
+id = "go"
+symbol = "tree_sitter_go"
+src = "src"
+
+[[grammar]]
+package = "tree-sitter-c"
+repo = "https://github.com/tree-sitter/tree-sitter-c.git"
+tag = "v0.24.2"
+rev = "b780e47fc780ddc8da13afa35a3f4ed5c157823d"
+version = "0.24.2"
+tags_query = "queries/tags.scm"
+
+[[grammar.languages]]
+id = "c"
+symbol = "tree_sitter_c"
+src = "src"
+
+[[grammar]]
+package = "tree-sitter-cpp"
+repo = "https://github.com/tree-sitter/tree-sitter-cpp.git"
+tag = "v0.23.4"
+rev = "f41e1a044c8a84ea9fa8577fdd2eab92ec96de02"
+version = "0.23.4"
+tags_query = "queries/tags.scm"
+
+[[grammar.languages]]
+id = "cpp"
+symbol = "tree_sitter_cpp"
+src = "src"
+
+[[grammar]]
+package = "tree-sitter-swift"
+repo = "https://github.com/alex-pinkus/tree-sitter-swift.git"
+tag = "0.7.4-with-generated-files"
+rev = "82bb3a533e0801fd2bbaa11dc49676e10bf41948"
+version = "0.7.4"
+tags_query = "queries/tags.scm"
+
+[[grammar.languages]]
+id = "swift"
+symbol = "tree_sitter_swift"
+src = "src"
+
+[[grammar]]
+package = "tree-sitter-json"
+repo = "https://github.com/tree-sitter/tree-sitter-json.git"
+tag = "v0.24.8"
+rev = "ee35a6ebefcef0c5c416c0d1ccec7370cfca5a24"
+version = "0.24.8"
+# No tags.scm upstream (JSON has no defs/refs to speak of): falls back to
+# crates/code-intel-toolchain/queries/json-tags.scm, not written yet.
+
+[[grammar.languages]]
+id = "json"
+symbol = "tree_sitter_json"
+src = "src"
+
+[[grammar]]
+package = "tree-sitter-yaml"
+repo = "https://github.com/tree-sitter-grammars/tree-sitter-yaml.git"
+tag = "v0.7.2"
+rev = "7708026449bed86239b1cd5bce6e3c34dbca6415"
+version = "0.7.2"
+# No tags.scm upstream: crates/code-intel-toolchain/queries/yaml-tags.scm,
+# not written yet.
+
+[[grammar.languages]]
+id = "yaml"
+symbol = "tree_sitter_yaml"
+src = "src"
+
+[[grammar]]
+package = "tree-sitter-toml"
+repo = "https://github.com/tree-sitter-grammars/tree-sitter-toml.git"
+tag = "v0.7.0"
+rev = "64b56832c2cffe41758f28e05c756a3a98d16f41"
+version = "0.7.0"
+# No tags.scm upstream: crates/code-intel-toolchain/queries/toml-tags.scm,
+# not written yet.
+
+[[grammar.languages]]
+id = "toml"
+symbol = "tree_sitter_toml"
+src = "src"
+
+[[grammar]]
+package = "tree-sitter-markdown"
+repo = "https://github.com/tree-sitter-grammars/tree-sitter-markdown.git"
+tag = "v0.5.4"
+rev = "41ff24a6c775492c543b09228aeb98d1cd2b3a0f"
+version = "0.5.4"
+# No tags.scm in either sub-grammar upstream: crates/code-intel-toolchain/
+# queries/markdown-tags.scm and markdown_inline-tags.scm, not written yet.
+
+[[grammar.languages]]
+id = "markdown"
+symbol = "tree_sitter_markdown"
+src = "tree-sitter-markdown/src"
+
+[[grammar.languages]]
+id = "markdown_inline"
+symbol = "tree_sitter_markdown_inline"
+src = "tree-sitter-markdown-inline/src"
+
+[[grammar]]
+package = "tree-sitter-bash"
+repo = "https://github.com/tree-sitter/tree-sitter-bash.git"
+tag = "v0.25.1"
+rev = "a06c2e4415e9bc0346c6b86d401879ffb44058f7"
+version = "0.25.1"
+# No tags.scm upstream: crates/code-intel-toolchain/queries/bash-tags.scm,
+# not written yet.
+
+[[grammar.languages]]
+id = "bash"
+symbol = "tree_sitter_bash"
+src = "src"

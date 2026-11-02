@@ -252,11 +252,17 @@ async fn a_space_turn_gets_space_tools_and_is_told_about_them() {
         name,
         pr,
         space,
+        code,
     } = regs[0].clone();
     assert!(run_id.starts_with(&format!("space:{}:", s.id)), "{run_id}");
     assert_eq!(name, "space-tools");
     assert_eq!(pr, None);
     assert_eq!(space.as_deref(), Some(s.id.as_str()));
+    assert_eq!(
+        code,
+        crate::deps::CodeTools::Off,
+        "no code intelligence wired"
+    );
 
     let req = e.f.agents.last_request().unwrap();
     assert_eq!(
@@ -333,6 +339,7 @@ async fn review_runs_get_the_space_reads_only_on_a_spaces_pr() {
         .core
         .pr_tools("r-other", &other, AgentId::Claude)
         .await
+        .0
         .unwrap();
     assert_eq!(endpoint.name, "review-tools");
     let last = e.f.tools.registered().pop().unwrap();

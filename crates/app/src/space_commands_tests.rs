@@ -31,7 +31,7 @@ pub(crate) async fn wait_until(mut cond: impl FnMut() -> bool) {
 pub(crate) struct Env {
     pub f: Fixtures,
     pub core: Core,
-    _recv: Receivers,
+    pub recv: Receivers,
     pub project: Project,
     folder: tempfile::TempDir,
     _spaces: tempfile::TempDir,
@@ -45,11 +45,16 @@ async fn started() -> Env {
 
 /// `started`, with `tools`: the fake MCP registry wired in.
 pub(crate) async fn start_env(tools: bool) -> Env {
+    start_env_with(|f| if tools { f.deps_with_tools() } else { f.deps() }).await
+}
+
+/// `started` with the deps `deps` picks from the fixtures.
+pub(crate) async fn start_env_with(deps: impl FnOnce(&Fixtures) -> crate::Deps) -> Env {
     let f = fixtures();
     let folder = tempfile::tempdir().unwrap();
     let spaces = tempfile::tempdir().unwrap();
     f.git.set_space_root(spaces.path());
-    let (core, recv) = Core::start(if tools { f.deps_with_tools() } else { f.deps() });
+    let (core, recv) = Core::start(deps(&f));
     tokio::time::sleep(Duration::from_millis(30)).await;
     let project = core
         .add_project(AddProjectRequest {
@@ -77,7 +82,7 @@ pub(crate) async fn start_env(tools: bool) -> Env {
     Env {
         f,
         core,
-        _recv: recv,
+        recv,
         project,
         folder,
         _spaces: spaces,

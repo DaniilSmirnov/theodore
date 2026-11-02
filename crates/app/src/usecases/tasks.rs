@@ -296,7 +296,7 @@ async fn drive_fix_run(
     reject_reason: Option<String>,
     cancel: CancellationToken,
 ) {
-    let mcp = core.pr_tools(&run_id, &task.pr, agent).await;
+    let (mcp, code) = core.pr_tools(&run_id, &task.pr, agent).await;
     let mut prompt = format!(
         "Fix this review task in the pull request.\n\nTitle: {}\n\n{}\n\n\
          Make the necessary code changes directly in this worktree. Do not commit or push.",
@@ -309,7 +309,10 @@ async fn drive_fix_run(
         agent,
         prompt,
         // The repo's `review.instructions` / `review.context`.
-        system: core.review_rules_of(&task.pr).await.with_system(None),
+        system: core
+            .review_rules_of(&task.pr)
+            .await
+            .with_system(crate::usecases::code_intel::code_prompt(code).map(str::to_string)),
         cwd: worktree.clone(),
         mode: AgentMode::Edit,
         mcp: mcp.clone(),

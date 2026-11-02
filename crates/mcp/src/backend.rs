@@ -1,13 +1,15 @@
 //! The backends the MCP server calls into, implemented by `app` (plan
-//! §8.3): `review-tools` over a PR, `space-tools` over a space. Everything
-//! here is scoped by a run context.
+//! §8.3): `review-tools` over a PR, `space-tools` over a space, and the
+//! code tools (docs/code-intel.md §7) in either. Everything here is scoped
+//! by a run context.
 
 use async_trait::async_trait;
 use theodore_domain::{AgentId, Commit, FileStatus, FindingId, Group, Hunk, PrId, RunId, Severity};
 pub use theodore_ports::{
-    AppStatus, BaseChange, CheckOutcome, LogTail, NewReviewComment, ProgressStep,
-    ProgressStepState, ReviewItem, ShipOutcome, ShipToolAction, SpaceCommandName, SpaceDiff,
-    SpaceInfo, SpaceToolError,
+    Answer, AppStatus, BaseChange, CheckOutcome, CodeHit, CodeSymbol, CodeSymbolKind, Diagnostic,
+    LanguageStatus, LogTail, NewReviewComment, Position, ProgressStep, ProgressStepState,
+    ReviewItem, ShipOutcome, ShipToolAction, SpaceCommandName, SpaceDiff, SpaceInfo,
+    SpaceToolError,
 };
 
 /// Which server a run talks to, and so which tools it sees.
@@ -47,6 +49,36 @@ pub const SPACE_TOOL_NAMES: &[&str] = &[
     "update_progress",
 ];
 
+/// The code tools, in both tool sets when the run has them
+/// ([`RunContext::code`]): read-only.
+pub const CODE_TOOL_NAMES: &[&str] = &[
+    "find_symbol",
+    "get_symbol",
+    "references",
+    "definition",
+    "diagnostics",
+    "code_status",
+];
+/// The code edits: `space-tools` only, and only with [`CodeTools::Edit`].
+pub const CODE_EDIT_TOOL_NAMES: &[&str] = &[
+    "replace_symbol_body",
+    "insert_after_symbol",
+    "rename_symbol",
+];
+
+/// Which code tools a run lists (docs/code-intel.md §7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum CodeTools {
+    /// None: code intelligence is off for the run's project or this build.
+    #[default]
+    Off,
+    /// [`CODE_TOOL_NAMES`].
+    Read,
+    /// Plus [`CODE_EDIT_TOOL_NAMES`] on a space turn that may write
+    /// (Edit, Run; never Ask).
+    Edit,
+}
+
 /// Identifies the agent run calling the MCP server: which PR, which agent, which
 /// invocation. One token maps to exactly one `RunContext` (see [`crate::McpHandle::register_run`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -59,6 +91,7 @@ pub struct RunContext {
     /// space whose PR a review run is on.
     pub space: Option<String>,
     pub tools: ToolSet,
+    pub code: CodeTools,
 }
 
 impl RunContext {
@@ -70,6 +103,7 @@ impl RunContext {
             agent,
             space: None,
             tools: ToolSet::Review,
+            code: CodeTools::Off,
         }
     }
 
@@ -83,6 +117,12 @@ impl RunContext {
 
     /// Whether this run may list and call `tool`.
     pub fn allows(&self, tool: &str) -> bool {
+        if CODE_TOOL_NAMES.contains(&tool) {
+            return self.code != CodeTools::Off;
+        }
+        if CODE_EDIT_TOOL_NAMES.contains(&tool) {
+            return self.code_edits();
+        }
         match self.tools {
             ToolSet::Review => {
                 REVIEW_TOOL_NAMES.contains(&tool)
@@ -90,6 +130,11 @@ impl RunContext {
             }
             ToolSet::Space => self.space.is_some() && SPACE_TOOL_NAMES.contains(&tool),
         }
+    }
+
+    /// The code edits: a space turn with [`CodeTools::Edit`].
+    pub fn code_edits(&self) -> bool {
+        self.tools == ToolSet::Space && self.space.is_some() && self.code == CodeTools::Edit
     }
 }
 
@@ -302,4 +347,152 @@ impl SpaceToolsBackend for NoSpaceTools {
 
 fn unavailable() -> SpaceToolError {
     SpaceToolError::Unavailable("spaces are not available here".into())
+}
+
+/// What an edit tool changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeEditOutcome {
+    /// Repo-relative.
+    pub files: Vec<String>,
+    pub edits: usize,
+}
+
+/// What the code tools call into: `app` over `CodeIntelPort`. The worktree
+/// is the run's (its PR's, or its space's), never one the agent names;
+/// edits are refused unless the run's space may write.
+#[async_trait]
+pub trait CodeToolsBackend: Send + Sync {
+    async fn find_symbol(
+        &self,
+        run: &RunContext,
+        name: &str,
+        kind: Option<CodeSymbolKind>,
+    ) -> Result<Answer<CodeSymbol>, BackendError>;
+    /// The symbol and its source text.
+    async fn get_symbol(
+        &self,
+        run: &RunContext,
+        path: &str,
+        name: &str,
+    ) -> Result<(CodeSymbol, String), BackendError>;
+    async fn references(
+        &self,
+        run: &RunContext,
+        path: &str,
+        at: Position,
+    ) -> Result<Answer<CodeHit>, BackendError>;
+    async fn definition(
+        &self,
+        run: &RunContext,
+        path: &str,
+        at: Position,
+    ) -> Result<Answer<CodeHit>, BackendError>;
+    async fn diagnostics(
+        &self,
+        run: &RunContext,
+        path: Option<&str>,
+    ) -> Result<Answer<Diagnostic>, BackendError>;
+    async fn code_status(&self, run: &RunContext) -> Result<Vec<LanguageStatus>, BackendError>;
+    async fn replace_symbol_body(
+        &self,
+        run: &RunContext,
+        path: &str,
+        name: &str,
+        body: &str,
+    ) -> Result<CodeEditOutcome, BackendError>;
+    async fn insert_after_symbol(
+        &self,
+        run: &RunContext,
+        path: &str,
+        name: &str,
+        text: &str,
+    ) -> Result<CodeEditOutcome, BackendError>;
+    async fn rename_symbol(
+        &self,
+        run: &RunContext,
+        path: &str,
+        at: Position,
+        new_name: &str,
+    ) -> Result<CodeEditOutcome, BackendError>;
+}
+
+/// For servers started without code intelligence: every call fails (and
+/// no run lists the tools, [`CodeTools::Off`]).
+pub struct NoCodeTools;
+
+fn code_off() -> BackendError {
+    BackendError::Invalid("code intelligence is off".into())
+}
+
+#[async_trait]
+impl CodeToolsBackend for NoCodeTools {
+    async fn find_symbol(
+        &self,
+        _: &RunContext,
+        _: &str,
+        _: Option<CodeSymbolKind>,
+    ) -> Result<Answer<CodeSymbol>, BackendError> {
+        Err(code_off())
+    }
+    async fn get_symbol(
+        &self,
+        _: &RunContext,
+        _: &str,
+        _: &str,
+    ) -> Result<(CodeSymbol, String), BackendError> {
+        Err(code_off())
+    }
+    async fn references(
+        &self,
+        _: &RunContext,
+        _: &str,
+        _: Position,
+    ) -> Result<Answer<CodeHit>, BackendError> {
+        Err(code_off())
+    }
+    async fn definition(
+        &self,
+        _: &RunContext,
+        _: &str,
+        _: Position,
+    ) -> Result<Answer<CodeHit>, BackendError> {
+        Err(code_off())
+    }
+    async fn diagnostics(
+        &self,
+        _: &RunContext,
+        _: Option<&str>,
+    ) -> Result<Answer<Diagnostic>, BackendError> {
+        Err(code_off())
+    }
+    async fn code_status(&self, _: &RunContext) -> Result<Vec<LanguageStatus>, BackendError> {
+        Err(code_off())
+    }
+    async fn replace_symbol_body(
+        &self,
+        _: &RunContext,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<CodeEditOutcome, BackendError> {
+        Err(code_off())
+    }
+    async fn insert_after_symbol(
+        &self,
+        _: &RunContext,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<CodeEditOutcome, BackendError> {
+        Err(code_off())
+    }
+    async fn rename_symbol(
+        &self,
+        _: &RunContext,
+        _: &str,
+        _: Position,
+        _: &str,
+    ) -> Result<CodeEditOutcome, BackendError> {
+        Err(code_off())
+    }
 }

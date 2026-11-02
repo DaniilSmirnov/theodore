@@ -1,0 +1,32 @@
+[package]
+name = "theodore-code-intel-syntax"
+description = "Code intelligence syntax layer: tree-sitter tags index keyed by git blob sha."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+theodore-ports.workspace = true
+tree-sitter.workspace = true
+tree-sitter-tags.workspace = true
+rusqlite.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+hex.workspace = true
+memchr.workspace = true
+ignore.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-typescript = "0.23"
+tempfile.workspace = true
+pretty_assertions.workspace = true
+
+[lints]
+workspace = true

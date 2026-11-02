@@ -29,6 +29,8 @@ mod account_gate_tests;
 mod account_tests;
 #[cfg(test)]
 mod attachments_tests;
+#[cfg(test)]
+mod code_intel_tests;
 
 #[cfg(test)]
 mod git_integration_tests;
@@ -66,10 +68,11 @@ mod spaces_tests;
 
 pub use agent_defaults::AgentDefaults;
 pub use core::{Core, Receivers};
-pub use deps::{Deps, Grouper, GroupingAgent, OnPartial, RunTools, TokenStatus};
+pub use deps::{CodeTools, Deps, Grouper, GroupingAgent, OnPartial, RunTools, TokenStatus};
 pub use error::{AppError, AppResult, GrouperError};
 pub use snapshot::PrSnapshot;
 pub use usecases::account::{AccountGate, resolve_client_id};
+pub use usecases::code_intel::{CodeEdits, CodeScope, LspPolicy};
 pub use usecases::open_pr::parse_pr_ref;
 pub use usecases::spaces::space_chat_key;
 pub use usecases::telemetry::TelemetrySettings;

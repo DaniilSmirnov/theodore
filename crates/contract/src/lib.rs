@@ -23,6 +23,8 @@ mod pr_state;
 pub use pr_state::*;
 mod symbols;
 pub use symbols::*;
+mod code_intel;
+pub use code_intel::*;
 mod sandbox;
 pub use sandbox::*;
 mod project_state;
@@ -600,6 +602,16 @@ pub enum Ephemeral {
         /// Empty when the host didn't say.
         url: String,
     },
+    /// `code_intel.install: ask` and a language's server is missing
+    /// (docs/code-intel.md §5.1): offer `code_intel_install(language)`,
+    /// or `code_intel_decline(language)`. Once per language per session.
+    CodeIntelSuggest {
+        /// The project whose worktree needs it, when known.
+        project: Option<String>,
+        language: String,
+        /// The server that would be downloaded (`clangd`).
+        server: String,
+    },
     /// Raw PTY output of a space's terminal (docs/spaces.md "Terminal"),
     /// base64 (control sequences and all) so a chunk split mid UTF-8 still
     /// round-trips — `xterm.js`'s own parser tolerates that. `seq` is
@@ -780,6 +792,17 @@ pub fn types() -> specta::Types {
         .register::<LinearIssue>()
         .register::<FindSymbolRequest>()
         .register::<SymbolHit>()
+        .register::<SymbolSource>()
+        .register::<CodeIntelStatus>()
+        .register::<CodeLsp>()
+        .register::<CodeLspToggle>()
+        .register::<CodeIntelLspRequest>()
+        .register::<CodeLspScope>()
+        .register::<CodeInstallPolicy>()
+        .register::<CodeLanguage>()
+        .register::<CodeServer>()
+        .register::<CodeInstall>()
+        .register::<CodeServerState>()
         .register::<StackInfo>()
         .register::<ReactionCount>()
         .register::<DiffSide>()

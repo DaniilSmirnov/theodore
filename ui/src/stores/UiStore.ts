@@ -30,6 +30,8 @@ export type SettingsPage =
   | 'agents'
   | 'integrations'
   | 'projects'
+  /** Code intelligence per project (docs/code-intel.md §9). */
+  | 'languages'
   | 'updates'
   | 'about'
   /** Listed only in sandbox mode (`AppInfo.sandbox`). */

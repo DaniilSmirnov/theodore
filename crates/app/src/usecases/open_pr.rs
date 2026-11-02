@@ -294,6 +294,17 @@ impl Core {
                 .unwrap_or_default();
             tracing::info!(pr = %pr_id.0, files = revision.files.len(), "pr opened");
             theodore_telemetry::product(theodore_telemetry::ProductEvent::PrOpened { host });
+            if self.0.deps.code_intel.is_some() {
+                // Code intelligence starts indexing the head now, so the
+                // first review run or go-to-definition doesn't wait.
+                let (core, entry) = (self.clone(), entry.clone());
+                tokio::spawn(
+                    async move {
+                        core.open_review_code(&entry).await;
+                    }
+                    .in_current_span(),
+                );
+            }
             self.spawn_grouping(pr_id.clone(), head.clone(), revision, detail, entry);
             tokio::spawn(self.run_auto_skills(auto).in_current_span());
         }

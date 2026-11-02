@@ -216,6 +216,7 @@ fn space_run() -> RunContext {
         agent: AgentId::Codex,
         space: Some("s1".into()),
         tools: ToolSet::Space,
+        code: theodore_mcp::CodeTools::Off,
     }
 }
 

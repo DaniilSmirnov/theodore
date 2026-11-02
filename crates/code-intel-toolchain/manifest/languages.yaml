@@ -1,0 +1,144 @@
+# Languages and their language servers (docs/code-intel.md §3). Hand-written,
+# pinned versions. Grammar entries are not here: CI generates them into
+# grammars.json next to this file.
+#
+# servers[]:
+#   detect     alternatives, each an argv; first one that runs wins. A
+#              one-element argv only checks that the program exists.
+#   download   per platform; sha256 is required (an entry without it is
+#              dropped). redirect_hosts: the only hosts the URL may redirect to.
+#   launch     argv; "{bin}" is replaced by the resolved binary.
+#   review_init_options  merged over init_options in a review run (§8). They
+#              narrow what a server runs; they do not make it safe: rust-analyzer
+#              still runs `cargo metadata` (a PR's .cargo/config.toml
+#              `rustc-wrapper`, rust-toolchain.toml), typescript-language-server
+#              loads node_modules/typescript. Hence review runs start servers
+#              only when `code_intel.lsp.review` is on (off by default).
+# languages[]: globs match the file name (`*.rs`, `Dockerfile`); a glob with a
+#   `/` matches the repo-relative path. First language whose glob matches wins.
+#   tags_extends  a language whose tags query is prepended to this one's
+#              (upstream TypeScript tags.scm is written to extend JavaScript's).
+
+servers:
+  - name: rust-analyzer
+    version: "2026-10-26"
+    detect: [["rust-analyzer", "--version"]]
+    download:
+      darwin-arm64:
+        url: https://github.com/rust-lang/rust-analyzer/releases/download/2026-10-26/rust-analyzer-aarch64-apple-darwin.gz
+        sha256: 8fb90cb58f5910d8d8b24ac1a93cca49f053365cbf0eb3c682144ad0a0027dcf
+        size: 14092361
+        format: gz
+        bin: rust-analyzer
+        redirect_hosts: [release-assets.githubusercontent.com, objects.githubusercontent.com]
+      darwin-x64:
+        url: https://github.com/rust-lang/rust-analyzer/releases/download/2026-10-26/rust-analyzer-x86_64-apple-darwin.gz
+        sha256: b3e4904877bcf7013a4a342c449cff1bf0ea0b91d5a1a30ac8df3d32142519c0
+        size: 14821659
+        format: gz
+        bin: rust-analyzer
+        redirect_hosts: [release-assets.githubusercontent.com, objects.githubusercontent.com]
+    launch: ["{bin}"]
+    workspace_folders: true
+    # Build scripts, proc macros and `cargo check` run the project's code.
+    review_init_options:
+      cargo: { buildScripts: { enable: false } }
+      procMacro: { enable: false }
+      checkOnSave: false
+
+  - name: ty
+    version: "0.0.95"
+    detect: [["ty", "--version"]]
+    download:
+      darwin-arm64:
+        url: https://github.com/astral-sh/ty/releases/download/0.0.95/ty-aarch64-apple-darwin.tar.gz
+        sha256: 379d341e8fb12d949e92fa7142f864cde835be5b2c1378d24c264a928c551857
+        size: 13068441
+        format: tar.gz
+        bin: ty-aarch64-apple-darwin/ty
+        redirect_hosts: [release-assets.githubusercontent.com, objects.githubusercontent.com]
+    launch: ["{bin}", "server"]
+    workspace_folders: true
+
+  - name: pyright
+    # `pyright-langserver --version` waits on stdio: only check it exists.
+    detect: [["pyright-langserver"]]
+    launch: ["{bin}", "--stdio"]
+    workspace_folders: true
+    requires: node
+
+  - name: typescript-language-server
+    detect: [["typescript-language-server", "--version"]]
+    launch: ["{bin}", "--stdio"]
+    workspace_folders: true
+    requires: node
+    review_init_options:
+      plugins: []
+      disableAutomaticTypingAcquisition: true
+
+  - name: gopls
+    detect: [["gopls", "version"]]
+    launch: ["{bin}"]
+    workspace_folders: true
+
+  - name: clangd
+    version: "23.1.0"
+    detect: [["clangd", "--version"]]
+    download:
+      darwin-arm64:
+        url: https://github.com/clangd/clangd/releases/download/23.1.0/clangd-mac-23.1.0.zip
+        sha256: 1082e6638223b785ca2daf0939f13afcd0bb95c84ee9a4bbaff4745365159253
+        size: 100060151
+        format: zip
+        bin: clangd_23.1.0/bin/clangd
+        redirect_hosts: [release-assets.githubusercontent.com, objects.githubusercontent.com]
+    launch: ["{bin}"]
+    workspace_folders: false
+
+  - name: sourcekit-lsp
+    # Ships with Xcode / the Swift toolchain; found through `xcrun --find`.
+    detect: [["sourcekit-lsp"]]
+    launch: ["{bin}"]
+    workspace_folders: true
+
+languages:
+  - id: rust
+    globs: ["*.rs"]
+    servers: [rust-analyzer]
+  - id: typescript
+    globs: ["*.ts", "*.mts", "*.cts"]
+    tags_extends: javascript
+    servers: [typescript-language-server]
+  - id: tsx
+    globs: ["*.tsx"]
+    lsp_id: typescriptreact
+    tags_extends: javascript
+    servers: [typescript-language-server]
+  - id: javascript
+    globs: ["*.js", "*.mjs", "*.cjs", "*.jsx"]
+    servers: [typescript-language-server]
+  - id: python
+    globs: ["*.py", "*.pyi"]
+    servers: [ty, pyright]
+  - id: go
+    globs: ["*.go"]
+    servers: [gopls]
+  - id: c
+    globs: ["*.c", "*.h"]
+    servers: [clangd]
+  - id: cpp
+    globs: ["*.cc", "*.cpp", "*.cxx", "*.c++", "*.hh", "*.hpp", "*.hxx", "*.h++", "*.ipp"]
+    servers: [clangd]
+  - id: swift
+    globs: ["*.swift"]
+    servers: [sourcekit-lsp]
+  - id: json
+    globs: ["*.json", "*.jsonc"]
+  - id: yaml
+    globs: ["*.yaml", "*.yml"]
+  - id: toml
+    globs: ["*.toml"]
+  - id: markdown
+    globs: ["*.md", "*.markdown"]
+  - id: dockerfile
+    globs: ["Dockerfile", "Dockerfile.*", "*.dockerfile"]

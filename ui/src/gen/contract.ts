@@ -243,6 +243,82 @@ export type ClientLog = {
 
 export type ClientLogLevel = "error" | "warn" | "info";
 
+/**  Where a grammar or a server stands. */
+export type CodeInstall =
+/**  Not on disk; can be downloaded. */
+{ state: "missing" } | { state: "downloading" } |
+/**  Found on the machine (PATH, rustup, xcrun, …). */
+{ state: "system"; path: string; version: string | null } |
+/**  Downloaded by Theodore. */
+{ state: "installed"; version: string } |
+/**  No download for this platform. */
+{ state: "unavailable" } |
+/**  You said no to the install suggestion. */
+{ state: "declined" } | { state: "failed"; error: string };
+
+/**  `code_intel.install`. */
+export type CodeInstallPolicy = "ask" | "always" | "never";
+
+/**  `code_intel_set_lsp`: Settings → Languages' toggles. */
+export type CodeIntelLspRequest = {
+	scope: CodeLspScope,
+	on: boolean,
+};
+
+/**  `code_intel_status(project)`. */
+export type CodeIntelStatus = {
+	/**  `code_intel.enabled` for the project and a backend in this build. */
+	enabled: boolean,
+	install: CodeInstallPolicy,
+	/**  Where language servers may run (`code_intel.lsp`). */
+	lsp: CodeLsp,
+	/**  Empty when no worktree of the project is open yet. */
+	languages: CodeLanguage[],
+};
+
+/**  One language of a project's worktree. */
+export type CodeLanguage = {
+	/**  A manifest id: `rust`, `typescript`, … */
+	language: string,
+	/**  Files of this language in the worktree. */
+	files: number,
+	grammar: CodeInstall,
+	/**  The server that would serve it, when the manifest has one. */
+	server: CodeServer | null,
+	/**  0–100. */
+	index_percent: number,
+};
+
+/**  `code_intel.lsp.review` and `code_intel.lsp.spaces`. */
+export type CodeLsp = {
+	/**
+	 *  In review runs on PRs. On: a PR's code may run (build scripts,
+	 *  macros), written by whoever opened the PR.
+	 */
+	review: CodeLspToggle,
+	/**  In spaces. */
+	spaces: CodeLspToggle,
+};
+
+export type CodeLspScope = "review" | "spaces";
+
+export type CodeLspToggle = {
+	on: boolean,
+	/**
+	 *  The global or local config file that sets it: the file wins over
+	 *  the toggle until the line is removed. A repo's file never does.
+	 */
+	from_config: string | null,
+};
+
+export type CodeServer = {
+	name: string,
+	install: CodeInstall,
+	state: CodeServerState,
+};
+
+export type CodeServerState = "not_running" | "warming" | "ready" | "failed";
+
 export type CommandError = {
 	code: string,
 	message: string,
@@ -510,6 +586,16 @@ export type Ephemeral = { type: "agent_delta"; run: string; agent: AgentId; text
 /**  Empty when the host didn't say. */
 url: string } |
 /**
+ *  `code_intel.install: ask` and a language's server is missing
+ *  (docs/code-intel.md §5.1): offer `code_intel_install(language)`,
+ *  or `code_intel_decline(language)`. Once per language per session.
+ */
+{ type: "code_intel_suggest";
+/**  The project whose worktree needs it, when known. */
+project: string | null; language: string;
+/**  The server that would be downloaded (`clangd`). */
+server: string } |
+/**
  *  Raw PTY output of a space's terminal (docs/spaces.md "Terminal"),
  *  base64 (control sequences and all) so a chunk split mid UTF-8 still
  *  round-trips — `xterm.js`'s own parser tolerates that. `seq` is
@@ -568,6 +654,12 @@ export type FindSymbolRequest = {
 	lang: string | null,
 	/**  The file the click came from. Hits in it, or near it, rank first. */
 	from_path: string | null,
+	/**
+	 *  Where in `from_path` the click was (1-based line, char column):
+	 *  lets code intelligence resolve the exact symbol instead of the name.
+	 */
+	line?: number | null,
+	col?: number | null,
 };
 
 export type Finding = {
@@ -1784,9 +1876,20 @@ export type SymbolHit = {
 	kind: SymbolKind,
 	/**  The matched source line, trimmed. */
 	preview: string,
+	/**  Who found it; the grep fallback is `Text`. */
+	source?: SymbolSource | null,
 };
 
 export type SymbolKind = "definition" | "reference";
+
+/**  How far to trust a hit (docs/code-intel.md §1). */
+export type SymbolSource =
+/**  A language server: exact. */
+"lsp" |
+/**  tree-sitter: matched by name. */
+"syntax" |
+/**  Whole-word text search. */
+"text";
 
 export type SyncCode = "I" | "U" | "C" | "A" | "D";
 

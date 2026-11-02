@@ -1,0 +1,250 @@
+{
+  "schema": 1,
+  "release_tag": "grammars-1d483ee8dfea",
+  "grammars": [
+    {
+      "package": "tree-sitter-c",
+      "version": "0.24.2",
+      "languages": [
+        {
+          "id": "c",
+          "symbol": "tree_sitter_c",
+          "tags_query": {
+            "url": "https://github.com/JeanIsahakyan/theodore/releases/download/grammars-1d483ee8dfea/tree-sitter-c-0.24.2-c.tags.scm",
+            "sha256": "774ca67cfe23b0e0d1d3a4f01788049a822beb1311feee72b20a595a37be1e28",
+            "redirect_hosts": [
+              "release-assets.githubusercontent.com",
+              "objects.githubusercontent.com"
+            ]
+          }
+        }
+      ],
+      "downloads": {
+        "darwin-arm64": {
+          "url": "https://github.com/JeanIsahakyan/theodore/releases/download/grammars-1d483ee8dfea/tree-sitter-c-0.24.2.dylib",
+          "sha256": "f948621ae10fd057f9500f6626a34e177c0adcdc7550ea5716c4ff6640b21880",
+          "size": 676816,
+          "redirect_hosts": [
+            "release-assets.githubusercontent.com",
+            "objects.githubusercontent.com"
+          ]
+        }
+      }
+    },
+    {
+      "package": "tree-sitter-cpp",
+      "version": "0.23.4",
+      "languages": [
+        {
+          "id": "cpp",
+          "symbol": "tree_sitter_cpp",
+          "tags_query": {
+            "url": "https://github.com/JeanIsahakyan/theodore/releases/download/grammars-1d483ee8dfea/tree-sitter-cpp-0.23.4-cpp.tags.scm",
+            "sha256": "029731ca946e32f919491d9f76c85a50e5deb5ad1934e37fd6849312c0d4a705",
+            "redirect_hosts": [
+              "release-assets.githubusercontent.com",
+              "objects.githubusercontent.com"
+            ]
+          }
+        }
+      ],
+      "downloads": {
+        "darwin-arm64": {
+          "url": "https://github.com/JeanIsahakyan/theodore/releases/download/grammars-1d483ee8dfea/tree-sitter-cpp-0.23.4.dylib",
+          "sha256": "572df906b49d03ce6365f11841789beedae669021dded1c86ea675c171804768",
+          "size": 3486672,
+          "redirect_hosts": [
+            "release-assets.githubusercontent.com",
+            "objects.githubusercontent.com"
+          ]
+        }
+      }
+    },
+    {
+      "package": "tree-sitter-go",
+      "version": "0.25.0",
+      "languages": [
+        {
+          "id": "go",
+          "symbol": "tree_sitter_go",
+          "tags_query": {
+            "url": "https://github.com/JeanIsahakyan/theodore/releases/download/grammars-1d483ee8dfea/tree-sitter-go-0.25.0-go.tags.scm",
+            "sha256": "d1a9b1f678fe0278b85054e2dc56a28ef26aa478b8c88fb2b0dd83cdcdb9db35",
+            "redirect_hosts": [
+              "release-assets.githubusercontent.com",
+              "objects.githubusercontent.com"
+            ]
+          }
+        }
+      ],
+      "downloads": {
+        "darwin-arm64": {
+          "url": "https://github.com/JeanIsahakyan/theodore/releases/download/grammars-1d483ee8dfea/tree-sitter-go-0.25.0.dylib",
+          "sha256": "0f6df7d4fb8d302d3c3f8dadd89091b79c8416e6abaf6a636bf4f257ff94d038",
+          "size": 265952,
+          "redirect_hosts": [
+            "release-assets.githubusercontent.com",
+            "objects.githubusercontent.com"
+          ]
+        }
+      }
+    },
+    {
+      "package": "tree-sitter-javascript",
+      "version": "0.25.0",
+      "languages": [
+        {
+          "id": "javascript",
+          "symbol": "tree_sitter_javascript",
+          "tags_query": {
+            "url": "https://github.com/JeanIsahakyan/theodore/releases/download/grammars-1d483ee8dfea/tree-sitter-javascript-0.25.0-javascript.tags.scm",
+            "sha256": "6ef988cce5a428a15b5460e3ee96f1478705f965fc6e848a91a18bfa6c6f0212",
+            "redirect_hosts": [
+              "release-assets.githubusercontent.com",
+              "objects.githubusercontent.com"
+            ]
+          }
+        }
+      ],
+      "downloads": {
+        "darwin-arm64": {
+          "url": "https://github.com/JeanIsahakyan/theodore/releases/download/grammars-1d483ee8dfea/tree-sitter-javascript-0.25.0.dylib",
+          "sha256": "0a5492ecbe1b44c17c0205b9003dcd598f0381fec9352a0b35f5a572eb6fc81d",
+          "size": 480208,
+          "redirect_hosts": [
+            "release-assets.githubusercontent.com",
+            "objects.githubusercontent.com"
+          ]
+        }
+      }
+    },
+    {
+      "package": "tree-sitter-python",
+      "version": "0.25.0",
+      "languages": [
+        {
+          "id": "python",
+          "symbol": "tree_sitter_python",
+          "tags_query": {
+            "url": "https://github.com/JeanIsahakyan/theodore/releases/download/grammars-1d483ee8dfea/tree-sitter-python-0.25.0-python.tags.scm",
+            "sha256": "d0f3e577878167bfabc30e526e497bce58d1699b9bcabf8ab3a50698efb5ca3e",
+            "redirect_hosts": [
+              "release-assets.githubusercontent.com",
+              "objects.githubusercontent.com"
+            ]
+          }
+        }
+      ],
+      "downloads": {
+        "darwin-arm64": {
+          "url": "https://github.com/JeanIsahakyan/theodore/releases/download/grammars-1d483ee8dfea/tree-sitter-python-0.25.0.dylib",
+          "sha256": "bfc862bcc7561111adf1aeb3c491aa25bbf5ce9d6384d74f79f73418c33bafba",
+          "size": 512736,
+          "redirect_hosts": [
+            "release-assets.githubusercontent.com",
+            "objects.githubusercontent.com"
+          ]
+        }
+      }
+    },
+    {
+      "package": "tree-sitter-rust",
+      "version": "0.24.2",
+      "languages": [
+        {
+          "id": "rust",
+          "symbol": "tree_sitter_rust",
+          "tags_query": {
+            "url": "https://github.com/JeanIsahakyan/theodore/releases/download/grammars-1d483ee8dfea/tree-sitter-rust-0.24.2-rust.tags.scm",
+            "sha256": "f22867fdebde5cb091861c08d34690dc2540f4318068bf81be9f6b0d348ab8c1",
+            "redirect_hosts": [
+              "release-assets.githubusercontent.com",
+              "objects.githubusercontent.com"
+            ]
+          }
+        }
+      ],
+      "downloads": {
+        "darwin-arm64": {
+          "url": "https://github.com/JeanIsahakyan/theodore/releases/download/grammars-1d483ee8dfea/tree-sitter-rust-0.24.2.dylib",
+          "sha256": "7d57a07241d4e25e4e9a70d3ba7f7ebb7be69e2c461484ce1cbaa14967912835",
+          "size": 1170336,
+          "redirect_hosts": [
+            "release-assets.githubusercontent.com",
+            "objects.githubusercontent.com"
+          ]
+        }
+      }
+    },
+    {
+      "package": "tree-sitter-swift",
+      "version": "0.7.4",
+      "languages": [
+        {
+          "id": "swift",
+          "symbol": "tree_sitter_swift",
+          "tags_query": {
+            "url": "https://github.com/JeanIsahakyan/theodore/releases/download/grammars-1d483ee8dfea/tree-sitter-swift-0.7.4-swift.tags.scm",
+            "sha256": "6d3884e3f785d621128356a23ac81dfc438d9a853b8ee24b8070dc2caaf631ca",
+            "redirect_hosts": [
+              "release-assets.githubusercontent.com",
+              "objects.githubusercontent.com"
+            ]
+          }
+        }
+      ],
+      "downloads": {
+        "darwin-arm64": {
+          "url": "https://github.com/JeanIsahakyan/theodore/releases/download/grammars-1d483ee8dfea/tree-sitter-swift-0.7.4.dylib",
+          "sha256": "997dd3849cce1dbada2a514439806dbc5391b71f7fce39533144f6c1b632db55",
+          "size": 4244464,
+          "redirect_hosts": [
+            "release-assets.githubusercontent.com",
+            "objects.githubusercontent.com"
+          ]
+        }
+      }
+    },
+    {
+      "package": "tree-sitter-typescript",
+      "version": "0.23.2",
+      "languages": [
+        {
+          "id": "tsx",
+          "symbol": "tree_sitter_tsx",
+          "tags_query": {
+            "url": "https://github.com/JeanIsahakyan/theodore/releases/download/grammars-1d483ee8dfea/tree-sitter-typescript-0.23.2-tsx.tags.scm",
+            "sha256": "b391288bcc71b513a5df7c9bb232d8bc7418d7e274b125aa0aa4bdd6121a0338",
+            "redirect_hosts": [
+              "release-assets.githubusercontent.com",
+              "objects.githubusercontent.com"
+            ]
+          }
+        },
+        {
+          "id": "typescript",
+          "symbol": "tree_sitter_typescript",
+          "tags_query": {
+            "url": "https://github.com/JeanIsahakyan/theodore/releases/download/grammars-1d483ee8dfea/tree-sitter-typescript-0.23.2-typescript.tags.scm",
+            "sha256": "b391288bcc71b513a5df7c9bb232d8bc7418d7e274b125aa0aa4bdd6121a0338",
+            "redirect_hosts": [
+              "release-assets.githubusercontent.com",
+              "objects.githubusercontent.com"
+            ]
+          }
+        }
+      ],
+      "downloads": {
+        "darwin-arm64": {
+          "url": "https://github.com/JeanIsahakyan/theodore/releases/download/grammars-1d483ee8dfea/tree-sitter-typescript-0.23.2.dylib",
+          "sha256": "f2d48aa67a00e8be1edbc5969a948aa366e6a5049a61e5bae071f68933975f69",
+          "size": 2911568,
+          "redirect_hosts": [
+            "release-assets.githubusercontent.com",
+            "objects.githubusercontent.com"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -15,6 +15,7 @@ use tracing::Instrument as _;
 use crate::core::{Core, RunHandle};
 use crate::error::{AppError, AppResult};
 use crate::usecases::attachments::{agent_attachments, with_attachments};
+use crate::usecases::code_intel::code_prompt;
 use crate::usecases::live::LiveRun;
 
 impl Core {
@@ -393,7 +394,7 @@ async fn drive_skill_run(
     // The user's own MCP servers are for spaces only (issue #16).
     let user_mcp = false;
     // The repo's `review.instructions` / `review.context`.
-    let system = core.review_rules_of(&pr).await.with_system(None);
+    let rules = core.review_rules_of(&pr).await;
     let started = std::time::Instant::now();
     let findings_before = count_findings(core, &pr, &skill).await;
     let agent_count = agents.len() as u32;
@@ -405,11 +406,11 @@ async fn drive_skill_run(
         if cancel.is_cancelled() {
             break;
         }
-        let mcp = core.pr_tools(&run_id, &pr, agent).await;
+        let (mcp, code) = core.pr_tools(&run_id, &pr, agent).await;
         let req = AgentRequest {
             agent,
             prompt: skill_prompt(&skill, agent, &cwd, &core.0.deps.claude_home),
-            system: system.clone(),
+            system: rules.with_system(code_prompt(code).map(str::to_string)),
             cwd: cwd.clone(),
             mode: AgentMode::ReadOnly,
             mcp: mcp.clone(),
@@ -632,6 +633,15 @@ pub(crate) fn tool_log_line(name: &str) -> String {
         "get_base_file" => "read a file before the change",
         "add_finding" => "add a finding",
         "propose_patch" => "propose a fix",
+        "find_symbol" => "find a symbol",
+        "get_symbol" => "read a symbol",
+        "references" => "find references",
+        "definition" => "go to definition",
+        "diagnostics" => "read diagnostics",
+        "code_status" => "code intelligence status",
+        "replace_symbol_body" => "replace a symbol",
+        "insert_after_symbol" => "insert after a symbol",
+        "rename_symbol" => "rename a symbol",
         _ => name,
     };
     format!("tool: {label}")
@@ -711,11 +721,14 @@ async fn drive_ask(
     cwd: PathBuf,
     cancel: CancellationToken,
 ) {
-    let mcp = core.pr_tools(&run_id, &pr, agent).await;
+    let (mcp, code) = core.pr_tools(&run_id, &pr, agent).await;
     let system = core
         .review_rules_of(&pr)
         .await
-        .with_system(Some(ASK_SYSTEM.into()));
+        .with_system(Some(match code_prompt(code) {
+            Some(hint) => format!("{ASK_SYSTEM}\n{hint}"),
+            None => ASK_SYSTEM.into(),
+        }));
     let req = AgentRequest {
         agent,
         prompt: question.prompt,

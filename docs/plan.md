@@ -1092,7 +1092,7 @@ M0 scaffold ─▶ M1 grouping spike ─▶ M2 core + sync + UI ─▶ M3 GitHub
 
 Total: ~11–14 sessions to v1 on GitHub, +1 for GitLab, +1 for Bitbucket.
 
-Later: LSP go-to-definition, Linear integration, merge queue UI, org settings
+Later: code intelligence — symbols, references, LSP diagnostics (`docs/code-intel.md`), Linear integration, merge queue UI, org settings
 via repo file, Windows/Linux, accounts and billing, uploading problem reports.
 
 Spaces — the stage before a pull request, where an agent writes the change in

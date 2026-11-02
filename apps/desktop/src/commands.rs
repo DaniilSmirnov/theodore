@@ -1110,6 +1110,57 @@ pub async fn project_config(
         .await
 }
 
+/// Settings → Languages: each language of a project, its grammar, server
+/// and index progress (docs/code-intel.md §9).
+#[tauri::command]
+#[specta::specta]
+pub async fn code_intel_status(
+    op: crate::op::Op,
+    project: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::CodeIntelStatus, CommandError> {
+    op.run(async move { core.code_intel_status(project).await })
+        .await
+}
+
+/// Downloads a language's grammar and server (an install suggestion's
+/// Yes, or Settings → Languages → Install).
+#[tauri::command]
+#[specta::specta]
+pub async fn code_intel_install(
+    op: crate::op::Op,
+    language: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<(), CommandError> {
+    op.run(async move { core.code_intel_install(language).await })
+        .await
+}
+
+/// Settings → Languages: language servers in reviews (a PR's code may
+/// run) or in spaces, on or off. A global or local config file wins.
+#[tauri::command]
+#[specta::specta]
+pub async fn code_intel_set_lsp(
+    op: crate::op::Op,
+    req: theodore_contract::CodeIntelLspRequest,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<(), CommandError> {
+    op.run(async move { core.code_intel_set_lsp(req).await })
+        .await
+}
+
+/// An install suggestion's No: not suggested again.
+#[tauri::command]
+#[specta::specta]
+pub async fn code_intel_decline(
+    op: crate::op::Op,
+    language: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<(), CommandError> {
+    op.run(async move { core.code_intel_decline(language).await })
+        .await
+}
+
 /// Settings → Projects → Config: each layer's file and YAML generated from
 /// the project's settings.
 #[tauri::command]

@@ -246,6 +246,49 @@ archive ─▶ stop run ─▶ checkpoint ─▶ archive ─▶ remove worktree 
 - **Archive** failing is a warning; the space is archived anyway. Unarchive
   reserves fresh ports.
 
+## 2b. `code_intel:`
+
+Symbols, references and diagnostics for agents and the diff
+(docs/code-intel.md).
+
+```yaml
+code_intel:
+  enabled: true              # off: no index, no servers, no tools
+  install: ask               # ask | always | never: language servers
+  languages: [typescript, rust]   # empty: detected
+  servers: { python: pyright }    # preferred server per language
+  max_servers: 4
+  idle_minutes: 10
+  max_file_kb: 1024
+  lsp:                       # your global / local file only
+    spaces: true
+    review: false            # true: a PR's code may run during reviews
+```
+
+| Key | Default | Does |
+| --- | --- | --- |
+| `enabled` | `true` | off: no worktree is indexed and no run gets the code tools |
+| `install` | `ask` | `ask`: a toast offers each missing server once per session, a No is remembered; `always`: downloaded; `never`: only servers already installed. Grammars are downloaded either way |
+| `languages` | `[]` | only these; empty: detected from the repo's files |
+| `servers.<language>` | — | the server preferred over the manifest's order |
+| `max_servers` | `4` | language servers alive at once |
+| `idle_minutes` | `10` | an idle server is shut down after this |
+| `max_file_kb` | `1024` | larger files are not indexed |
+| `lsp.spaces` | `true` | language servers serve your spaces (an untrusted space only with `lsp.review` too) |
+| `lsp.review` | `false` | language servers serve review runs on PRs. **A PR's code may run** (build scripts, macros, plugins), written by whoever opened the PR |
+
+- `lsp.*` is honoured only from your global and local files. A repo's file
+  setting it is ignored, with a toast, and the editor warns on that line:
+  a repo turning servers on for reviews of its own PRs would run their
+  authors' code. Unset, the Settings → Languages toggles apply.
+
+- Read like the rest of the repo layer: at the base, never at a PR's head,
+  so a PR can't change what gets downloaded or run.
+- Trust (docs/code-intel.md §8): a review's worktree is always served
+  read-only (no build scripts, no proc macros). A space's is trusted once
+  nothing from the repo layer waits for Allow (§5); "Not now" keeps it
+  read-only.
+
 ## 3. `copy`
 
 Each entry is a path relative to the project's folder: a file, a directory
@@ -380,6 +423,12 @@ ship ─▶ same turn? ─no──▶ error: the agent is still working
   the agent's own comments are findings of skill `space-agent`.
 - **`set_base`** refuses an unknown branch, the space's own branch, an
   archived space, or a space another run holds.
+
+**Code tools.** With code intelligence on for the project (§2b), both
+`review-tools` and `space-tools` also list `find_symbol`, `get_symbol`,
+`references`, `definition`, `diagnostics` and `code_status`; a space turn
+in Edit or Run mode also gets `replace_symbol_body`, `insert_after_symbol`
+and `rename_symbol` (refused in Ask mode). Off, they aren't listed.
 
 Your own MCP servers come along unless you turn them off: with Settings →
 Agents → **Allow my Claude MCP servers in spaces** on (the default),

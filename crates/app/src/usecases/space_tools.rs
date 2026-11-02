@@ -22,6 +22,7 @@ use theodore_ports::{
 };
 
 use crate::core::Core;
+use crate::deps::CodeTools;
 use crate::usecases::space_commands::{STOP_WAIT, SpaceConfig, describe_failure, kind_name};
 
 fn kind_of(name: SpaceCommandName) -> SpaceCommandKind {
@@ -232,15 +233,23 @@ impl Core {
     }
 
     /// `review-tools` for a PR run, with the read-only space tools when
-    /// the PR is a space's. `None` without an MCP server.
+    /// the PR is a space's and the read-only code tools when code
+    /// intelligence is on for it (its worktree is opened here). `None`
+    /// without an MCP server.
     pub(crate) async fn pr_tools(
         &self,
         run_id: &str,
         pr: &PrId,
         agent: AgentId,
-    ) -> Option<McpEndpoint> {
-        let tools = self.0.deps.tools.as_ref()?;
+    ) -> (Option<McpEndpoint>, CodeTools) {
+        let Some(tools) = self.0.deps.tools.as_ref() else {
+            return (None, CodeTools::Off);
+        };
         let space = self.space_of_pr(pr).await;
-        Some(tools.register(run_id, pr, agent, space.as_deref()))
+        let code = self.review_code_tools(pr).await;
+        (
+            Some(tools.register(run_id, pr, agent, space.as_deref(), code)),
+            code,
+        )
     }
 }

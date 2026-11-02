@@ -168,6 +168,7 @@ Read the doc before changing its area; keep it true when the change lands.
 | Logs, error codes, New Relic, PostHog | `docs/telemetry.md` | `crates/telemetry` |
 | Simulated host for demos and QA | `docs/sandbox.md` | `crates/sandbox`, `crates/fixtures` |
 | Grouping quality and speed evals | `docs/grouping-eval.md`, `docs/eval/` | `crates/grouping`, `apps/cli` (`theodore eval`) |
+| Code intelligence: symbols, LSP, grammars (design) | `docs/code-intel.md` | `crates/code-intel` (planned) |
 
 Code layout:
 

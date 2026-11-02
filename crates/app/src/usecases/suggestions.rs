@@ -150,19 +150,17 @@ fn check_no_overlap(edits: &[SuggestionEdit]) -> AppResult<()> {
 /// - a symlink inside the worktree that resolves outside it, which
 ///   neither of those checks catches — caught by canonicalizing both
 ///   sides and requiring the result to stay under the worktree.
-async fn safe_join(worktree: &Path, path: &str) -> AppResult<PathBuf> {
+pub(crate) async fn safe_join(worktree: &Path, path: &str) -> AppResult<PathBuf> {
     let rel = Path::new(path);
     if rel.is_absolute() {
-        return Err(AppError::Invalid(format!(
-            "suggestion path must be relative: {path}"
-        )));
+        return Err(AppError::Invalid(format!("path must be relative: {path}")));
     }
     if rel
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         return Err(AppError::Invalid(format!(
-            "suggestion path must not contain ..: {path}"
+            "path must not contain ..: {path}"
         )));
     }
     let canon_worktree = tokio::fs::canonicalize(worktree)
@@ -173,7 +171,7 @@ async fn safe_join(worktree: &Path, path: &str) -> AppResult<PathBuf> {
         .map_err(|e| AppError::Invalid(format!("resolving {path}: {e}")))?;
     if !canon_joined.starts_with(&canon_worktree) {
         return Err(AppError::Invalid(format!(
-            "suggestion path escapes the worktree: {path}"
+            "path escapes the worktree: {path}"
         )));
     }
     Ok(canon_joined)

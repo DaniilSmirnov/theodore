@@ -3,6 +3,7 @@ import { ThemePicker } from './ThemePicker';
 import {
   ArrowLeft,
   ArrowRotateRight,
+  CurlyBrackets,
   ChevronRight,
   CircleCheckFill,
   CircleInfo,
@@ -77,6 +78,7 @@ import { isLabsVisible } from './space/mode';
 import { LabsPage } from './space/SpacePage';
 import { isHostOn, isLinearOn } from './settings/labs';
 import { LabsPage as ExperimentsPage } from './settings/LabsPage';
+import { LanguagesPage } from './settings/LanguagesPage';
 
 const AGENTS: AgentId[] = ['claude', 'codex', 'gemini'];
 const AI_KEYS = ['agents.grouping', 'agents.chat', 'agents.fix'] as const;
@@ -93,6 +95,7 @@ const PAGES: { id: Page; title: string; icon: ReactNode }[] = [
   { id: 'agents', title: 'Agents', icon: <Cpu /> },
   { id: 'integrations', title: 'Integrations', icon: <PlugConnection /> },
   { id: 'projects', title: 'Projects', icon: <Folder /> },
+  { id: 'languages', title: 'Languages', icon: <CurlyBrackets /> },
   { id: 'about', title: 'About & updates', icon: <CircleInfo /> },
   { id: 'sandbox', title: 'Sandbox', icon: <Cubes3 /> },
   { id: 'labs', title: 'Spaces', icon: <Sparkles /> },
@@ -106,6 +109,8 @@ const SUB: Record<Page, string> = {
   agents: 'Agent CLIs on this computer, and which one handles each task.',
   integrations: 'Other tools Theodore can link PRs to.',
   projects: 'Connected repositories and the settings effective in each.',
+  languages:
+    'Grammars and language servers that give reviews and spaces exact definitions and references.',
   updates: 'Version, release channel and updates.',
   about: 'Version, release channel and updates.',
   sandbox: 'The simulated host this window runs against: faults and timeline.',
@@ -1179,6 +1184,8 @@ export const SettingsPage = observer(function SettingsPage({
           ) : null
         ) : page === 'projects' ? (
           <ProjectsPage />
+        ) : page === 'languages' ? (
+          <LanguagesPage />
         ) : page === 'sandbox' ? (
           <SandboxPage />
         ) : page === 'labs' ? (

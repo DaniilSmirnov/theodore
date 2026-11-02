@@ -3,7 +3,7 @@ import { looksLikePrUrl } from '../core/prUrl';
 import { openPr } from '../actions';
 import { NewTab } from './NewTab';
 import { useEffect } from 'react';
-import { Surface, Toast, toast } from '@heroui/react';
+import { Surface, Toast } from '@heroui/react';
 import { observer } from 'mobx-react-lite';
 import { useRootStore, useUi } from '../stores/context';
 import { ask } from '../actions';
@@ -26,6 +26,7 @@ import { UpdateReady } from './shell/UpdateReady';
 import { SharingPrompt } from './SharingPrompt';
 import { appView } from '../core/accountGate';
 import { StatusBanners } from './shell/StatusBanners';
+import { showToast } from './shell/toasts';
 import { isBuildMode } from './space/mode';
 import { isHostOn } from './settings/labs';
 import { SpacePage } from './space/SpacePage';
@@ -122,12 +123,7 @@ const Toasts = observer(function Toasts() {
   useEffect(() => {
     // HeroUI's imperative toast API: fire once per new entry, then drop it.
     for (const t of store.ephemeral.toasts) {
-      toast(t.text, {
-        timeout: t.action ? 5000 : 3200,
-        actionProps: t.action
-          ? { children: t.action.label, onPress: t.action.onAction }
-          : undefined,
-      });
+      showToast(t);
       store.ephemeral.dismissToast(t.id);
     }
   }, [store, store.ephemeral.toasts]);
