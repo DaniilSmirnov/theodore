@@ -60,12 +60,24 @@ export function isSpaceReview(p: Pick<PrSummary, 'pr'>): boolean {
 }
 
 /** Spaces the workspace lists: its project's (All: every one), archived
- *  ones left out, most recently active first. */
+ *  ones left out, pinned ones first, then most recently active first. */
 export function spacesIn(ws: WorkspaceId, spaces: Space[]): Space[] {
   return spaces
     .filter((s) => s.status !== 'archived')
     .filter((s) => ws === ALL || s.project === ws)
-    .sort((a, b) => b.updated_at - a.updated_at);
+    .sort(pinnedFirst);
+}
+
+/** Pinned before unpinned; within each, most recently active first. Pin
+ *  itself never touches `updated_at`, so pinning a space doesn't make it
+ *  read as a new turn. */
+function pinnedFirst(
+  a: Pick<Space, 'pinned' | 'updated_at'>,
+  b: Pick<Space, 'pinned' | 'updated_at'>,
+): number {
+  const pa = a.pinned ? 1 : 0;
+  const pb = b.pinned ? 1 : 0;
+  return pb - pa || b.updated_at - a.updated_at;
 }
 
 /** The workspace's archived spaces, latest first — the palette lists them
@@ -90,6 +102,15 @@ export function spaceGlyph(
   if (s.status === 'failed') return 'failed';
   if (s.turns > 0 && (seenAt ?? 0) < s.updated_at) return 'unseen';
   return 'idle';
+}
+
+/** Whether "Mark as unread" would do anything: there's a turn to flag, and
+ *  it doesn't already show as waiting for you. */
+export function canMarkUnread(
+  s: Pick<Space, 'status' | 'updated_at' | 'turns'>,
+  seenAt: number | undefined,
+): boolean {
+  return s.turns > 0 && spaceGlyph(s, seenAt) !== 'unseen';
 }
 
 /** A turn just ended (running → anything else): what to tell you if you're

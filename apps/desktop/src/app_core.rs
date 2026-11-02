@@ -997,6 +997,15 @@ impl CoreApi for AppCore {
     ) -> Result<theodore_contract::Space, CommandError> {
         self.core.unarchive_space(&space).await.map_err(err)
     }
+    async fn set_space_pinned(
+        &self,
+        req: theodore_contract::SetSpacePinnedRequest,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        self.core
+            .set_space_pinned(&req.space, req.pinned)
+            .await
+            .map_err(err)
+    }
     async fn space_send_feedback(
         &self,
         req: theodore_contract::SpaceFeedbackRequest,

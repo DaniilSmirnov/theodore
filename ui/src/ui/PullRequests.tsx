@@ -15,6 +15,7 @@ import { ALL } from '../core/workspaces';
 import { useRootStore, useUi } from '../stores/context';
 import { Avatar, Empty, Hints, K } from './bits';
 import { useContextMenu } from './ContextMenu';
+import { ListSearchBar } from './ListSearchBar';
 import {
   PEEK_FITS_FROM,
   PeekToggle,
@@ -27,6 +28,7 @@ import {
 import { useElementWidth } from './useElementWidth';
 import { RowsSkeleton } from './Loading';
 import { Peek } from './Peek';
+import { matchesSearch, prSearchText } from './search';
 import { branchReviewMenu, closeBranchReview } from './project/closeReview';
 import { isBranchReview } from './project/sections';
 import { useProjectAutoRefresh } from './project/freshness';
@@ -239,10 +241,25 @@ export const PullRequests = observer(function PullRequests() {
   const login = viewer?.login ?? null;
   const prs = ws.scopePrs(store.models.prSummaries.all());
   const groups = prGroups(prs, filter, login);
+  // ⌘F (search.ts): matches ignore a group's collapsed state — searching
+  // should surface a row even if its group was folded.
+  const query = ui.listSearch?.scope === 'prs' ? ui.listSearch.query : null;
+  const visibleGroups =
+    query === null
+      ? groups
+      : groups
+          .map((g) => ({
+            ...g,
+            items: g.items.filter((p) => matchesSearch(prSearchText(p), query)),
+          }))
+          .filter((g) => g.items.length);
   const closed = Object.fromEntries(
-    groups.map((g) => [g.id, toggled[`${filter}:${g.id}`] ?? g.collapsed]),
+    visibleGroups.map((g) => [
+      g.id,
+      query === null ? (toggled[`${filter}:${g.id}`] ?? g.collapsed) : false,
+    ]),
   );
-  const order = groups.flatMap((g) =>
+  const order = visibleGroups.flatMap((g) =>
     closed[g.id] ? [] : g.items.map((p) => p.id),
   );
   usePrKeys(order);
@@ -252,7 +269,7 @@ export const PullRequests = observer(function PullRequests() {
   const pickOrder =
     filter === 'mine'
       ? []
-      : groups.flatMap((g) =>
+      : visibleGroups.flatMap((g) =>
           closed[g.id]
             ? []
             : g.items.filter((p) => !branchReviews.has(p.id)).map((p) => p.id),
@@ -285,9 +302,22 @@ export const PullRequests = observer(function PullRequests() {
         </Tabs>
         <PeekToggle on={ui.peek} fits={fits} toggle={() => ui.togglePeek()} />
       </ViewHeader>
+      {query !== null && (
+        <ListSearchBar
+          query={query}
+          onQueryChange={(q) => ui.setListSearchQuery(q)}
+          order={order}
+          selected={ui.selected}
+          onSelect={(id) => ui.select(id as PrId)}
+          onOpen={(id) => ui.go({ name: 'review', pr: id as PrId })}
+          onClose={() => ui.closeListSearch()}
+          placeholder="Search pull requests…"
+          reopenToken={ui.listSearchFocusAt}
+        />
+      )}
       <div ref={pageRef} className="flex min-h-0 flex-1">
         <RowList
-          groups={groups}
+          groups={visibleGroups}
           sel={ui.selected}
           closed={closed}
           toggle={(id) =>
@@ -338,8 +368,8 @@ export const PullRequests = observer(function PullRequests() {
       </div>
       <Hints>
         <K>J</K>
-        <K>K</K> navigate <K>⏎</K> open <K>Space</K> preview <K>⌘K</K>{' '}
-        everything
+        <K>K</K> navigate <K>⏎</K> open <K>Space</K> preview <K>⌘F</K> search{' '}
+        <K>⌘K</K> everything
       </Hints>
     </div>
   );

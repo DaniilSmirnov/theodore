@@ -113,6 +113,34 @@ a separate feature island.
 
 ◐, ✕ and ● win over ⎇; the label keeps `#n` either way.
 
+**Pin / mark as unread** (finding a space again, GitHub #77): right-click
+a row, or type "pin"/"unread" in ⌘K.
+
+```
+┌ Spaces             + │
+│ ● fix-login-redirect │  pinned (small pin mark) — sorts first
+│ ◐ add-csv-export     │  running
+│ ● tidy-config        │  turn done, not seen yet
+└──────────────────────┘
+  right-click ▸ Pin/Unpin · Mark as unread
+```
+
+| | Field | Written by |
+| --- | --- | --- |
+| Pin | `space.pinned` (synced) | `set_space_pinned` only — never a client transaction, like the rest of `space` |
+| Mark as unread | the UI-local seen mark (`seen.ts`) | forgets the space was seen, so it reads ● again and counts toward the dock badge, without waiting for a new turn |
+
+Pinning never touches `updated_at`, so pinning alone doesn't make a space
+read as a new turn. Pinned spaces sort first, then by activity, in both
+the sidebar and ⌘K.
+
+**⌘F searches the current list** (GitHub #77): the PR list on Inbox / My
+PRs (title, number, author, repo, branch), or this section everywhere
+else build mode is on (name, title, goal, branch). Fuzzy-ish substring
+match; Esc clears the query, then closes; ↑↓ moves, ⏎ opens. Never on
+`review` or `space` (a diff/text view) — the key is left for the
+webview's own find there; `settings` has no sidebar to search either.
+
 ### New space
 
 ```
@@ -985,6 +1013,7 @@ downloaded to this Mac yet".
 | `archive_space` | checkpoint, remove the worktree, keep the ref |
 | `unarchive_space` | recreate the worktree from the ref, reopen the live diff |
 | `undo_space_turn` | worktree and ref back to the last live turn's `before`; the turn is marked undone |
+| `set_space_pinned` | `space.pinned`; pinned spaces sort first (sidebar, ⌘K) — never touches `updated_at` |
 | `space_send_feedback` | threads / drafts / findings of the space's PR or own review, quoted as one turn |
 | `space_base_status` | the base's tip in the copy on this Mac and how many commits the space is behind it; no network |
 | `update_space_from_base` | merge the base's tip into the space (§6); while `updating`, complete that merge if no markers are left |

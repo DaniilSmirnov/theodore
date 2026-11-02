@@ -191,6 +191,7 @@ impl Core {
             continue_note: None,
             fork_sha,
             issue: start.issue,
+            pinned: false,
         };
         self.apply(vec![NewAction {
             model: models::SPACE.into(),
@@ -710,6 +711,24 @@ impl Core {
         let space = self.space_row(&space.id).await?;
         self.spawn_space_code(&space, &project);
         Ok(space)
+    }
+
+    /// Pin/unpin a space (docs/spaces.md §3): pinned spaces sort first in
+    /// the sidebar and ⌘K. Works on an archived space too; it keeps no
+    /// worktree state.
+    pub async fn set_space_pinned(&self, space: &str, pinned: bool) -> AppResult<Space> {
+        let row = self.space_row(space).await?;
+        if row.pinned == pinned {
+            return Ok(row);
+        }
+        self.apply(vec![NewAction {
+            model: models::SPACE.into(),
+            model_id: row.id.clone(),
+            action: SyncActionCode::C,
+            data: Some(serde_json::json!({ "pinned": pinned })),
+        }])
+        .await?;
+        self.space_row(space).await
     }
 
     /// Turns left `running` by a previous process can never finish

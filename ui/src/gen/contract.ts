@@ -1426,6 +1426,15 @@ export type SetLinearTokenRequest = {
 	token: string | null,
 };
 
+/**
+ *  "Pin"/"Unpin" on a space (docs/spaces.md §3): sidebar context menu and
+ *  ⌘K.
+ */
+export type SetSpacePinnedRequest = {
+	space: string,
+	pinned: boolean,
+};
+
 export type SetTokenRequest = {
 	host: HostKind,
 	/**  `None` removes the stored token. */
@@ -1641,6 +1650,11 @@ export type Space = {
 	 *  project's repo. `ship_space`'s PR body says "Closes #<n>".
 	 */
 	issue?: number | null,
+	/**
+	 *  Pinned spaces sort first in the sidebar and ⌘K (docs/spaces.md §3).
+	 *  Set only by `set_space_pinned`, never by a client transaction.
+	 */
+	pinned?: boolean,
 };
 
 /**

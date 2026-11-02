@@ -844,6 +844,7 @@ pub fn types() -> specta::Types {
         .register::<SpaceUpdate>()
         .register::<SpaceBaseStatus>()
         .register::<SpaceFixCiRequest>()
+        .register::<SetSpacePinnedRequest>()
         .register::<ConfigLayer>()
         .register::<ConfigFile>()
         .register::<ConfigEntry>()

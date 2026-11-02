@@ -80,6 +80,7 @@ import type {
   SpaceConfigView,
   SpaceLogLine,
   SpaceRunRequest,
+  SetSpacePinnedRequest,
   SpaceSetupRequest,
   SpaceTerminalInfo,
   SpaceTrustRequest,
@@ -311,6 +312,9 @@ export const api = {
   /** Continue after merge: a new branch on the base's fresh tip (§7). */
   continueSpace: (space: string) => call<Space>('continue_space', { space }),
   unarchiveSpace: (space: string) => call<Space>('unarchive_space', { space }),
+  /** Pin/unpin a space: pinned ones sort first (docs/spaces.md §3). */
+  setSpacePinned: (req: SetSpacePinnedRequest) =>
+    call<Space>('set_space_pinned', { req }),
   spaceSendFeedback: (req: SpaceFeedbackRequest) =>
     call<string>('space_send_feedback', { req }),
   /** "Base moved: N commits behind", from the copy on this Mac. A passive

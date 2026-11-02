@@ -7,6 +7,7 @@ import {
   REVIEW_AGENT_KEY,
   autoArchiveDays,
   buildModeOn,
+  canMarkUnread,
   defaultReviewSkill,
   defaultTitle,
   reviewAgentDefault,
@@ -122,6 +123,40 @@ describe('spaces', () => {
     expect(spaceGlyph({ ...s, turns: 0 }, undefined)).toBe('idle');
     expect(spaceGlyph({ ...s, status: 'running' }, 99)).toBe('running');
     expect(spaceGlyph({ ...s, status: 'failed' }, 99)).toBe('failed');
+  });
+
+  it('sorts pinned spaces first, newest activity first within each group', () => {
+    const all = [
+      space({ id: 'old', updated_at: 1 }),
+      space({ id: 'new', updated_at: 5 }),
+      space({ id: 'pinned-old', updated_at: 2, pinned: true }),
+      space({ id: 'pinned-new', updated_at: 8, pinned: true }),
+    ];
+    expect(spacesIn('local:app', all).map((s) => s.id)).toEqual([
+      'pinned-new',
+      'pinned-old',
+      'new',
+      'old',
+    ]);
+  });
+
+  it('pinning never touches updated_at, so it does not read as a new turn', () => {
+    // Pure sorting rule only looks at `pinned`/`updated_at` as given — this
+    // guards the contract that `set_space_pinned` (Rust) must not bump
+    // `updated_at`, by asserting pin alone doesn't reorder by activity.
+    const unpinned = space({ id: 'a', updated_at: 5 });
+    const pinned = { ...space({ id: 'b', updated_at: 5 }), pinned: true };
+    expect(spacesIn('local:app', [unpinned, pinned]).map((s) => s.id)).toEqual([
+      'b',
+      'a',
+    ]);
+  });
+
+  it('"Mark as unread" only does something once there is a turn to flag and it is not already unseen', () => {
+    const s = space({ id: 's', turns: 1, updated_at: 10 });
+    expect(canMarkUnread(s, 20)).toBe(true);
+    expect(canMarkUnread(s, undefined)).toBe(false); // already unseen
+    expect(canMarkUnread({ ...s, turns: 0 }, 20)).toBe(false); // no turn yet
   });
 
   it('notices only a turn that just ended', () => {

@@ -602,6 +602,27 @@ async fn review_groups_the_space_diff() {
 }
 
 #[tokio::test]
+async fn pinning_toggles_the_flag_without_touching_updated_at() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    let s = core.create_space(request(&project, "")).await.unwrap();
+    assert!(!s.pinned);
+    let before = s.updated_at;
+
+    let pinned = core.set_space_pinned(&s.id, true).await.unwrap();
+    assert!(pinned.pinned);
+    assert_eq!(pinned.updated_at, before, "pin alone isn't a new turn");
+
+    // Idempotent: pinning an already-pinned space is a no-op, not an error.
+    let still = core.set_space_pinned(&s.id, true).await.unwrap();
+    assert!(still.pinned);
+
+    let unpinned = core.set_space_pinned(&s.id, false).await.unwrap();
+    assert!(!unpinned.pinned);
+    assert_eq!(unpinned.updated_at, before);
+}
+
+#[tokio::test]
 async fn archive_removes_the_worktree_and_review_but_keeps_the_transcript() {
     let f = fixtures();
     let (core, _recv, project) = started(&f).await;

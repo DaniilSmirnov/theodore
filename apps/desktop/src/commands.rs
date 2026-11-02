@@ -846,6 +846,17 @@ pub async fn unarchive_space(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn set_space_pinned(
+    op: crate::op::Op,
+    req: theodore_contract::SetSpacePinnedRequest,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::Space, CommandError> {
+    op.run(async move { core.set_space_pinned(req).await })
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn space_send_feedback(
     op: crate::op::Op,
     req: theodore_contract::SpaceFeedbackRequest,

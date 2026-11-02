@@ -303,6 +303,13 @@ pub trait CoreApi: Send + Sync {
     ) -> Result<theodore_contract::Space, CommandError> {
         Err(not_ready())
     }
+    /// Pin/unpin a space: pinned ones sort first (docs/spaces.md §3).
+    async fn set_space_pinned(
+        &self,
+        _req: theodore_contract::SetSpacePinnedRequest,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        Err(not_ready())
+    }
     /// "Send to agent": review threads / drafts / findings as the next turn.
     async fn space_send_feedback(
         &self,

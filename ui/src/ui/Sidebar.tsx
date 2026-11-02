@@ -3,6 +3,7 @@ import {
   BranchesRight,
   ChevronDown,
   CircleExclamation,
+  CircleFill,
   CircleXmark,
   CodePullRequest,
   Gear,
@@ -10,6 +11,8 @@ import {
   ListCheck,
   Magnifier,
   Pencil,
+  Pin,
+  PinSlash,
   Plus,
   Sparkles,
   Tray,
@@ -26,20 +29,25 @@ import {
   Tooltip,
 } from '@heroui/react';
 import { observer } from 'mobx-react-lite';
-import type { ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
+import type { Space } from '../gen/contract';
 import { useRootStore, useUi } from '../stores/context';
 import { sameRoute, type Route } from '../stores/UiStore';
 import { api } from '../core/api';
 import { Avatar, K, Spinner } from './bits';
+import { contextMenuHandler, type ContextMenuItem } from './ContextMenu';
+import { ListSearchBar } from './ListSearchBar';
 import { inInbox } from './List';
 import { openPrCount } from './prs/filters';
+import { matchesSearch, spaceSearchText } from './search';
 import { sectionsOf, type Section } from '../core/workspaces';
 import { SandboxBadge } from './sandbox/SandboxBadge';
 import { WorkspaceSwitcher } from './WorkspaceSwitcher';
-import { spaceSeen } from './space/seen';
+import { markSpaceUnseen, spaceSeen } from './space/seen';
 import { isBuildMode } from './space/mode';
 import { PrGlyph } from './space/SpacePr';
 import {
+  canMarkUnread,
   spaceGlyph,
   spaceTitle,
   spacesIn,
@@ -54,6 +62,41 @@ interface NavItem {
   route?: Route;
   /** An action instead of a route, e.g. "New space". */
   onPress?: () => void;
+  /** Right-click menu for this row, built lazily (`ContextMenu.tsx`). */
+  contextMenu?: () => ContextMenuItem[];
+  /** A pinned space (docs/spaces.md §3): sorts first, marked with a small pin. */
+  pinned?: boolean;
+}
+
+/** Pin/unpin and "Mark as unread" (docs/spaces.md §3) — the sidebar's
+ *  right-click menu and ⌘K share this. */
+export function spaceContextMenu(s: Space): ContextMenuItem[] {
+  const pinned = s.pinned ?? false;
+  return [
+    {
+      id: 'pin',
+      label: pinned ? 'Unpin' : 'Pin',
+      icon: pinned ? (
+        <PinSlash className="size-4" />
+      ) : (
+        <Pin className="size-4" />
+      ),
+      onAction: () =>
+        void api
+          .setSpacePinned({ space: s.id, pinned: !pinned })
+          .catch(() => {}),
+    },
+    ...(canMarkUnread(s, spaceSeen.get(s.id))
+      ? [
+          {
+            id: 'mark-unread',
+            label: 'Mark as unread',
+            icon: <CircleFill className="size-3" />,
+            onAction: () => markSpaceUnseen(s.id),
+          },
+        ]
+      : []),
+  ];
 }
 
 interface NavGroup {
@@ -194,9 +237,25 @@ export const Sidebar = observer(function Sidebar() {
   const spaces = isBuildMode(store)
     ? spacesIn(ui.workspace, store.models.spaces.all())
     : null;
+  // ⌘F over the Spaces section (search.ts): while it's open, the section's
+  // own search block takes over below and this group is left out of the
+  // ListBox, so the two never show at once.
+  const spacesQuery =
+    ui.listSearch?.scope === 'spaces' ? ui.listSearch.query : null;
+  const visibleSpaces =
+    spaces && spacesQuery !== null
+      ? spaces.filter((s) => matchesSearch(spaceSearchText(s), spacesQuery))
+      : spaces;
+  const [spaceHi, setSpaceHi] = useState<string | null>(null);
+  useEffect(() => {
+    const order = visibleSpaces?.map((s) => s.id) ?? [];
+    if (!spaceHi || !order.includes(spaceHi)) setSpaceHi(order[0] ?? null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [spacesQuery, visibleSpaces?.map((s) => s.id).join(',')]);
+
   const groups: NavGroup[] = [
     { id: 'main', items: sectionsOf(ws.kind).map((k) => all[k]) },
-    ...(spaces
+    ...(spaces && spacesQuery === null
       ? [
           {
             id: 'spaces',
@@ -223,6 +282,14 @@ export const Sidebar = observer(function Sidebar() {
                   route: { name: 'space', id: s.id },
                 };
               }),
+              ...spaces.map((s): NavItem => ({
+                key: routeKey({ name: 'space', id: s.id }),
+                icon: <SpaceGlyphIcon g={spaceGlyph(s, spaceSeen.get(s.id))} />,
+                label: spaceTitle(s),
+                route: { name: 'space', id: s.id },
+                contextMenu: () => spaceContextMenu(s),
+                pinned: s.pinned ?? false,
+              })),
               {
                 key: 'new-space',
                 icon: <Plus />,
@@ -289,22 +356,92 @@ export const Sidebar = observer(function Sidebar() {
                 aria-current={current?.key === i.key ? 'page' : undefined}
                 className={`nav group gap-3 px-3 text-sm ${current?.key === i.key ? 'bg-default font-medium' : ''}`}
               >
-                <span className="grid size-4 shrink-0 place-items-center text-muted [&>svg]:size-4">
-                  {i.icon}
-                </span>
-                <span className="min-w-0 flex-1 truncate" title={i.label}>
-                  {i.label}
-                </span>
-                {i.n !== undefined && i.n !== 0 && (
-                  <span className="shrink-0 text-xs tabular-nums text-muted">
-                    {i.n}
+                {/* `contents`: a right-click target with no layout of its
+                    own, same trick as `PrRow`'s range wrapper. */}
+                <span
+                  className="contents"
+                  onContextMenu={
+                    i.contextMenu
+                      ? contextMenuHandler(ui, i.contextMenu)
+                      : undefined
+                  }
+                >
+                  <span className="grid size-4 shrink-0 place-items-center text-muted [&>svg]:size-4">
+                    {i.icon}
                   </span>
-                )}
+                  <span className="min-w-0 flex-1 truncate" title={i.label}>
+                    {i.label}
+                  </span>
+                  {i.pinned && (
+                    <Pin
+                      className="size-3 shrink-0 text-muted"
+                      aria-label="Pinned"
+                    />
+                  )}
+                  {i.n !== undefined && i.n !== 0 && (
+                    <span className="shrink-0 text-xs tabular-nums text-muted">
+                      {i.n}
+                    </span>
+                  )}
+                </span>
               </ListBox.Item>
             ))}
           </ListBox.Section>
         ))}
       </ListBox>
+
+      {spaces && spacesQuery !== null && (
+        <div className="spaces-search flex min-h-0 flex-col border-t border-separator">
+          <Header className="px-3 pb-1.5 pt-2 text-xs text-muted">
+            Spaces
+          </Header>
+          <ListSearchBar
+            query={spacesQuery}
+            onQueryChange={(q) => ui.setListSearchQuery(q)}
+            order={visibleSpaces?.map((s) => s.id) ?? []}
+            selected={spaceHi}
+            onSelect={setSpaceHi}
+            onOpen={(id) => {
+              ui.go({ name: 'space', id });
+              ui.closeListSearch();
+            }}
+            onClose={() => ui.closeListSearch()}
+            placeholder="Search spaces…"
+            reopenToken={ui.listSearchFocusAt}
+          />
+          <div className="flex min-h-0 flex-col overflow-auto px-2 pb-2">
+            {(visibleSpaces ?? []).map((s) => (
+              <button
+                key={s.id}
+                type="button"
+                className={`nav flex items-center gap-3 rounded-lg px-3 py-1.5 text-start text-sm hover:bg-default ${
+                  spaceHi === s.id ? 'bg-default font-medium' : ''
+                }`}
+                onClick={() => {
+                  ui.go({ name: 'space', id: s.id });
+                  ui.closeListSearch();
+                }}
+                onContextMenu={contextMenuHandler(ui, () =>
+                  spaceContextMenu(s),
+                )}
+              >
+                <span className="grid size-4 shrink-0 place-items-center text-muted [&>svg]:size-4">
+                  <SpaceGlyphIcon g={spaceGlyph(s, spaceSeen.get(s.id))} />
+                </span>
+                <span className="min-w-0 flex-1 truncate" title={spaceTitle(s)}>
+                  {spaceTitle(s)}
+                </span>
+                {s.pinned && (
+                  <Pin
+                    className="size-3 shrink-0 text-muted"
+                    aria-label="Pinned"
+                  />
+                )}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       <Separator />
       <Toolbar
