@@ -35,6 +35,7 @@
     "createUpdaterArtifacts": true,
     "macOS": {
       "signingIdentity": "-",
+      "entitlements": "Entitlements.plist",
       "minimumSystemVersion": "11.0",
       "dmg": {
         "background": "icons/dmg-background.png",
