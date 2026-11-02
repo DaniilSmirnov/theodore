@@ -789,6 +789,29 @@ pub async fn ship_space(
     op.run(async move { core.ship_space(req).await }).await
 }
 
+/// Merge the space's PR from the space page (docs/spaces.md §3).
+#[tauri::command]
+#[specta::specta]
+pub async fn merge_space(
+    op: crate::op::Op,
+    req: theodore_contract::MergeSpaceRequest,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::MergeSpaceResult, CommandError> {
+    op.run(async move { core.merge_space(req).await }).await
+}
+
+/// Continue after merge: a new branch on the base's fresh tip (§7).
+#[tauri::command]
+#[specta::specta]
+pub async fn continue_space(
+    op: crate::op::Op,
+    space: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::Space, CommandError> {
+    op.run(async move { core.continue_space(space).await })
+        .await
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn undo_space_turn(

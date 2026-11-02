@@ -77,6 +77,7 @@ import {
 import { GlobalConfigSection, SpaceSetupAssistHint } from './ConfigSection';
 import { SpaceProgress } from './SpaceProgress';
 import { BaseMoved, UpdatingBanner } from './BaseUpdate';
+import { MergedBanner, SpaceMergeButton, SpacePrPane } from './SpacePr';
 import {
   CheckChip,
   LogsDrawer,
@@ -346,7 +347,14 @@ export const SpacePage = observer(function SpacePage({ id }: { id: string }) {
         {showChanges && (
           <section className="flex min-w-0 flex-1 flex-col">
             {opened || !live ? (
-              <SpaceChanges space={space} />
+              space.pr ? (
+                <SpacePrPane
+                  pr={space.pr}
+                  changes={<SpaceChanges space={space} />}
+                />
+              ) : (
+                <SpaceChanges space={space} />
+              )
             ) : (
               <div className="grid flex-1 place-items-center text-muted">
                 <Spinner />
@@ -366,6 +374,7 @@ export const SpacePage = observer(function SpacePage({ id }: { id: string }) {
         />
       )}
       {space.status === 'archived' && <ArchivedBanner space={space} />}
+      <MergedBanner space={space} />
       <Hints>
         <K>C</K> message the agent <K>M</K> mode <K>D</K> changes <K>⌃`</K>{' '}
         terminal <K>⌘.</K> stop <K>R</K> review <K>P</K>{' '}
@@ -469,7 +478,8 @@ const SpaceHeader = observer(function SpaceHeader({
         </span>
       )}
       <span className="flex-1" />
-      <BaseMoved space={space} />
+      {/* Once its PR merged, Continue moves it onto the new base. */}
+      {!(space.pr && stage === 'done') && <BaseMoved space={space} />}
       <RunButton space={space} config={config} />
       <PortChips space={space} />
       <LogsToggle open={logsOpen} onToggle={onToggleLogs} />
@@ -484,6 +494,7 @@ const SpaceHeader = observer(function SpaceHeader({
           handle={ship}
         />
       )}
+      {!archived && space.pr && <SpaceMergeButton space={space} />}
       {space.pr && (
         <Button
           size="sm"

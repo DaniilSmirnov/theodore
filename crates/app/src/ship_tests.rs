@@ -260,7 +260,13 @@ async fn open_as_draft_and_an_edited_title() {
     let calls = f.host.create_pr_calls.lock().unwrap().clone();
     assert!(calls[0].1.draft);
     assert_eq!(calls[0].1.title, "Export orders as CSV");
-    assert_eq!(calls[0].1.body, "Add CSV export\nQuote commas too.");
+    assert!(
+        calls[0]
+            .1
+            .body
+            .starts_with("Add CSV export\nQuote commas too.\n\n<!-- theodore-space:"),
+        "the goal, then the link back"
+    );
     assert_eq!(
         f.git.ship.lock().unwrap().commits[0].1.message,
         "Export orders as CSV\n\nAdd CSV export\nQuote commas too."

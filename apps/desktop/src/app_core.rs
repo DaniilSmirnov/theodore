@@ -967,6 +967,18 @@ impl CoreApi for AppCore {
     ) -> Result<theodore_contract::Space, CommandError> {
         self.core.ship_space(req).await.map_err(err)
     }
+    async fn merge_space(
+        &self,
+        req: theodore_contract::MergeSpaceRequest,
+    ) -> Result<theodore_contract::MergeSpaceResult, CommandError> {
+        self.core.merge_space(req).await.map_err(err)
+    }
+    async fn continue_space(
+        &self,
+        space: String,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        self.core.continue_space(&space).await.map_err(err)
+    }
     async fn undo_space_turn(
         &self,
         space: String,

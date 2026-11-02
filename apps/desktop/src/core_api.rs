@@ -266,6 +266,20 @@ pub trait CoreApi: Send + Sync {
     ) -> Result<theodore_contract::Space, CommandError> {
         Err(not_ready())
     }
+    /// Merges the space's PR: default method, auto-merge when blocked.
+    async fn merge_space(
+        &self,
+        _req: theodore_contract::MergeSpaceRequest,
+    ) -> Result<theodore_contract::MergeSpaceResult, CommandError> {
+        Err(not_ready())
+    }
+    /// Continue after merge: a new branch on the base's fresh tip.
+    async fn continue_space(
+        &self,
+        _space: String,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        Err(not_ready())
+    }
     /// Undo last turn: back to the previous checkpoint (docs/spaces.md §7).
     async fn undo_space_turn(
         &self,

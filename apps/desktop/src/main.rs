@@ -75,6 +75,8 @@ fn main() {
     // returns there instead of the loopback (unless a redirect is
     // configured).
     core.set_account_app_redirect(theodore_desktop::deep_link::app_redirect().as_deref());
+    // A space's PR links back to it on this build's scheme.
+    core.set_space_link_scheme(theodore_desktop::deep_link::scheme().as_deref());
     // No remote sinks in sandbox or fixture runs, whatever is configured.
     let remote = !is_sandbox && cfg.fixtures.is_none();
     let app_core = AppCore::new(core)

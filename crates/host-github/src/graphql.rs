@@ -1407,6 +1407,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
     squashMergeAllowed
     rebaseMergeAllowed
     autoMergeAllowed
+    viewerDefaultMergeMethod
     pullRequest(number: $number) {
       mergeable
       mergeStateStatus
@@ -1428,6 +1429,10 @@ pub(crate) struct GqlRepoMergeSettings {
     pub rebase_merge_allowed: bool,
     #[serde(rename = "autoMergeAllowed", default)]
     pub auto_merge_allowed: bool,
+    /// `MERGE` · `SQUASH` · `REBASE`: the viewer's last method, else the
+    /// repo's default.
+    #[serde(rename = "viewerDefaultMergeMethod", default)]
+    pub viewer_default_merge_method: Option<String>,
     #[serde(rename = "pullRequest")]
     pub pull_request: Option<GqlPrMergeStatus>,
 }

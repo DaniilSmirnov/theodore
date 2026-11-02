@@ -27,6 +27,7 @@ pub mod space_fix_ci;
 pub(crate) mod space_handoff;
 pub mod space_hooks;
 pub(crate) mod space_naming;
+pub mod space_pr;
 pub mod space_queue;
 pub mod space_setup_assist;
 pub mod space_terminal;

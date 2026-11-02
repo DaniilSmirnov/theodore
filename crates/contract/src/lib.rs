@@ -474,6 +474,10 @@ pub struct MergeInfo {
     pub auto_merge_allowed: bool,
     #[serde(default)]
     pub merge_queue: bool,
+    /// The method the host would pick (GitHub: your last one, else the
+    /// repo's default); `None` when it doesn't say.
+    #[serde(default)]
+    pub default_method: Option<MergeMethod>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -824,6 +828,9 @@ pub fn types() -> specta::Types {
         .register::<SpaceShipped>()
         .register::<ShipAction>()
         .register::<ShipSpaceRequest>()
+        .register::<MergeSpaceRequest>()
+        .register::<MergeSpaceResult>()
+        .register::<SpaceRound>()
         .register::<SpaceTurn>()
         .register::<AgentSession>()
         .register::<SpaceFeedback>()

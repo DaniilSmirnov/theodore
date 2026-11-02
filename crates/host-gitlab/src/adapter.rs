@@ -533,6 +533,17 @@ impl HostAdapter for GitlabAdapter {
             // "Merge when pipeline succeeds" is always available.
             auto_merge_allowed: true,
             merge_queue: false,
+            // GitLab merges by the project's method; squash is a flag.
+            default_method: Some(
+                if matches!(
+                    settings.squash_option.as_deref(),
+                    Some("default_on" | "always")
+                ) {
+                    MergeMethod::Squash
+                } else {
+                    MergeMethod::Merge
+                },
+            ),
         })
     }
 

@@ -171,6 +171,8 @@ impl Core {
             handoff_summary: None,
             progress: None,
             updating: None,
+            rounds: Vec::new(),
+            continue_note: None,
         };
         self.apply(vec![NewAction {
             model: models::SPACE.into(),
@@ -351,6 +353,8 @@ impl Core {
                     "model": model,
                     "mode": mode,
                     "error": null,
+                    // Said once, in this turn's prompt.
+                    "continue_note": null,
                     "updated_at": now,
                 })),
             },
@@ -373,7 +377,10 @@ impl Core {
         let ask = with_attachments(ask, &attachments);
         let ultracode = agent == AgentId::Claude
             && self.setting_string("agents.claude.effort", "").await.trim() == ULTRACODE;
-        let wrap = |prompt: String| with_ultracode(with_failed_check(&space, prompt), ultracode);
+        let wrap = |prompt: String| {
+            let prompt = crate::usecases::space_pr::with_continue_note(&space, prompt);
+            with_ultracode(with_failed_check(&space, prompt), ultracode)
+        };
         // The same agent in the same worktree continues its session and
         // hears only the new turn; anything else starts a new session from
         // the replayed transcript.

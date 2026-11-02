@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use theodore_domain::{AgentId, Millis, PrId, Sha};
 
-use crate::{SpaceCheck, SpaceProcess, SpaceSetup};
+use crate::{MergeMethod, SpaceCheck, SpaceProcess, SpaceSetup};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
@@ -153,6 +153,14 @@ pub struct Space {
     /// set while its merge conflicts (docs/spaces.md §6).
     #[serde(default)]
     pub updating: Option<SpaceUpdate>,
+    /// Earlier rounds, oldest first: each PR of the space that merged
+    /// before "Continue" moved it to a new branch (docs/spaces.md §7).
+    #[serde(default)]
+    pub rounds: Vec<SpaceRound>,
+    /// Told to the agent at the start of the next turn, then cleared: the
+    /// previous PR merged and the work goes on on a new branch.
+    #[serde(default)]
+    pub continue_note: Option<String>,
 }
 
 /// A merge of the base into the space, left in progress on conflicts
@@ -178,6 +186,19 @@ pub struct SpaceBaseStatus {
     pub base_tip: Sha,
     /// Commits on the base since `base_sha`.
     pub behind: u32,
+}
+
+/// One merged round of a continued space.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct SpaceRound {
+    /// The PR that merged, and its branch.
+    pub pr: PrId,
+    pub branch: String,
+    /// The base the round forked from, and its last pushed checkpoint.
+    pub base_sha: Sha,
+    pub head_sha: Sha,
+    /// When "Continue" started the next round.
+    pub at: Millis,
 }
 
 /// One agent CLI session a space's turns continue (docs/spaces.md §5
@@ -321,4 +342,23 @@ pub struct SentFeedback {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 pub struct SpaceFixCiRequest {
     pub space: String,
+}
+
+/// Merge a space's PR from the space page (docs/spaces.md §3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct MergeSpaceRequest {
+    pub space: String,
+    /// One of the repo's allowed methods; defaults to the host's default.
+    #[serde(default)]
+    pub method: Option<MergeMethod>,
+}
+
+/// What `merge_space` asked the host for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct MergeSpaceResult {
+    pub method: MergeMethod,
+    /// Auto-merge: the PR merges itself once its checks and reviews pass.
+    pub auto: bool,
+    /// Added to the base branch's merge queue instead.
+    pub queue: bool,
 }

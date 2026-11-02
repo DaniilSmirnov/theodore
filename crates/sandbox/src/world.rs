@@ -716,6 +716,7 @@ impl Locked<'_> {
             auto_merge_allowed: true,
             // The `merge_queue` fault turns the queue on for every repo.
             merge_queue: self.st.faults.merge_queue,
+            default_method: Some(MergeMethod::Squash),
         }
     }
 

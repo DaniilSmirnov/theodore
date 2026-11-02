@@ -25,7 +25,12 @@ import {
   nextMode,
   spaceKeyAction,
   turnEnded,
+  prTint,
+  defaultMergeMethod,
+  spaceMerge,
+  canContinue,
 } from './spaces';
+import type { MergeInfo } from '../../gen/contract';
 
 const setting = (value: unknown, scope = 'user') => ({
   key: BUILD_MODE_KEY,
@@ -341,5 +346,82 @@ describe('send N to agent', () => {
     expect(sentTurnDone({ status: 'idle', turns: 1 }, 2)).toBe(false);
     expect(sentTurnDone({ status: 'idle', turns: 2 }, 2)).toBe(true);
     expect(sentTurnDone({ status: 'failed', turns: 3 }, 2)).toBe(true);
+  });
+});
+
+const info = (over: Partial<MergeInfo> = {}): MergeInfo => ({
+  mergeable: true,
+  state: 'clean',
+  allowed_methods: ['merge', 'squash'],
+  auto_merge_enabled: false,
+  in_queue: false,
+  required_approvals: null,
+  auto_merge_allowed: false,
+  merge_queue: false,
+  default_method: null,
+  ...over,
+});
+
+describe('a space in review', () => {
+  it('tints its PR glyph by checks, then by how it ended', () => {
+    expect(prTint(undefined)).toBe('none');
+    expect(prTint({ state: 'open', checks: 'fail' })).toBe('fail');
+    expect(prTint({ state: 'draft', checks: 'pass' })).toBe('pass');
+    expect(prTint({ state: 'merged', checks: 'fail' })).toBe('merged');
+    expect(prTint({ state: 'closed', checks: 'pass' })).toBe('closed');
+  });
+
+  it("merges by the host's default when the repo allows it", () => {
+    expect(defaultMergeMethod(info())).toBe('merge');
+    expect(defaultMergeMethod(info({ default_method: 'squash' }))).toBe(
+      'squash',
+    );
+    expect(defaultMergeMethod(info({ default_method: 'rebase' }))).toBe(
+      'merge',
+    );
+    expect(defaultMergeMethod(info({ allowed_methods: [] }))).toBe('squash');
+  });
+
+  it('merges now, auto-merges, queues, or says why not', () => {
+    const s = space({ id: 'a', status: 'idle' });
+    expect(spaceMerge(info(), s)).toEqual({ kind: 'merge' });
+    expect(spaceMerge(info({ state: 'unstable' }), s)).toEqual({
+      kind: 'merge',
+    });
+    expect(spaceMerge(info({ merge_queue: true }), s)).toEqual({
+      kind: 'queue',
+    });
+    expect(
+      spaceMerge(info({ state: 'blocked', auto_merge_allowed: true }), s),
+    ).toEqual({ kind: 'auto' });
+    expect(spaceMerge(info({ state: 'blocked' }), s).kind).toBe('none');
+    expect(
+      spaceMerge(info({ state: 'dirty', auto_merge_allowed: true }), s),
+    ).toEqual({ kind: 'none', reason: 'Conflicts with the base branch' });
+    expect(spaceMerge(null, s).kind).toBe('none');
+    const unpushed = space({
+      id: 'b',
+      head_sha: 'h2',
+      shipped: {
+        how: 'pr',
+        branch: 'theo/b',
+        sha: 's1',
+        head: 'h1',
+        pushes: 1,
+        at: 0,
+      },
+    });
+    expect(spaceMerge(info(), unpushed)).toEqual({
+      kind: 'none',
+      reason: 'Push the new turns first',
+    });
+  });
+
+  it('offers Continue once the PR merged', () => {
+    const s = space({ id: 'a', pr: 'github:o/r#1' });
+    expect(canContinue(s, 'merged')).toBe(true);
+    expect(canContinue(s, 'open')).toBe(false);
+    expect(canContinue({ ...s, status: 'archived' }, 'merged')).toBe(false);
+    expect(canContinue({ ...s, pr: null }, 'merged')).toBe(false);
   });
 });

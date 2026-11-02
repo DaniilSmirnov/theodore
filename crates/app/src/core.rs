@@ -114,6 +114,9 @@ pub(crate) struct Inner {
     pub term_rt: std::sync::Mutex<HashMap<String, crate::usecases::space_terminal::TerminalEntry>>,
     /// Spaces' send queues and the turns "Send now" can steer into.
     pub space_queue: crate::usecases::space_queue::QueueState,
+    /// The app's URL scheme a space's PR links back with
+    /// (`Core::set_space_link_scheme`).
+    pub space_link_scheme: std::sync::Mutex<Option<String>>,
 }
 
 /// Inbound streams the shell (Tauri or the CLI) forwards to the UI.
@@ -165,6 +168,7 @@ impl Core {
             code_intel: Default::default(),
             term_rt: std::sync::Mutex::new(HashMap::new()),
             space_queue: Default::default(),
+            space_link_scheme: std::sync::Mutex::new(None),
         });
 
         let core = Core(inner.clone());

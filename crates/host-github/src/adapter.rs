@@ -560,6 +560,12 @@ impl HostAdapter for GithubAdapter {
             required_approvals: None,
             auto_merge_allowed: settings.auto_merge_allowed,
             merge_queue: status.is_merge_queue_enabled,
+            default_method: match settings.viewer_default_merge_method.as_deref() {
+                Some("MERGE") => Some(MergeMethod::Merge),
+                Some("SQUASH") => Some(MergeMethod::Squash),
+                Some("REBASE") => Some(MergeMethod::Rebase),
+                _ => None,
+            },
         })
     }
 

@@ -153,6 +153,10 @@ pub struct MergeStatus {
     pub auto_merge_allowed: bool,
     /// The base branch merges through a merge queue.
     pub merge_queue: bool,
+    /// The method the host would pick (GitHub `viewerDefaultMergeMethod`);
+    /// `None` when it doesn't say.
+    #[serde(default)]
+    pub default_method: Option<MergeMethod>,
 }
 
 // ── create ───────────────────────────────────────────────────────────────

@@ -1243,7 +1243,7 @@ const SuggestionBatchBar = observer(function SuggestionBatchBar({
 });
 
 /** All threads and pending drafts of this PR, grouped like an inbox. */
-const Threads = observer(function Threads({ pr }: { pr: PrId }) {
+export const Threads = observer(function Threads({ pr }: { pr: PrId }) {
   const store = useRootStore();
   const threads = store.models.prDetails.get(pr)?.threads ?? [];
   const drafts = store.models.drafts.byPr(pr);

@@ -937,6 +937,11 @@ export type MergeInfo = {
 	required_approvals: number | null,
 	auto_merge_allowed?: boolean,
 	merge_queue?: boolean,
+	/**
+	 *  The method the host would pick (GitHub: your last one, else the
+	 *  repo's default); `None` when it doesn't say.
+	 */
+	default_method?: MergeMethod | null,
 };
 
 export type MergeMethod = "merge" | "squash" | "rebase";
@@ -949,6 +954,22 @@ export type MergeRequest = {
 	/**  Merge when requirements pass instead of now. */
 	auto: boolean,
 	/**  Add to the merge queue instead of merging. */
+	queue: boolean,
+};
+
+/**  Merge a space's PR from the space page (docs/spaces.md §3). */
+export type MergeSpaceRequest = {
+	space: string,
+	/**  One of the repo's allowed methods; defaults to the host's default. */
+	method?: MergeMethod | null,
+};
+
+/**  What `merge_space` asked the host for. */
+export type MergeSpaceResult = {
+	method: MergeMethod,
+	/**  Auto-merge: the PR merges itself once its checks and reviews pass. */
+	auto: boolean,
+	/**  Added to the base branch's merge queue instead. */
 	queue: boolean,
 };
 
@@ -1583,6 +1604,16 @@ export type Space = {
 	 *  set while its merge conflicts (docs/spaces.md §6).
 	 */
 	updating?: SpaceUpdate | null,
+	/**
+	 *  Earlier rounds, oldest first: each PR of the space that merged
+	 *  before "Continue" moved it to a new branch (docs/spaces.md §7).
+	 */
+	rounds?: SpaceRound[],
+	/**
+	 *  Told to the agent at the start of the next turn, then cleared: the
+	 *  previous PR merged and the work goes on on a new branch.
+	 */
+	continue_note?: string | null,
 };
 
 /**
@@ -1714,6 +1745,18 @@ export type SpaceReviewRequest = {
 	space: string,
 	/**  Also group the diff by meaning (Review); `false` for the live diff. */
 	group: boolean,
+};
+
+/**  One merged round of a continued space. */
+export type SpaceRound = {
+	/**  The PR that merged, and its branch. */
+	pr: PrId,
+	branch: string,
+	/**  The base the round forked from, and its last pushed checkpoint. */
+	base_sha: Sha,
+	head_sha: Sha,
+	/**  When "Continue" started the next round. */
+	at: number,
 };
 
 export type SpaceRunRequest = {

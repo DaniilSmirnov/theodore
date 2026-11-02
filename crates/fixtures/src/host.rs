@@ -663,6 +663,7 @@ impl HostAdapter for FixtureHost {
             required_approvals: detail.summary.required_approvals,
             auto_merge_allowed: true,
             merge_queue: false,
+            default_method: Some(MergeMethod::Squash),
         })
     }
 

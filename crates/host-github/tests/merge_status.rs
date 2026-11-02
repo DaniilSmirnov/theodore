@@ -31,6 +31,7 @@ async fn merge_status_maps_a_clean_mergeable_pr() {
                     "squashMergeAllowed": true,
                     "rebaseMergeAllowed": false,
                     "autoMergeAllowed": true,
+                    "viewerDefaultMergeMethod": "SQUASH",
                     "pullRequest": {
                         "mergeable": "MERGEABLE",
                         "mergeStateStatus": "CLEAN",
@@ -55,6 +56,7 @@ async fn merge_status_maps_a_clean_mergeable_pr() {
     assert!(!status.in_queue);
     assert!(status.auto_merge_allowed);
     assert!(!status.merge_queue);
+    assert_eq!(status.default_method, Some(MergeMethod::Squash));
 }
 
 #[tokio::test]
