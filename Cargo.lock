@@ -5776,6 +5776,7 @@ dependencies = [
  "sha2",
  "tar",
  "tempfile",
+ "theodore-code-intel-lsp",
  "theodore-ports",
  "tokio",
  "tracing",

@@ -24,13 +24,14 @@ pub(crate) fn language_of(manifest: Manifest, only: Option<HashSet<LanguageId>>)
     })
 }
 
-/// A language code intelligence knows something about: it has a grammar or
-/// a server in the manifest. JSON, YAML, Markdown are not; the text
-/// fallback leaves them out, and notes do not mention them.
+/// A code language code intelligence knows something about: it has a
+/// grammar or a server in the manifest, and is not `prose` (Markdown, JSON,
+/// YAML, TOML). The text fallback leaves the rest out, and notes do not
+/// mention them.
 pub(crate) fn is_code(manifest: &Manifest, language: &LanguageId) -> bool {
     manifest
         .language(language)
-        .is_some_and(|l| l.grammar.is_some() || !l.servers.is_empty())
+        .is_some_and(|l| !l.prose && (l.grammar.is_some() || !l.servers.is_empty()))
 }
 
 pub(crate) struct Ws {

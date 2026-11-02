@@ -222,7 +222,13 @@ manifest entry ─▶ download ─▶ sha256 (required) ─▶ unpack ─▶ ser
 
 | Downloaded by Theodore (no runtime needed) | Used only if already installed |
 | --- | --- |
-| rust-analyzer, clangd, ty / pyrefly, tsgo, gopls (our build), zls, lua-language-server, taplo, marksman, terraform-ls | sourcekit-lsp (Xcode), typescript-language-server / pyright (Node), JDT LS (JVM), kotlin-lsp, Roslyn (.NET), ruby-lsp, ElixirLS, Metals |
+| rust-analyzer, clangd, ty / pyrefly, tsgo, gopls (our build), lua-language-server, taplo, marksman, terraform-ls | sourcekit-lsp (Xcode), typescript-language-server / pyright (Node), zls¹, JDT LS (JVM), kotlin-lsp, Roslyn (.NET), ruby-lsp, ElixirLS, Metals |
+
+¹ zigtools/zls only publishes darwin-arm64 as `.tar.xz`; `ArchiveFormat`
+(`crates/code-intel-toolchain/src/manifest.rs`) has no xz variant yet
+(`tar.gz`, `zip`, `gz`, `binary`, npm `tgz`, wheel), so zls is detect-only
+for now — found on the machine, not downloaded. Moves to the left column
+once that format exists.
 
 Detection looks, in order: the manifest's `detect` commands on `PATH`,
 `rustup which`, `xcrun --find`, the repo's `node_modules/.bin`. A server found
@@ -420,8 +426,14 @@ A layer that does not improve them is not turned on by default.
 
 ## 11. Open questions
 
-- tsgo's LSP maturity: default for TypeScript, or behind
-  typescript-language-server until it is?
+- tsgo's LSP maturity: resolved for the basics — a two-file fixture project
+  through `theodore-code-intel-lsp` gets correct `definition`, cross-file
+  `references` and `documentSymbol` from `tsgo --lsp --stdio`
+  (`crates/code-intel-toolchain/tests/tsgo_lsp.rs`, `--ignored`); it is
+  listed ahead of typescript-language-server for `typescript` / `tsx`.
+  Still open: diagnostics, rename, hover and large real-world projects
+  (this crate's own fixture has no `node_modules`) — the eval (§10)
+  decides whether it stays first for those.
 - Mirror every server into our assets, or only when upstream breaks?
 - `max_servers` and `idle_minutes` defaults: measured on a large repo, not
   guessed.

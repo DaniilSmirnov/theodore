@@ -200,6 +200,10 @@ pub struct LanguageSpec {
     ///
     /// [`Toolchain::ensure_grammar`]: crate::Toolchain::ensure_grammar
     pub tags_extends: Option<LanguageId>,
+    /// Data or prose (Markdown, JSON, YAML, TOML), not code: symbols and
+    /// servers may serve it, but the text fallback of a code query never
+    /// searches it.
+    pub prose: bool,
     /// The package that parses it, if CI built one.
     pub grammar: Option<GrammarSpec>,
     /// In preference order.
@@ -249,6 +253,8 @@ struct RawLanguage {
     lsp_id: Option<String>,
     #[serde(default)]
     tags_extends: Option<LanguageId>,
+    #[serde(default)]
+    prose: bool,
     #[serde(default)]
     servers: Vec<String>,
 }
@@ -331,6 +337,7 @@ impl Manifest {
                 globs: lang.globs,
                 lsp_id: lang.lsp_id,
                 tags_extends: lang.tags_extends,
+                prose: lang.prose,
                 grammar,
                 servers: specs,
             });
