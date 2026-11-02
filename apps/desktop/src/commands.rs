@@ -699,6 +699,16 @@ pub async fn create_space(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn project_issues(
+    op: crate::op::Op,
+    req: theodore_contract::ProjectIssuesRequest,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<Vec<theodore_contract::SpaceIssue>, CommandError> {
+    op.run(async move { core.project_issues(req).await }).await
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn list_spaces(
     op: crate::op::Op,
     project: Option<String>,

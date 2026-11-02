@@ -101,6 +101,7 @@ async fn one_turn(f: &Fixtures, core: &Core, project: &Project, goal: &str) -> S
             base: None,
             agent: None,
             model: None,
+            start_from: None,
         })
         .await
         .unwrap();
@@ -219,6 +220,7 @@ async fn open_pr_fills_the_repos_template_and_links_back_to_the_space() {
             base: None,
             agent: None,
             model: None,
+            start_from: None,
         })
         .await
         .unwrap();

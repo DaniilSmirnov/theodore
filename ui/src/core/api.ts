@@ -50,6 +50,7 @@ import type {
   ProblemReport,
   PrId,
   Project,
+  ProjectIssuesRequest,
   ProjectWorkingState,
   ReactRequest,
   ReplyRequest,
@@ -72,6 +73,7 @@ import type {
   SpaceBaseStatus,
   SpaceFeedbackRequest,
   SpaceFixCiRequest,
+  SpaceIssue,
   SpaceReviewRequest,
   SpaceQueuedRequest,
   SpaceSendRequest,
@@ -284,6 +286,9 @@ export const api = {
   // ── spaces (docs/spaces.md; hidden behind build mode) ──
   createSpace: (req: CreateSpaceRequest) =>
     call<Space>('create_space', { req }),
+  /** New space's "From an issue" picker. */
+  projectIssues: (req: ProjectIssuesRequest) =>
+    call<SpaceIssue[]>('project_issues', { req }),
   listSpaces: (project: string | null) =>
     call<Space[]>('list_spaces', { project }),
   spaceSend: (req: SpaceSendRequest) => call<string>('space_send', { req }),

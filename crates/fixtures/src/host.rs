@@ -109,6 +109,7 @@ impl HostAdapter for FixtureHost {
             merge_queue: true,
             auto_merge: true,
             reactions: true,
+            issues: false,
         }
     }
 

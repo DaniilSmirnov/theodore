@@ -44,6 +44,7 @@ import type {
   Space,
   SpaceConfigView,
   SpaceMode,
+  SpaceStart,
 } from '../../gen/contract';
 import { api } from '../../core/api';
 import { STORAGE_NS } from '../../stores/UiStore';
@@ -67,6 +68,7 @@ import { agentModel } from '../agentModel';
 import { isBuildMode } from './mode';
 import { ReviewMenu } from './ReviewMenu';
 import { markSpaceSeen } from './seen';
+import { useProjectIssues } from './useProjectIssues';
 import {
   checksByReply,
   runControl,
@@ -1050,9 +1052,23 @@ const SpaceChanges = observer(function SpaceChanges({
   );
 });
 
+/** `goal`: the plain, usual case. `issue` / `branch` / `pr` adopt something
+ *  that already exists on the host (docs/spaces.md §3 "New space") instead
+ *  of forking a fresh branch from the goal. */
+type StartKind = 'goal' | 'issue' | 'branch' | 'pr';
+
+const START_KIND_ITEMS: { id: StartKind; label: string; hint?: string }[] = [
+  { id: 'goal', label: 'A new branch', hint: 'from the goal' },
+  { id: 'issue', label: 'An existing issue' },
+  { id: 'branch', label: 'An existing branch' },
+  { id: 'pr', label: 'An existing PR' },
+];
+
 /** New space: a composer, not a form — say what you want; the project,
  *  agent and base sit as chips around it. ⏎ creates and sends it as the
- *  first turn; the space opens on that turn. */
+ *  first turn; the space opens on that turn. Picking "An existing issue /
+ *  branch / PR" adopts it instead: the worktree starts on its tip, and
+ *  shipping pushes back to it rather than a fresh `<login>/<slug>`. */
 export const NewSpaceModal = observer(function NewSpaceModal() {
   const store = useRootStore();
   const ui = useUi();
@@ -1065,9 +1081,31 @@ export const NewSpaceModal = observer(function NewSpaceModal() {
   const [goal, setGoal] = useState('');
   const [agent, setAgent] = useState<AgentId | null>(null);
   const [busy, setBusy] = useState(false);
+  const [startKind, setStartKind] = useState<StartKind>('goal');
+  const [issueId, setIssueId] = useState<string | null>(null);
+  const [startText, setStartText] = useState('');
   const chosen = ready.find((p) => p.id === project);
+  const issues = useProjectIssues(startKind === 'issue' ? project : null);
+  // Switching project, or away from "issue"/"branch"/"PR", drops whatever
+  // was picked/typed for the previous one rather than silently reusing it.
+  useEffect(() => {
+    setIssueId(null);
+    setStartText('');
+  }, [project, startKind]);
+  const prNumber = Number(startText.trim());
+  const startFrom: SpaceStart | null =
+    startKind === 'issue' && issueId
+      ? { kind: 'issue', value: issueId }
+      : startKind === 'branch' && startText.trim()
+        ? { kind: 'branch', value: startText.trim() }
+        : startKind === 'pr' && startText.trim() && Number.isInteger(prNumber) && prNumber > 0
+          ? { kind: 'pr', value: prNumber }
+          : null;
+  // A plain goal needs the text; an adopted issue/branch/PR needs that
+  // picked/typed instead — the goal becomes an optional extra note.
+  const canStart = startKind === 'goal' ? goal.trim() !== '' : startFrom !== null;
   const start = async () => {
-    if (!project || !goal.trim() || busy) return;
+    if (!project || !canStart || busy) return;
     setBusy(true);
     try {
       const s = await api.createSpace({
@@ -1079,6 +1117,7 @@ export const NewSpaceModal = observer(function NewSpaceModal() {
         agent,
         // The agent's model setting applies at each turn.
         model: null,
+        start_from: startFrom,
       });
       ui.closeModal();
       ui.go({ name: 'space', id: s.id });
@@ -1124,16 +1163,30 @@ export const NewSpaceModal = observer(function NewSpaceModal() {
             value={goal}
             onChange={setGoal}
             onSubmit={() => void start()}
-            placeholder="What do you want to work on?"
+            placeholder={
+              startKind === 'goal'
+                ? 'What do you want to work on?'
+                : 'Anything else the agent should know? (optional)'
+            }
             rows={5}
             quiet
             autoFocus
             disabled={busy || !project}
+            canSubmitEmpty={startKind !== 'goal' && startFrom !== null}
             submit={busy ? 'Creating…' : 'Create'}
             chips={
               <>
                 <AgentChip value={agent} onChange={setAgent} />
-                {chosen?.default_branch && (
+                <ChipMenu
+                  ariaLabel="Start from"
+                  label={
+                    START_KIND_ITEMS.find((i) => i.id === startKind)?.label
+                  }
+                  items={START_KIND_ITEMS}
+                  selected={startKind}
+                  onSelect={setStartKind}
+                />
+                {startKind === 'goal' && chosen?.default_branch && (
                   <span className="flex items-center gap-1 px-2 text-xs text-muted">
                     <BranchesRight className="size-3.5" />
                     from {chosen.default_branch}
@@ -1142,9 +1195,70 @@ export const NewSpaceModal = observer(function NewSpaceModal() {
               </>
             }
           />
+          {startKind === 'issue' && (
+            <div className="flex flex-wrap items-center gap-1.5 px-2">
+              {issues.length === 0 ? (
+                <span className="text-xs text-muted">
+                  No open issues assigned to you on this project's host.
+                </span>
+              ) : (
+                <ChipMenu
+                  ariaLabel="Issue"
+                  label={
+                    issueId
+                      ? `#${issueId} ${
+                          issues.find((i) => String(i.number) === issueId)
+                            ?.title ?? ''
+                        }`
+                      : 'Pick an issue'
+                  }
+                  items={issues.map((i) => ({
+                    id: String(i.number),
+                    label: `#${i.number} ${i.title}`,
+                  }))}
+                  selected={issueId ?? ''}
+                  onSelect={setIssueId}
+                />
+              )}
+            </div>
+          )}
+          {(startKind === 'branch' || startKind === 'pr') && (
+            <div className="flex items-center gap-1.5 px-2">
+              <TextField
+                value={startText}
+                onChange={setStartText}
+                aria-label={startKind === 'branch' ? 'Branch name' : 'PR number'}
+                autoFocus
+              >
+                <InputGroup className="w-56 rounded-xl">
+                  {startKind === 'pr' && (
+                    <InputGroup.Prefix className="text-xs text-muted">
+                      #
+                    </InputGroup.Prefix>
+                  )}
+                  <InputGroup.Input
+                    placeholder={
+                      startKind === 'branch' ? 'feature/retry-export' : '123'
+                    }
+                    inputMode={startKind === 'pr' ? 'numeric' : 'text'}
+                    className="w-full text-sm"
+                  />
+                </InputGroup>
+              </TextField>
+            </div>
+          )}
           <span className="px-2 text-xs text-muted">
-            The agent works in its own worktree — your checkout is never
-            touched. <K>⇧⏎</K> new line.
+            {startKind === 'goal' ? (
+              <>
+                The agent works in its own worktree — your checkout is never
+                touched. <K>⇧⏎</K> new line.
+              </>
+            ) : (
+              <>
+                The worktree starts on its tip; shipping pushes back to the
+                same branch.
+              </>
+            )}
           </span>
         </Modal.Dialog>
       </Modal.Container>

@@ -156,6 +156,9 @@ impl HostAdapter for BitbucketAdapter {
             merge_queue: false,
             auto_merge: false,
             reactions: false,
+            // Bitbucket's issue tracker is a separate, often-disabled
+            // per-repo feature; "From an issue" hides for it.
+            issues: false,
         }
     }
 

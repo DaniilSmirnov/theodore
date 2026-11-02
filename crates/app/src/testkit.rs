@@ -21,7 +21,7 @@ use theodore_ports::{
     DeviceSignInPoll, DiffOptions, Fetched, GitError, GitPort, GitResult, HostAdapter, HostError,
     HostResult, InboxSection, IncomingCallback, MergeMethod, MergeStatus, ModelRow, NewAction,
     OutboxItem, OutboxStatus, ReviewSubmission, Secrets, SecretsError, Store, StoreError,
-    StoreResult, SubmittedReview, SyncAction, SyncActionCode, Worktree,
+    StoreResult, SubmittedReview, SyncAction, SyncActionCode, TrackedIssue, Worktree,
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -1203,6 +1203,8 @@ pub struct FakeHost {
     /// (a timeout after the host did open it).
     pub create_pr_errors: Mutex<VecDeque<HostError>>,
     pub create_pr_lands: Mutex<bool>,
+    pub get_issue_responses: Mutex<VecDeque<HostResult<TrackedIssue>>>,
+    pub my_open_issues_responses: Mutex<VecDeque<HostResult<Vec<TrackedIssue>>>>,
 }
 
 impl FakeHost {
@@ -1305,6 +1307,12 @@ impl FakeHost {
     pub fn push_repo_info(&self, r: HostResult<HostRepo>) {
         self.repo_info_responses.lock().unwrap().push_back(r);
     }
+    pub fn push_get_issue(&self, r: HostResult<TrackedIssue>) {
+        self.get_issue_responses.lock().unwrap().push_back(r);
+    }
+    pub fn push_my_open_issues(&self, r: HostResult<Vec<TrackedIssue>>) {
+        self.my_open_issues_responses.lock().unwrap().push_back(r);
+    }
 }
 
 #[async_trait]
@@ -1350,6 +1358,7 @@ impl HostAdapter for FakeHost {
             merge_queue: false,
             auto_merge: false,
             reactions: true,
+            issues: true,
         }
     }
     async fn changed_since(&self, _cursor: Option<&str>) -> HostResult<Changes> {
@@ -1381,6 +1390,20 @@ impl HostAdapter for FakeHost {
     }
     async fn list_repos(&self) -> HostResult<Vec<theodore_domain::HostRepo>> {
         Ok(vec![])
+    }
+    async fn get_issue(&self, _repo: &RepoRef, _number: u64) -> HostResult<TrackedIssue> {
+        self.get_issue_responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| Err(HostError::NotFound("no fixture queued".into())))
+    }
+    async fn my_open_issues(&self, _repo: &RepoRef) -> HostResult<Vec<TrackedIssue>> {
+        self.my_open_issues_responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(vec![]))
     }
     async fn get_pr(&self, _pr: &PrRef, _etag: Option<&str>) -> HostResult<Fetched<PrDetail>> {
         self.get_pr_calls

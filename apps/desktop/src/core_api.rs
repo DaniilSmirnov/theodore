@@ -214,6 +214,15 @@ pub trait CoreApi: Send + Sync {
     ) -> Result<theodore_contract::Space, CommandError> {
         Err(not_ready())
     }
+    /// New space's "From an issue" picker: the project's own open issues
+    /// assigned to the viewer (`Capabilities::issues`; empty when the host
+    /// doesn't support it).
+    async fn project_issues(
+        &self,
+        _req: theodore_contract::ProjectIssuesRequest,
+    ) -> Result<Vec<theodore_contract::SpaceIssue>, CommandError> {
+        Err(not_ready())
+    }
     /// Spaces of one project, or all.
     async fn list_spaces(
         &self,

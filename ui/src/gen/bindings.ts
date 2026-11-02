@@ -99,6 +99,7 @@ export const commands = {
 	projectWorkingState: (project: string) => typedError<ProjectWorkingState, CommandError>(__TAURI_INVOKE("project_working_state", { project })),
 	closeBranchReview: (pr: PrId) => typedError<null, CommandError>(__TAURI_INVOKE("close_branch_review", { pr })),
 	createSpace: (req: CreateSpaceRequest) => typedError<Space, CommandError>(__TAURI_INVOKE("create_space", { req })),
+	projectIssues: (req: ProjectIssuesRequest) => typedError<SpaceIssue[], CommandError>(__TAURI_INVOKE("project_issues", { req })),
 	listSpaces: (project: string | null) => typedError<Space[], CommandError>(__TAURI_INVOKE("list_spaces", { project })),
 	spaceSend: (req: SpaceSendRequest) => typedError<string, CommandError>(__TAURI_INVOKE("space_send", { req })),
 	/**  "Send now": into the running turn when it takes messages, else queued. */
@@ -655,17 +656,24 @@ export type ConflictKind = "content" | "add_add" | "modify_delete" | "rename_del
 
 export type CreateSpaceRequest = {
 	project: string,
-	/**  What should change. Sent as the first turn unless empty. */
+	/**
+	 *  What should change. Sent as the first turn unless empty. Ignored
+	 *  (replaced by the issue's title + body) with `start_from: Issue`.
+	 */
 	goal: string,
 	/**  Defaults to a slug of the goal. */
 	name?: string | null,
-	/**  Defaults to `<host login>/<name>` (`space/<name>` without a login). */
+	/**
+	 *  Defaults to `<host login>/<name>` (`space/<name>` without a login);
+	 *  ignored with `start_from: Branch` / `Pr`, which keep that branch.
+	 */
 	branch?: string | null,
 	/**  Defaults to the project's default branch. */
 	base?: string | null,
 	/**  Defaults to the `agents.chat` setting. */
 	agent?: AgentId | null,
 	model?: string | null,
+	start_from?: SpaceStart | null,
 };
 
 export type DelegateRequest = {
@@ -1134,6 +1142,14 @@ export type Project = {
 	last_fetched_at?: number | null,
 };
 
+/**
+ *  New space's "From an issue" picker: the project's own open issues
+ *  assigned to the viewer (`HostAdapter::my_open_issues`).
+ */
+export type ProjectIssuesRequest = {
+	project: string,
+};
+
 export type ProjectStatus = "cloning" | "ready" | "error";
 
 /**
@@ -1532,6 +1548,18 @@ export type Space = {
 	 *  previous PR merged and the work goes on on a new branch.
 	 */
 	continue_note?: string | null,
+	/**
+	 *  Set when the space started on an existing branch or PR
+	 *  (`CreateSpaceRequest::start_from`): its tip when the space forked.
+	 *  Shipping fast-forwards onto `branch` from here instead of squashing
+	 *  onto `base_sha` — `branch` already exists on the host.
+	 */
+	fork_sha?: Sha | null,
+	/**
+	 *  Set when the space started from a host issue: its number in the
+	 *  project's repo. `ship_space`'s PR body says "Closes #<n>".
+	 */
+	issue?: number | null,
 };
 
 /**
@@ -1594,6 +1622,14 @@ export type SpaceFeedbackRequest = {
  */
 export type SpaceFixCiRequest = {
 	space: string,
+};
+
+/**  One issue, wire shape of `theodore_ports::TrackedIssue`. */
+export type SpaceIssue = {
+	number: number,
+	title: string,
+	body: string,
+	url: string,
 };
 
 /**  One line of a space command's output (`space_logs`, `Ephemeral::SpaceLog`). */
@@ -1729,6 +1765,29 @@ export type SpaceShipped = {
 	pushes: number,
 	at: number,
 };
+
+/**
+ *  Where a new space's work starts (docs/spaces.md §3 "New space"), instead
+ *  of a fresh branch off the project's default.
+ */
+export type SpaceStart =
+/**
+ *  A host issue — a pasted URL, or `#<number>` / a bare number in the
+ *  project's repo. `goal` becomes the issue's title + body + a link;
+ *  the number is kept so `ship_space` can say "Closes #<number>".
+ */
+{ kind: "issue"; value: string } |
+/**
+ *  An existing remote branch: its tip becomes the worktree, the
+ *  project's default branch stays `base`. Shipping pushes to this same
+ *  branch (fast-forward, never forced) instead of `<login>/<slug>`.
+ */
+{ kind: "branch"; value: string } |
+/**
+ *  An existing PR's branch (same as `Branch`), plus `Space::pr` so the
+ *  space opens "In review" right away.
+ */
+{ kind: "pr"; value: number };
 
 export type SpaceStatus =
 /**  No turn running. */

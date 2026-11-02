@@ -222,6 +222,7 @@ impl HostAdapter for SandboxHost {
             merge_queue: true,
             auto_merge: true,
             reactions: true,
+            issues: false,
         }
     }
 

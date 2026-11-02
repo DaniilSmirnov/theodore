@@ -161,6 +161,16 @@ pub struct Space {
     /// previous PR merged and the work goes on on a new branch.
     #[serde(default)]
     pub continue_note: Option<String>,
+    /// Set when the space started on an existing branch or PR
+    /// (`CreateSpaceRequest::start_from`): its tip when the space forked.
+    /// Shipping fast-forwards onto `branch` from here instead of squashing
+    /// onto `base_sha` — `branch` already exists on the host.
+    #[serde(default)]
+    pub fork_sha: Option<Sha>,
+    /// Set when the space started from a host issue: its number in the
+    /// project's repo. `ship_space`'s PR body says "Closes #<n>".
+    #[serde(default)]
+    pub issue: Option<u64>,
 }
 
 /// A merge of the base into the space, left in progress on conflicts
@@ -240,15 +250,35 @@ pub struct SpaceTurn {
     pub base_before: Option<Sha>,
 }
 
+/// Where a new space's work starts (docs/spaces.md §3 "New space"), instead
+/// of a fresh branch off the project's default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum SpaceStart {
+    /// A host issue — a pasted URL, or `#<number>` / a bare number in the
+    /// project's repo. `goal` becomes the issue's title + body + a link;
+    /// the number is kept so `ship_space` can say "Closes #<number>".
+    Issue(String),
+    /// An existing remote branch: its tip becomes the worktree, the
+    /// project's default branch stays `base`. Shipping pushes to this same
+    /// branch (fast-forward, never forced) instead of `<login>/<slug>`.
+    Branch(String),
+    /// An existing PR's branch (same as `Branch`), plus `Space::pr` so the
+    /// space opens "In review" right away.
+    Pr(u64),
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 pub struct CreateSpaceRequest {
     pub project: String,
-    /// What should change. Sent as the first turn unless empty.
+    /// What should change. Sent as the first turn unless empty. Ignored
+    /// (replaced by the issue's title + body) with `start_from: Issue`.
     pub goal: String,
     /// Defaults to a slug of the goal.
     #[serde(default)]
     pub name: Option<String>,
-    /// Defaults to `<host login>/<name>` (`space/<name>` without a login).
+    /// Defaults to `<host login>/<name>` (`space/<name>` without a login);
+    /// ignored with `start_from: Branch` / `Pr`, which keep that branch.
     #[serde(default)]
     pub branch: Option<String>,
     /// Defaults to the project's default branch.
@@ -259,6 +289,24 @@ pub struct CreateSpaceRequest {
     pub agent: Option<AgentId>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub start_from: Option<SpaceStart>,
+}
+
+/// New space's "From an issue" picker: the project's own open issues
+/// assigned to the viewer (`HostAdapter::my_open_issues`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct ProjectIssuesRequest {
+    pub project: String,
+}
+
+/// One issue, wire shape of `theodore_ports::TrackedIssue`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct SpaceIssue {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]

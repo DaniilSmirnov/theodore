@@ -39,11 +39,15 @@ pub(crate) const HISTORY_MESSAGES: usize = 12;
 const HISTORY_CHARS: usize = 2_000;
 
 impl Core {
-    pub async fn create_space(&self, req: CreateSpaceRequest) -> AppResult<Space> {
+    pub async fn create_space(&self, mut req: CreateSpaceRequest) -> AppResult<Space> {
         let project = self
             .project_row(&req.project)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("project {}", req.project)))?;
+        // From a host issue (rewrites `req.goal`), an existing branch, or an
+        // existing PR (docs/spaces.md §3 "New space") — `None` for the
+        // common case, a fresh branch off the project's default.
+        let start = self.resolve_space_start(&project, &mut req).await?;
         let base = req
             .base
             .clone()
@@ -58,7 +62,10 @@ impl Core {
             .as_deref()
             .map(str::trim)
             .is_some_and(|n| !n.is_empty());
-        let user_branched = req.branch.is_some();
+        // An adopted branch/PR is never renamed by the later proposal
+        // either — it's not this space's to rename, and `fork_sha` tracks
+        // it by this exact name.
+        let user_branched = req.branch.is_some() || start.adopt.is_some();
         let name = match req.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
             Some(n) => n.to_string(),
             // Named after the goal; a second "fix login" in the project
@@ -69,17 +76,24 @@ impl Core {
                 unique_name(&slug(&req.goal), &taken)
             }
         };
-        let branch = match req.branch.clone() {
-            Some(b) => b,
+        let branch = match (&start.adopt, req.branch.clone()) {
+            // An adopted branch/PR keeps its own name — never renamed into
+            // `<login>/<slug>`, since shipping pushes to it directly.
+            (Some(a), _) => a.branch.clone(),
+            (None, Some(b)) => b,
             // Named after you on the host (docs/spaces.md §12); a local
             // folder, or a host we can't reach, gets `space/<slug>`.
-            None => crate::usecases::space_naming::branch_for(self, &project, &name).await,
+            (None, None) => crate::usecases::space_naming::branch_for(self, &project, &name).await,
         };
         if !is_valid_branch(&branch) {
             return Err(AppError::Invalid(format!("bad branch name {branch:?}")));
         }
         let repo_path = self.ensure_project_cache(&project).await?;
         let base_sha = self.0.deps.git.resolve_ref(&repo_path, &base).await?;
+        // The worktree starts on the adopted branch's tip when there is
+        // one; `base_sha` stays the diff base (docs/spaces.md §3 "the diff
+        // is the whole branch vs its base").
+        let fork_sha = start.adopt.as_ref().map_or(&base_sha, |a| &a.fork_sha);
         // The project's config (docs/config.md), as of the space's base.
         let layers = self.project_layers(&project, Some(&base_sha)).await;
         let cfg = self.config_with_trust(&layers, &project, false).await;
@@ -104,7 +118,7 @@ impl Core {
             .0
             .deps
             .git
-            .space_worktree(&repo_path, &id, &base_sha)
+            .space_worktree(&repo_path, &id, fork_sha)
             .await?;
 
         // Files from the checkout, then ports for the space's life.
@@ -135,6 +149,8 @@ impl Core {
             });
         let has_goal = !req.goal.trim().is_empty();
         let setup = crate::usecases::space_hooks::initial_setup(&cfg, has_goal, notes);
+        let adopted_pr = start.adopt.as_ref().and_then(|a| a.pr.clone());
+        let fork_sha = start.adopt.map(|a| a.fork_sha);
 
         let now = self.0.deps.clock.now();
         let space = Space {
@@ -152,7 +168,7 @@ impl Core {
             model: req.model.clone(),
             mode: SpaceMode::Edit,
             review_pr: None,
-            pr: None,
+            pr: adopted_pr.as_ref().map(|(r, _)| r.id()),
             turns: 0,
             run: None,
             error: None,
@@ -173,6 +189,8 @@ impl Core {
             updating: None,
             rounds: Vec::new(),
             continue_note: None,
+            fork_sha,
+            issue: start.issue,
         };
         self.apply(vec![NewAction {
             model: models::SPACE.into(),
@@ -186,6 +204,18 @@ impl Core {
         theodore_telemetry::product(theodore_telemetry::ProductEvent::SpaceCreated {
             mode: crate::usecases::telemetry::wire_str(&space.mode),
         });
+        // An adopted PR (`start_from: Pr`, or a `Branch` that already has
+        // one): store what's known now, fetch the rest, so the space opens
+        // "In review" without waiting for the next poll.
+        match adopted_pr {
+            Some((_, Some(detail))) => {
+                let _ = self.apply_pr_detail(&detail).await;
+            }
+            Some((pr_ref, None)) => {
+                self.refresh_pr(&pr_ref.id(), &pr_ref).await;
+            }
+            None => {}
+        }
 
         // The empty diff exists from the start, so the page has a review id.
         self.space_review(SpaceReviewRequest {

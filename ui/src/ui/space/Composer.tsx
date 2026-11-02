@@ -55,6 +55,7 @@ export function Composer({
   queueWhileRunning,
   onEmptyBackspace,
   quiet,
+  canSubmitEmpty,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -101,10 +102,15 @@ export function Composer({
   onEmptyBackspace?: () => void;
   /** The big New space box: larger text, no focus ring. */
   quiet?: boolean;
+  /** New space "from an issue/branch/PR" (docs/spaces.md §3): something
+   *  other than the text already makes this submittable, so the usual
+   *  "empty box" check is skipped in favor of this. */
+  canSubmitEmpty?: boolean;
 }) {
   const empty =
-    (!value.trim() && (requireText || !attachments?.ids.length)) ||
-    !!attachments?.busy;
+    !canSubmitEmpty &&
+    ((!value.trim() && (requireText || !attachments?.ids.length)) ||
+      !!attachments?.busy);
   const files = attachments ? fileHandlers(attachments.add) : null;
   const own = useRef<HTMLTextAreaElement | null>(null);
   const matches = skills ? matchSkills(skills, value) : null;

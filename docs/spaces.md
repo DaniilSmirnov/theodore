@@ -163,6 +163,34 @@ the proposed solution…", GitHub #78). Open PR / Merge locally's own title
 field still defaults to the goal's first line (`defaultTitle`), on
 purpose: that one is the commit message, not the chat's name.
 
+#### Start from an issue, a branch, or a PR
+
+A "Start from" chip next to the goal switches what the space starts on,
+instead of a fresh `<login>/<slug>` forked from the goal
+(`CreateSpaceRequest.start_from` / `SpaceStart`):
+
+```
+goal (default)  ──▶ fork <login>/<slug> off the project's default branch
+issue            ──▶ get_issue; goal := title + body + a link; number kept
+                     for ship_space's PR body ("Closes #<number>")
+branch           ──▶ resolve the branch's tip; worktree starts there
+pr               ──▶ get_pr; same as branch, plus Space.pr set right away
+                     (opens "In review", not "Drafting")
+```
+
+| | branch / name | worktree starts at | shipping |
+| --- | --- | --- | --- |
+| goal | `<login>/<slug>`, new | `base_sha` | Open PR: pushes the new branch |
+| issue | `<login>/<slug>`, new | `base_sha` | same, body says "Closes #n" |
+| branch | the adopted branch, kept | its own tip (`fork_sha`) | pushes back to it, never a fresh branch |
+| pr | the PR's branch, kept | its own tip (`fork_sha`) | Push (the PR already exists) |
+
+An issue needs a host that can read its own issues
+(`Capabilities::issues`; GitHub and GitLab, not Bitbucket) — the picker
+lists the viewer's own open ones (`my_open_issues`), or a pasted URL /
+`#<number>` resolves directly (`get_issue`). The goal box becomes an
+optional note on top of what's picked or typed, rather than required.
+
 ### Space page — drafting
 
 Chat left, changes right. The diff is the whole branch vs its base, the same

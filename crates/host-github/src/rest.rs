@@ -366,6 +366,53 @@ pub(crate) async fn create_issue(
         .value)
 }
 
+/// The bits of a REST issue object `get_issue` / `list_assigned_issues`
+/// read; `pull_request` is `Some` when the issues endpoint handed back a
+/// pull request (GitHub models PRs as issues too), filtered out by callers.
+#[derive(Debug, Deserialize)]
+pub(crate) struct GhIssueFull {
+    pub number: u64,
+    pub title: String,
+    pub body: Option<String>,
+    pub html_url: String,
+    #[serde(default)]
+    pub pull_request: Option<serde_json::Value>,
+}
+
+/// `GET /repos/{owner}/{repo}/issues/{number}`.
+pub(crate) async fn get_issue(
+    http: &HttpClient,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> HostResult<GhIssueFull> {
+    let path = format!("repos/{owner}/{repo}/issues/{number}");
+    let issue = http.get::<GhIssueFull>(&path).await?.value;
+    if issue.pull_request.is_some() {
+        return Err(HostError::NotFound(format!("issue #{number}")));
+    }
+    Ok(issue)
+}
+
+/// `GET /repos/{owner}/{repo}/issues?state=open&assignee={login}`: open
+/// issues assigned to `login`, pull requests filtered out.
+pub(crate) async fn list_assigned_issues(
+    http: &HttpClient,
+    owner: &str,
+    repo: &str,
+    login: &str,
+) -> HostResult<Vec<GhIssueFull>> {
+    let path = format!(
+        "repos/{owner}/{repo}/issues?state=open&assignee={}&per_page=50",
+        urlencode(login)
+    );
+    let issues = http.get::<Vec<GhIssueFull>>(&path).await?.value;
+    Ok(issues
+        .into_iter()
+        .filter(|i| i.pull_request.is_none())
+        .collect())
+}
+
 fn urlencode(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }

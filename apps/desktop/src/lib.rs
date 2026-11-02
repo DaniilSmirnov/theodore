@@ -93,6 +93,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::project_working_state,
             commands::close_branch_review,
             commands::create_space,
+            commands::project_issues,
             commands::list_spaces,
             commands::space_send,
             commands::space_send_now,

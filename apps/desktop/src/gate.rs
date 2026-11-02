@@ -204,6 +204,7 @@ mod tests {
             "remove_project",
             "list_spaces",
             "create_space",
+            "project_issues",
             "space_send",
             "space_send_now",
             "space_queued",
