@@ -48,8 +48,12 @@ const SOURCES: { id: ConfigSource; label: string }[] = [
 
 export const ConfigEditor = observer(function ConfigEditor({
   project,
+  rev = 0,
 }: {
   project: Project;
+  /** Bumped when something else wrote a layer's file (the Languages
+   *  switches): the files are read again, the text being edited stays. */
+  rev?: number;
 }) {
   const store = useRootStore();
   const [draft, setDraft] = useState<ConfigDraft | null>(null);
@@ -86,6 +90,18 @@ export const ConfigEditor = observer(function ConfigEditor({
       on = false;
     };
   }, [project.id]);
+
+  useEffect(() => {
+    if (rev === 0) return;
+    let on = true;
+    api
+      .configDraft(project.id)
+      .then((d) => on && setDraft(d))
+      .catch(() => {});
+    return () => {
+      on = false;
+    };
+  }, [project.id, rev]);
 
   // Checked as you type, a beat after the last key.
   useEffect(() => {

@@ -5705,8 +5705,10 @@ name = "theodore-code-intel"
 version = "0.1.11"
 dependencies = [
  "async-trait",
+ "hex",
  "pretty_assertions",
  "serde_json",
+ "sha2",
  "tempfile",
  "theodore-code-intel-lsp",
  "theodore-code-intel-syntax",
@@ -5719,6 +5721,7 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+ "wiremock",
 ]
 
 [[package]]

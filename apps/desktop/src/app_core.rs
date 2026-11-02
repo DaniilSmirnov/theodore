@@ -893,6 +893,15 @@ impl CoreApi for AppCore {
     async fn code_intel_decline(&self, language: String) -> Result<(), CommandError> {
         self.core.code_intel_decline(&language).await.map_err(err)
     }
+    async fn code_intel_remove(&self, language: String) -> Result<(), CommandError> {
+        self.core.code_intel_remove(&language).await.map_err(err)
+    }
+    async fn code_intel_hover(
+        &self,
+        req: theodore_contract::CodeHoverRequest,
+    ) -> Result<Option<theodore_contract::CodeHover>, CommandError> {
+        self.core.code_intel_hover(req).await.map_err(err)
+    }
     async fn ensure_global_config(
         &self,
     ) -> Result<theodore_contract::GlobalConfigInfo, CommandError> {

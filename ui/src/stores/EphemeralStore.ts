@@ -29,7 +29,11 @@ import type {
 import { appendLogs, seedLogs } from '../ui/space/commands';
 import { appendChunk, type TerminalChunk } from '../ui/space/terminalBuffer';
 import { configPrToast } from '../ui/project/configFile';
-import { suggestText } from '../ui/settings/languages';
+import {
+  suggestText,
+  withProgress,
+  type InstallProgressMap,
+} from '../ui/project/languages';
 import { api } from '../core/api';
 import { openExternal } from '../core/openExternal';
 import { accountGate, type AccountGate } from '../core/accountGate';
@@ -222,6 +226,10 @@ export class EphemeralStore {
    *  `Review`'s J/K steps through the same hunks the diff shows. */
   allEditsShown = new Set<string>();
   hiddenShown = new Set<string>();
+  /** Install progress (`code_intel_progress`) per language, each item at
+   *  its last event: project settings → Languages draws the bars from it
+   *  and reads the status again once an item settles. */
+  installProgress: InstallProgressMap = new Map();
 
   private nextToastId = 1;
   private nextFocusSeq = 1;
@@ -250,6 +258,7 @@ export class EphemeralStore {
       lineJump: observableRef,
       allEditsShown: observableShallow,
       hiddenShown: observableShallow,
+      installProgress: observableRef,
     });
   }
 
@@ -589,6 +598,9 @@ export class EphemeralStore {
           ];
           return;
         }
+        case 'code_intel_progress':
+          this.installProgress = withProgress(this.installProgress, e);
+          return;
         case 'code_intel_suggest': {
           // The core asks once per language per session (§5.1).
           const { language } = e;

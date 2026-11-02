@@ -616,6 +616,19 @@ pub enum Ephemeral {
         /// The server that would be downloaded (`clangd`).
         server: String,
     },
+    /// An install (`code_intel_install`, or `code_intel.install: always`)
+    /// downloading `language`'s grammar or server: `downloading` at most
+    /// four times a second per item, then `installed` or `failed`.
+    CodeIntelProgress {
+        /// The project whose worktree asked for it; `None` from Settings.
+        project: Option<String>,
+        language: String,
+        what: CodeInstallItem,
+        /// The grammar package (`tree-sitter-rust`) or server
+        /// (`rust-analyzer`).
+        name: String,
+        state: CodeInstallProgress,
+    },
     /// Raw PTY output of a space's terminal (docs/spaces.md "Terminal"),
     /// base64 (control sequences and all) so a chunk split mid UTF-8 still
     /// round-trips — `xterm.js`'s own parser tolerates that. `seq` is
@@ -807,6 +820,10 @@ pub fn types() -> specta::Types {
         .register::<CodeServer>()
         .register::<CodeInstall>()
         .register::<CodeServerState>()
+        .register::<CodeInstallItem>()
+        .register::<CodeInstallProgress>()
+        .register::<CodeHoverRequest>()
+        .register::<CodeHover>()
         .register::<StackInfo>()
         .register::<ReactionCount>()
         .register::<DiffSide>()

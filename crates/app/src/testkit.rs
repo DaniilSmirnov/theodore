@@ -2708,6 +2708,14 @@ pub struct FakeCodeIntel {
     pub hits: Mutex<Vec<theodore_ports::CodeHit>>,
     pub diagnostics: Mutex<Vec<theodore_ports::Diagnostic>>,
     pub renames: Mutex<Vec<theodore_ports::TextEdit>>,
+    /// `hover`'s answer.
+    pub hover: Mutex<Option<theodore_ports::Hover>>,
+    /// Sent to `install`'s progress listener, in order.
+    pub progress: Mutex<Vec<theodore_ports::InstallProgress>>,
+    /// `remove` fails with this, when set.
+    pub remove_error: Mutex<Option<theodore_ports::CodeIntelError>>,
+    /// Every `set_limits`, in order.
+    pub limits: Mutex<Vec<theodore_ports::CodeIntelLimits>>,
     /// Every query fails with this, when set.
     pub fail: Mutex<Option<theodore_ports::CodeIntelError>>,
 }
@@ -2868,12 +2876,45 @@ impl theodore_ports::CodeIntelPort for FakeCodeIntel {
         self.check()?;
         Ok(self.renames.lock().unwrap().clone())
     }
+    async fn hover(
+        &self,
+        _root: &Path,
+        path: &str,
+        at: theodore_ports::Position,
+    ) -> theodore_ports::CodeIntelResult<Option<theodore_ports::Hover>> {
+        self.record(format!("hover {path}:{}:{}", at.line, at.col));
+        self.check()?;
+        Ok(self.hover.lock().unwrap().clone())
+    }
     async fn install(
         &self,
         language: &theodore_ports::LanguageId,
+        progress: Option<theodore_ports::InstallProgressFn>,
     ) -> theodore_ports::CodeIntelResult<()> {
         self.record(format!("install {language}"));
+        if let Some(sink) = progress {
+            for p in self.progress.lock().unwrap().iter() {
+                sink(p.clone());
+            }
+        }
         Ok(())
+    }
+    async fn remove(
+        &self,
+        language: &theodore_ports::LanguageId,
+    ) -> theodore_ports::CodeIntelResult<()> {
+        self.record(format!("remove {language}"));
+        match self.remove_error.lock().unwrap().clone() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+    async fn set_limits(&self, limits: theodore_ports::CodeIntelLimits) {
+        self.record(format!(
+            "set_limits {} {} {} {}",
+            limits.max_servers, limits.idle_minutes, limits.max_file_kb, limits.cache_mb
+        ));
+        self.limits.lock().unwrap().push(limits);
     }
     async fn file_changed(&self, root: &Path, path: &str) {
         self.record(format!("file_changed {} {path}", root.display()));

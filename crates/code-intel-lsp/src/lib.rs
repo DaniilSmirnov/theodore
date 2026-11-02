@@ -28,6 +28,22 @@ pub use pool::LspPool;
 pub use session::{LspSession, SessionOptions};
 pub use text::PositionEncoding;
 
+/// Paths named in [`Located::external`] at most.
+pub const MAX_EXTERNAL: usize = 5;
+
+/// Locations a server answered, split at the worktree's edge: `items` are
+/// repo-relative; what lies outside (std, a dependency's source, a
+/// `jdt://` class) is counted and a few are named, never mixed in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Located {
+    pub items: Vec<theodore_ports::Location>,
+    /// Absolute paths (or URIs, when not a file) of the first
+    /// [`MAX_EXTERNAL`] distinct outside locations.
+    pub external: Vec<String>,
+    /// Every outside location, named or not.
+    pub external_count: usize,
+}
+
 /// How to start one language server: what the toolchain resolved.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LaunchConfig {

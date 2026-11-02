@@ -1098,12 +1098,16 @@ export const NewSpaceModal = observer(function NewSpaceModal() {
       ? { kind: 'issue', value: issueId }
       : startKind === 'branch' && startText.trim()
         ? { kind: 'branch', value: startText.trim() }
-        : startKind === 'pr' && startText.trim() && Number.isInteger(prNumber) && prNumber > 0
+        : startKind === 'pr' &&
+            startText.trim() &&
+            Number.isInteger(prNumber) &&
+            prNumber > 0
           ? { kind: 'pr', value: prNumber }
           : null;
   // A plain goal needs the text; an adopted issue/branch/PR needs that
   // picked/typed instead — the goal becomes an optional extra note.
-  const canStart = startKind === 'goal' ? goal.trim() !== '' : startFrom !== null;
+  const canStart =
+    startKind === 'goal' ? goal.trim() !== '' : startFrom !== null;
   const start = async () => {
     if (!project || !canStart || busy) return;
     setBusy(true);
@@ -1227,7 +1231,9 @@ export const NewSpaceModal = observer(function NewSpaceModal() {
               <TextField
                 value={startText}
                 onChange={setStartText}
-                aria-label={startKind === 'branch' ? 'Branch name' : 'PR number'}
+                aria-label={
+                  startKind === 'branch' ? 'Branch name' : 'PR number'
+                }
                 autoFocus
               >
                 <InputGroup className="w-56 rounded-xl">
@@ -1255,8 +1261,8 @@ export const NewSpaceModal = observer(function NewSpaceModal() {
               </>
             ) : (
               <>
-                The worktree starts on its tip; shipping pushes back to the
-                same branch.
+                The worktree starts on its tip; shipping pushes back to the same
+                branch.
               </>
             )}
           </span>

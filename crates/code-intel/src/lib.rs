@@ -22,6 +22,15 @@
 //! (off by default: most servers can run a PR's code) and spaces (on). The
 //! one gate is `servers::allowed`; [`CodeIntel::set_options`] applies a
 //! change live, stopping the sessions it no longer allows.
+//!
+//! Upkeep (docs/code-intel.md §5):
+//!
+//! ```text
+//! set_limits ─▶ pool restarts (max_servers, idle) · indexer size limit (a larger one retries skips)
+//! open · close · every 10 min ─▶ evict_cache: index.sqlite under cache_bytes, LRU, open worktrees last
+//! install(lang, progress) ─▶ grammar, server: downloading… (≤ 4/s) ─▶ installed | failed
+//! remove(lang) ─▶ in an open worktree? refuse ─▶ stop sessions ─▶ delete ─▶ removed.json (no auto-fetch)
+//! ```
 
 mod grammars;
 mod paths;
@@ -30,23 +39,28 @@ mod workspace;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use theodore_code_intel_lsp::{LspPool, LspSession, SessionOptions};
+use theodore_code_intel_lsp::{Located, LspPool, LspSession, SessionOptions};
 use theodore_code_intel_syntax::{
     Indexer, IndexerConfig, SyntaxIndex, byte_offset, file_entry, git_snapshot, preview,
     text_search,
 };
-use theodore_code_intel_toolchain::Toolchain;
+use theodore_code_intel_toolchain::{OnBytes, Toolchain};
 use theodore_ports::code_intel::{
-    Answer, CodeHit, CodeIntelError, CodeIntelPort, CodeIntelResult, CodeSymbol, CodeSymbolKind,
-    Diagnostic, InstallState, LanguageId, LanguageStatus, Location, LspPolicy, Position,
+    Answer, CodeHit, CodeIntelError, CodeIntelLimits, CodeIntelPort, CodeIntelResult, CodeSymbol,
+    CodeSymbolKind, Diagnostic, Hover, InstallItem, InstallProgress, InstallProgressFn,
+    InstallProgressState, InstallState, LanguageId, LanguageStatus, Location, LspPolicy, Position,
     ServerState, ServerStatus, Source, TextEdit, TrustMode, Workspace,
 };
 
 pub use grammars::GrammarSource;
+pub use theodore_code_intel_syntax::Eviction;
+
+use crate::grammars::Removed;
 
 use crate::paths::{canonical, normalize, read_inside};
 use crate::servers::{allowed, denied_note};
@@ -59,6 +73,14 @@ const INDEX_WAIT: Duration = Duration::from_secs(2);
 /// Names from the focus files used to promote files that mention them.
 const MAX_FOCUS_NAMES: usize = 64;
 
+/// How often the index is checked against its size cap, besides on every
+/// open and close.
+const EVICT_EVERY: Duration = Duration::from_secs(10 * 60);
+/// Lines of a definition the syntax layer's hover shows at most.
+const SIGNATURE_LINES: usize = 4;
+/// Install progress events per item, at most one per this.
+const PROGRESS_EVERY: Duration = Duration::from_millis(250);
+
 /// Settings of [`CodeIntel`] (docs/code-intel.md §9).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeIntelOptions {
@@ -70,6 +92,9 @@ pub struct CodeIntelOptions {
     pub idle: Duration,
     /// Larger files are not indexed (`code_intel.max_file_kb`).
     pub max_file_kb: usize,
+    /// `index.sqlite` is kept under this (`code_intel.cache_mb`): least
+    /// recently used blobs are evicted, open worktrees' last.
+    pub cache_bytes: u64,
     /// Where language servers may run (`code_intel.lsp.review` /
     /// `code_intel.lsp.spaces`).
     pub lsp: LspPolicy,
@@ -80,13 +105,30 @@ impl CodeIntelOptions {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
-            max_servers: 4,
-            idle: Duration::from_secs(10 * 60),
-            max_file_kb: 1024,
             lsp: LspPolicy::default(),
+            max_servers: 0,
+            idle: Duration::ZERO,
+            max_file_kb: 0,
+            cache_bytes: 0,
+        }
+        .with_limits(CodeIntelLimits::default())
+    }
+
+    /// The machine-wide limits of the global config.
+    pub fn with_limits(self, l: CodeIntelLimits) -> Self {
+        Self {
+            max_servers: l.max_servers.max(1),
+            idle: Duration::from_secs(u64::from(l.idle_minutes.max(1)) * 60),
+            max_file_kb: l.max_file_kb.max(1),
+            cache_bytes: l.cache_mb.max(MIN_CACHE_MB).saturating_mul(1024 * 1024),
+            ..self
         }
     }
 }
+
+/// A smaller `cache_mb` would evict the open worktrees' own blobs over and
+/// over.
+pub const MIN_CACHE_MB: u64 = 16;
 
 /// Replaces parts of [`CodeIntel`] (tests, tools). Defaults fit the app.
 pub struct CodeIntelBuilder {
@@ -139,9 +181,14 @@ impl CodeIntelBuilder {
         if let Some(w) = self.workers {
             config.workers = w.max(1);
         }
-        let provider = grammars::provider(grammars.clone(), toolchain.manifest().clone());
+        let removed = Arc::new(Removed::load(o.data_dir.join("removed.json")));
+        let provider = grammars::provider(
+            grammars.clone(),
+            toolchain.manifest().clone(),
+            removed.clone(),
+        );
         let pool = LspPool::with_options(o.max_servers, o.idle, self.session.clone());
-        Ok(CodeIntel {
+        let ci = CodeIntel {
             inner: Arc::new(Inner {
                 indexer: Indexer::new(index, provider, config),
                 pool: Mutex::new(Arc::new(pool)),
@@ -149,9 +196,22 @@ impl CodeIntelBuilder {
                 options: Mutex::new(o),
                 toolchain,
                 grammars,
+                removed,
+                evicting: AtomicBool::new(false),
                 workspaces: Mutex::default(),
             }),
-        })
+        };
+        let weak = Arc::downgrade(&ci.inner);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(EVICT_EVERY).await;
+                let Some(inner) = weak.upgrade() else { return };
+                if let Err(e) = (CodeIntel { inner }).evict_cache().await {
+                    tracing::warn!(target: "code_intel", error = %e, "index eviction failed");
+                }
+            }
+        });
+        Ok(ci)
     }
 }
 
@@ -169,6 +229,10 @@ struct Inner {
     pool: Mutex<Arc<LspPool>>,
     session: SessionOptions,
     options: Mutex<CodeIntelOptions>,
+    /// Languages removed, not fetched again on their own.
+    removed: Arc<Removed>,
+    /// One eviction at a time.
+    evicting: AtomicBool,
     /// By canonical root.
     workspaces: Mutex<HashMap<PathBuf, Arc<Ws>>>,
 }
@@ -230,12 +294,27 @@ impl CodeIntel {
 
     /// Apply changed settings. Live: `lsp` (sessions the new policy no
     /// longer allows stop; newly allowed ones start where a server is on
-    /// disk), `max_servers` and `idle` (the pool restarts). `data_dir` and
-    /// `max_file_kb` take effect on the next start.
+    /// disk), `max_servers` and `idle` (the pool restarts), `max_file_kb`
+    /// (files parsed from now on; a larger limit retries the files skipped
+    /// under the old one) and `cache_bytes` (a smaller cap evicts now).
+    /// `data_dir` takes effect on the next start.
     pub async fn set_options(&self, options: CodeIntelOptions) {
         let old = std::mem::replace(&mut *lock(&self.inner.options), options.clone());
-        if old.data_dir != options.data_dir || old.max_file_kb != options.max_file_kb {
-            tracing::info!(target: "code_intel", "data_dir / max_file_kb change applies after a restart");
+        if old.data_dir != options.data_dir {
+            tracing::info!(target: "code_intel", "data_dir change applies after a restart");
+        }
+        if old.max_file_kb != options.max_file_kb {
+            self.inner
+                .indexer
+                .set_max_file_bytes(options.max_file_kb.saturating_mul(1024));
+            if options.max_file_kb > old.max_file_kb {
+                for w in lock(&self.inner.workspaces).values() {
+                    w.index.retry_too_large();
+                }
+            }
+        }
+        if options.cache_bytes < old.cache_bytes {
+            self.spawn_evict();
         }
         let new_pool = old.max_servers != options.max_servers || old.idle != options.idle;
         if new_pool {
@@ -261,6 +340,65 @@ impl CodeIntel {
                 self.start_servers(&w).await;
             }
         }
+    }
+
+    /// [`set_options`](Self::set_options) with the global config's limits.
+    pub async fn set_limits(&self, limits: CodeIntelLimits) {
+        let options = self.options().with_limits(limits);
+        self.set_options(options).await;
+    }
+
+    /// Bytes `index.sqlite` holds and the blobs in it.
+    pub async fn cache_usage(&self) -> CodeIntelResult<(u64, usize)> {
+        let index = self.index().clone();
+        blocking(move || Ok((index.used_bytes()?, index.counts()?.0))).await
+    }
+
+    /// Keeps `index.sqlite` under `cache_bytes` (`SyntaxIndex::evict`):
+    /// blobs of no open worktree go first; open worktrees forget the
+    /// blobs of theirs that had to go too, and fill them in again on
+    /// demand. One at a time: a call while one runs returns at once, empty.
+    pub async fn evict_cache(&self) -> CodeIntelResult<Eviction> {
+        if self.inner.evicting.swap(true, Ordering::SeqCst) {
+            return Ok(Eviction::default());
+        }
+        struct Done<'a>(&'a AtomicBool);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _done = Done(&self.inner.evicting);
+        let cap = lock(&self.inner.options).cache_bytes;
+        let open: Vec<Arc<Ws>> = lock(&self.inner.workspaces).values().cloned().collect();
+        let in_use: HashSet<String> = open
+            .iter()
+            .flat_map(|w| {
+                w.index
+                    .snapshot()
+                    .files()
+                    .iter()
+                    .map(|f| f.blob_sha.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let index = self.index().clone();
+        let ev = blocking(move || Ok(index.evict(cap, &in_use)?)).await?;
+        if !ev.in_use.is_empty() {
+            for w in &open {
+                w.index.forget(&ev.in_use);
+            }
+        }
+        Ok(ev)
+    }
+
+    fn spawn_evict(&self) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = me.evict_cache().await {
+                tracing::warn!(target: "code_intel", error = %e, "index eviction failed");
+            }
+        });
     }
 
     /// Close every workspace and stop every server.
@@ -362,6 +500,7 @@ impl CodeIntel {
         self.focus(&w, focus);
         tracing::info!(target: "code_intel", root = %root.display(), trust = ?w.trust, languages = ?w.languages(), "workspace open");
         self.start_servers(&w).await;
+        self.spawn_evict();
         Ok(())
     }
 
@@ -446,6 +585,7 @@ impl CodeIntel {
         if let Some(w) = w {
             w.shut();
             self.pool().release_root(&w.root).await;
+            self.spawn_evict();
         }
     }
 
@@ -698,8 +838,11 @@ impl CodeIntel {
         let mut notes = Notes::default();
         match self.route(&w, lang.as_ref()).await {
             Route::Ready(s) => match s.definition(&w.root, &path, at).await {
-                Ok(locs) if !locs.is_empty() => {
-                    let hits = self.lsp_hits(&w, locs, true).await;
+                // Only outside the worktree (std, a dependency): the server's
+                // answer still stands; a same-named local symbol would be wrong.
+                Ok(found) if !found.items.is_empty() || found.external_count > 0 => {
+                    notes.extend(external_note(&found, true));
+                    let hits = self.lsp_hits(&w, found.items, true).await;
                     return Ok(self.answer(&w, hits, Source::Lsp, notes));
                 }
                 Ok(_) => notes.push(format!("{}: no definition; matched by name", s.server())),
@@ -748,8 +891,9 @@ impl CodeIntel {
         let mut notes = Notes::default();
         match self.route(&w, lang.as_ref()).await {
             Route::Ready(s) => match s.references(&w.root, &path, at, true).await {
-                Ok(locs) if !locs.is_empty() => {
-                    let hits = self.lsp_hits(&w, locs, false).await;
+                Ok(found) if !found.items.is_empty() => {
+                    notes.extend(external_note(&found, false));
+                    let hits = self.lsp_hits(&w, found.items, false).await;
                     return Ok(self.answer(&w, hits, Source::Lsp, notes));
                 }
                 Ok(_) => notes.push(format!("{}: no references; matched by name", s.server())),
@@ -849,34 +993,92 @@ impl CodeIntel {
         }
     }
 
-    /// Hover text (markdown) at `at`, for the diff view. Language servers
-    /// only: `None` when none answers for the file.
-    pub async fn hover(
+    /// Hover text at `at`, for the diff view: the language server's when
+    /// one answers, else the signature of the best definition with the
+    /// name under the cursor (`Source::Syntax`). `None`: neither has one.
+    pub async fn hover_at(
         &self,
         root: &Path,
         path: &str,
         at: Position,
-    ) -> CodeIntelResult<Option<String>> {
+    ) -> CodeIntelResult<Option<Hover>> {
         let w = self.ws(root)?;
         let path = normalize(path)?;
-        match self.route(&w, w.language(&path).as_ref()).await {
-            Route::Ready(s) => s.hover(&w.root, &path, at).await,
-            Route::Not(_) => Ok(None),
+        if let Route::Ready(s) = self.route(&w, w.language(&path).as_ref()).await {
+            match s.hover(&w.root, &path, at).await {
+                Ok(Some(text)) => {
+                    return Ok(Some(Hover {
+                        text,
+                        source: Source::Lsp,
+                    }));
+                }
+                Ok(None) => {}
+                Err(e) => tracing::debug!(target: "code_intel", error = %e, "hover: server"),
+            }
         }
+        self.wait_indexed(&w, &path).await;
+        let (snap, index, p) = (w.index.snapshot(), self.index().clone(), path.clone());
+        let found = blocking(move || {
+            let Some(hit) = index.definition(&snap, &p, at, 1)?.into_iter().next() else {
+                return Ok(None);
+            };
+            let text = read_inside(snap.root(), &hit.location.path).ok();
+            Ok(text.map(|t| (signature(&t, hit.location.range.start.line), hit.location)))
+        })
+        .await?;
+        let Some((sig, loc)) = found.filter(|(sig, _)| !sig.is_empty()) else {
+            return Ok(None);
+        };
+        let fence = w
+            .language(&loc.path)
+            .map(|l| l.as_str().to_string())
+            .unwrap_or_default();
+        Ok(Some(Hover {
+            text: format!(
+                "```{fence}\n{sig}\n```\n\n_Matched by name, no language server: {}:{}_",
+                loc.path, loc.range.start.line
+            ),
+            source: Source::Syntax,
+        }))
     }
 
-    // ── install / changes / status ────────────────────────────────────────
+    // ── install / remove / changes / status ───────────────────────────────
 
-    async fn install_language(&self, language: &LanguageId) -> CodeIntelResult<()> {
+    async fn install_language(
+        &self,
+        language: &LanguageId,
+        progress: Option<InstallProgressFn>,
+    ) -> CodeIntelResult<()> {
         let tc = self.inner.toolchain.clone();
         let spec =
             tc.manifest().language(language).cloned().ok_or_else(|| {
                 CodeIntelError::Unsupported(format!("unknown language {language}"))
             })?;
         let mut first_error: Option<CodeIntelError> = None;
+        // Asked for again: it may be fetched on its own again, too.
+        let mut again = vec![language.clone()];
+        again.extend(spec.tags_extends.clone());
+        if let Some(g) = &spec.grammar {
+            again.extend(g.languages.iter().map(|l| l.id.clone()));
+        }
+        self.inner.removed.forget(&again);
 
         // The grammar, and the one its tags query extends.
-        let grammar = self.inner.grammars.grammar(language).await;
+        let grammar = match &spec.grammar {
+            Some(g) => {
+                let report =
+                    Reporter::new(progress.clone(), language, InstallItem::Grammar, &g.package);
+                let on_bytes = report.on_bytes();
+                let result = self
+                    .inner
+                    .grammars
+                    .grammar_with(language, on_bytes.as_deref())
+                    .await;
+                report.finish(&result);
+                result
+            }
+            None => self.inner.grammars.grammar(language).await,
+        };
         if let Some(base) = &spec.tags_extends
             && let Err(e) = self.inner.grammars.grammar(base).await
         {
@@ -903,7 +1105,16 @@ impl CodeIntel {
             );
             if !on_disk && server.download_for(tc.platform()).is_some() {
                 self.mark_downloading(&server.name);
-                if let Err(e) = tc.install_server(&server).await {
+                let report = Reporter::new(
+                    progress.clone(),
+                    language,
+                    InstallItem::Server,
+                    &server.name,
+                );
+                let on_bytes = report.on_bytes();
+                let result = tc.install_server_with(&server, on_bytes.as_deref()).await;
+                report.finish(&result);
+                if let Err(e) = result {
                     first_error.get_or_insert(e);
                 }
             }
@@ -925,6 +1136,86 @@ impl CodeIntel {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// See [`CodeIntelPort::remove`].
+    async fn remove_language(&self, language: &LanguageId) -> CodeIntelResult<()> {
+        let tc = self.inner.toolchain.clone();
+        let spec =
+            tc.manifest().language(language).cloned().ok_or_else(|| {
+                CodeIntelError::Unsupported(format!("unknown language {language}"))
+            })?;
+        // Every language the grammar package parses goes with it.
+        let mut parsed: Vec<LanguageId> = spec
+            .grammar
+            .as_ref()
+            .map(|g| g.languages.iter().map(|l| l.id.clone()).collect())
+            .unwrap_or_default();
+        if !parsed.contains(language) {
+            parsed.push(language.clone());
+        }
+        let open: Vec<Arc<Ws>> = lock(&self.inner.workspaces).values().cloned().collect();
+        let users: Vec<String> = open
+            .iter()
+            .filter(|w| {
+                let langs = w.languages();
+                parsed.iter().any(|l| langs.contains(l))
+            })
+            .map(|w| w.root.display().to_string())
+            .collect();
+        if let Some(first) = users.first() {
+            let more = match users.len() {
+                1 => String::new(),
+                n => format!(" and {} more", n - 1),
+            };
+            return Err(CodeIntelError::Other(format!(
+                "{language} is in use by an open worktree ({first}{more}); \
+                 close it, or remove the language later"
+            )));
+        }
+
+        // Servers: every one of the language Theodore downloads. Their
+        // sessions stop wherever they run (a server can serve several
+        // languages).
+        let names: Vec<String> = spec
+            .servers
+            .iter()
+            .filter(|s| s.download.is_some())
+            .map(|s| s.name.clone())
+            .collect();
+        for name in &names {
+            self.pool().stop_server(name).await;
+        }
+        let grammars = self.inner.grammars.clone();
+        let (lang, tc2, names2) = (language.clone(), tc.clone(), names.clone());
+        let removed_langs = blocking(move || {
+            for name in &names2 {
+                tc2.remove_server(name)?;
+            }
+            grammars.remove(&lang)
+        })
+        .await?;
+        let mut sticky = parsed;
+        for l in removed_langs {
+            if !sticky.contains(&l) {
+                sticky.push(l);
+            }
+        }
+        self.inner.removed.insert(&sticky);
+
+        // Open worktrees whose plans named a removed server: Missing now.
+        for w in &open {
+            let langs: Vec<LanguageId> = lock(&w.servers)
+                .iter()
+                .filter(|(_, p)| names.contains(&p.spec.name))
+                .map(|(l, _)| l.clone())
+                .collect();
+            for l in langs {
+                self.plan_server(w, &l).await;
+            }
+        }
+        tracing::info!(target: "code_intel", %language, servers = ?names, "language removed");
+        Ok(())
     }
 
     fn mark_downloading(&self, server: &str) {
@@ -1039,6 +1330,134 @@ impl CodeIntel {
     }
 }
 
+/// Turns one install item's download into [`InstallProgress`] for the
+/// port's listener: `Downloading` at most every [`PROGRESS_EVERY`] (and
+/// the last chunk), then `Installed` or `Failed` once.
+struct Reporter {
+    sink: Option<InstallProgressFn>,
+    language: LanguageId,
+    what: InstallItem,
+    name: String,
+    last: Mutex<Option<Instant>>,
+}
+
+impl Reporter {
+    fn new(
+        sink: Option<InstallProgressFn>,
+        language: &LanguageId,
+        what: InstallItem,
+        name: &str,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            sink,
+            language: language.clone(),
+            what,
+            name: name.to_string(),
+            last: Mutex::new(None),
+        })
+    }
+
+    fn send(&self, state: InstallProgressState) {
+        if let Some(sink) = &self.sink {
+            sink(InstallProgress {
+                language: self.language.clone(),
+                what: self.what,
+                name: self.name.clone(),
+                state,
+            });
+        }
+    }
+
+    /// The toolchain's byte listener; `None` without a sink.
+    fn on_bytes(self: &Arc<Self>) -> Option<Box<OnBytes>> {
+        self.sink.as_ref()?;
+        let me = self.clone();
+        Some(Box::new(move |received: u64, total: Option<u64>| {
+            let done = total == Some(received) && received > 0;
+            {
+                let mut last = lock(&me.last);
+                if !done && last.is_some_and(|t| t.elapsed() < PROGRESS_EVERY) {
+                    return;
+                }
+                *last = Some(Instant::now());
+            }
+            me.send(InstallProgressState::Downloading { received, total });
+        }))
+    }
+
+    fn finish<T>(&self, result: &CodeIntelResult<T>) {
+        self.send(match result {
+            Ok(_) => InstallProgressState::Installed,
+            Err(e) => InstallProgressState::Failed {
+                error: e.to_string(),
+            },
+        });
+    }
+}
+
+/// A definition's signature: its first line in `text` (1-based `line`) and
+/// the next ones until the body opens (`{`, a trailing `:` or `;`, `=`),
+/// a blank line, or [`SIGNATURE_LINES`].
+fn signature(text: &str, line: u32) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for l in text
+        .lines()
+        .skip(line.saturating_sub(1) as usize)
+        .take(SIGNATURE_LINES)
+    {
+        let l = l.trim_end();
+        if l.trim().is_empty() {
+            break;
+        }
+        if let Some(i) = l.find('{') {
+            let head = l[..i].trim_end();
+            if !head.trim().is_empty() {
+                out.push(head);
+            }
+            break;
+        }
+        out.push(l);
+        if l.ends_with(':') || l.ends_with(';') || l.ends_with('=') || l.ends_with("=>") {
+            break;
+        }
+    }
+    // Keep the indentation relative to the first line.
+    let indent = out.first().map_or(0, |l| l.len() - l.trim_start().len());
+    out.iter()
+        .map(|l| l.get(indent..).unwrap_or(l.trim_start()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Paths an external-results note names at most.
+const NOTE_EXTERNAL: usize = 3;
+
+/// "2 results outside the worktree (std / dependencies): /…/vec.rs, …":
+/// their paths are not repo-relative, so they stay out of `items`.
+/// `name`: list the first few paths (definitions); references only count.
+fn external_note(found: &Located, name: bool) -> Option<String> {
+    let n = found.external_count;
+    if n == 0 {
+        return None;
+    }
+    let what = if n == 1 { "result" } else { "results" };
+    let mut note = format!("{n} {what} outside the worktree (std / dependencies)");
+    if name && !found.external.is_empty() {
+        let shown: Vec<&str> = found
+            .external
+            .iter()
+            .take(NOTE_EXTERNAL)
+            .map(String::as_str)
+            .collect();
+        note.push_str(": ");
+        note.push_str(&shown.join(", "));
+        if n > shown.len() {
+            note.push_str(", …");
+        }
+    }
+    Some(note)
+}
+
 /// The best layer that contributed.
 fn best(lsp: bool, syntax: bool) -> Source {
     if lsp {
@@ -1144,8 +1563,24 @@ impl CodeIntelPort for CodeIntel {
         self.rename_in(root, path, at, new_name).await
     }
 
-    async fn install(&self, language: &LanguageId) -> CodeIntelResult<()> {
-        self.install_language(language).await
+    async fn hover(&self, root: &Path, path: &str, at: Position) -> CodeIntelResult<Option<Hover>> {
+        self.hover_at(root, path, at).await
+    }
+
+    async fn install(
+        &self,
+        language: &LanguageId,
+        progress: Option<InstallProgressFn>,
+    ) -> CodeIntelResult<()> {
+        self.install_language(language, progress).await
+    }
+
+    async fn remove(&self, language: &LanguageId) -> CodeIntelResult<()> {
+        self.remove_language(language).await
+    }
+
+    async fn set_limits(&self, limits: CodeIntelLimits) {
+        CodeIntel::set_limits(self, limits).await
     }
 
     async fn file_changed(&self, root: &Path, path: &str) {

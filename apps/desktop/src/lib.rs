@@ -130,6 +130,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::code_intel_install,
             commands::code_intel_set_lsp,
             commands::code_intel_decline,
+            commands::code_intel_remove,
+            commands::code_intel_hover,
             commands::config_draft,
             commands::check_config,
             commands::save_config,

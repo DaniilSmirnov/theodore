@@ -487,9 +487,27 @@ async fn a_repo_lsp_key_is_reported_once() {
     assert!(toast.contains("code_intel.lsp.review"), "{toast}");
 }
 
+fn set_lsp(
+    project: &str,
+    scope: theodore_contract::CodeLspScope,
+    on: bool,
+) -> theodore_contract::CodeIntelLspRequest {
+    theodore_contract::CodeIntelLspRequest {
+        project: project.into(),
+        scope,
+        on,
+    }
+}
+
+const REVIEW: theodore_contract::CodeLspScope = theodore_contract::CodeLspScope::Review;
+const SPACES: theodore_contract::CodeLspScope = theodore_contract::CodeLspScope::Spaces;
+
 #[tokio::test]
-async fn lsp_toggles_sit_under_your_files_and_reopen_what_they_change() {
+async fn a_switch_writes_the_projects_local_file_over_the_global_default() {
     let e = code_env().await;
+    let folder = PathBuf::from(e.project.path.clone().unwrap());
+    let local = folder.join(".theodore/config.local.yaml");
+    let global = e.f.data_dir.path().join("config.yaml");
     let status = e.core.code_intel_status(&e.project.id).await.unwrap();
     assert_eq!(
         (status.lsp.review.on, status.lsp.spaces.on),
@@ -498,28 +516,165 @@ async fn lsp_toggles_sit_under_your_files_and_reopen_what_they_change() {
     );
     assert!(status.lsp.review.from_config.is_none());
 
-    e.core
-        .code_intel_set_lsp(theodore_contract::CodeIntelLspRequest {
-            scope: theodore_contract::CodeLspScope::Review,
-            on: true,
-        })
-        .await
-        .unwrap();
+    // The global file is the default under the project's switches.
+    e.global("code_intel: {lsp: {review: true}}");
     let status = e.core.code_intel_status(&e.project.id).await.unwrap();
     assert!(status.lsp.review.on);
-
-    // The global file wins over the toggle and says so.
-    e.global("code_intel: {lsp: {review: false, spaces: false}}");
-    let status = e.core.code_intel_status(&e.project.id).await.unwrap();
-    assert!(!status.lsp.review.on && !status.lsp.spaces.on);
-    let global = e.f.data_dir.path().join("config.yaml");
     assert_eq!(
-        status.lsp.spaces.from_config.as_deref(),
+        status.lsp.review.from_config.as_deref(),
         Some(global.display().to_string().as_str())
     );
 
+    e.core
+        .code_intel_set_lsp(set_lsp(&e.project.id, REVIEW, false))
+        .await
+        .unwrap();
+    let text = std::fs::read_to_string(&local).unwrap();
+    assert!(
+        text.ends_with("code_intel:\n  lsp:\n    review: false\n"),
+        "{text}"
+    );
+    let status = e.core.code_intel_status(&e.project.id).await.unwrap();
+    assert!(!status.lsp.review.on, "the local file wins");
+    assert_eq!(
+        status.lsp.review.from_config.as_deref(),
+        Some(local.display().to_string().as_str())
+    );
+    assert!(status.lsp.spaces.on && status.lsp.spaces.from_config.is_none());
+    assert_eq!(
+        std::fs::read_to_string(folder.join(".gitignore")).unwrap(),
+        ".theodore/config.local.yaml\n",
+        "the personal file stays out of commits"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&global).unwrap(),
+        "code_intel: {lsp: {review: true}}",
+        "the global file is left alone"
+    );
+    assert!(
+        !folder.join(".theodore/config.yaml").exists(),
+        "never the repo's"
+    );
+}
+
+#[tokio::test]
+async fn a_switch_keeps_the_rest_of_the_local_file_and_refuses_what_it_cant_edit() {
+    let e = code_env().await;
+    let folder = PathBuf::from(e.project.path.clone().unwrap());
+    let local = folder.join(".theodore/config.local.yaml");
+    let mine =
+        "# my overrides\nspaces:\n  setup: make   # fast\ncode_intel:\n  lsp:\n    review: true\n";
+    e.repo_file(".theodore/config.local.yaml", mine);
+    e.core
+        .code_intel_set_lsp(set_lsp(&e.project.id, SPACES, false))
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&local).unwrap(),
+        "# my overrides\nspaces:\n  setup: make   # fast\ncode_intel:\n  lsp:\n    spaces: false\n    review: true\n"
+    );
+    let status = e.core.code_intel_status(&e.project.id).await.unwrap();
+    assert_eq!((status.lsp.review.on, status.lsp.spaces.on), (true, false));
+
+    // A flow mapping: refused, the file as it was.
+    let flow = "code_intel: {lsp: {review: true}}\n";
+    e.repo_file(".theodore/config.local.yaml", flow);
+    let err = e
+        .core
+        .code_intel_set_lsp(set_lsp(&e.project.id, REVIEW, false))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("code_intel.lsp.review"), "{err}");
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), flow);
+
+    let err = e
+        .core
+        .code_intel_set_lsp(set_lsp("nope", REVIEW, true))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AppError::NotFound(_)), "{err}");
+}
+
+#[tokio::test]
+async fn a_host_projects_switch_writes_its_local_file_in_the_data_dir() {
+    let f = fixtures();
+    let (core, _recv) = Core::start(f.deps_with_code());
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let project = theodore_contract::Project {
+        id: "github:acme/widget".into(),
+        repo: RepoRef {
+            host: HostKind::Github,
+            owner: "acme".into(),
+            name: "widget".into(),
+        },
+        path: None,
+        status: theodore_contract::ProjectStatus::Ready,
+        error: None,
+        default_branch: Some("main".into()),
+        added_at: 0,
+        description: None,
+        private: false,
+        pushed_at: None,
+        last_fetched_at: Some(0),
+    };
+    core.apply(vec![NewAction {
+        model: models::PROJECT.into(),
+        model_id: project.id.clone(),
+        action: SyncActionCode::I,
+        data: Some(serde_json::to_value(&project).unwrap()),
+    }])
+    .await
+    .unwrap();
+    core.code_intel_set_lsp(set_lsp(&project.id, REVIEW, true))
+        .await
+        .unwrap();
+    let local = f
+        .data_dir
+        .path()
+        .join("projects/github/acme/widget/config.local.yaml");
+    assert!(
+        std::fs::read_to_string(&local)
+            .unwrap()
+            .contains("    review: true\n")
+    );
+    let status = core.code_intel_status(&project.id).await.unwrap();
+    assert!(status.lsp.review.on);
+    assert_eq!(
+        status.lsp.review.from_config.as_deref(),
+        Some(local.display().to_string().as_str())
+    );
+}
+
+#[tokio::test]
+async fn the_old_app_wide_switch_still_counts_below_the_files() {
+    let e = code_env().await;
+    e.core
+        .apply(vec![NewAction {
+            model: models::SETTING.into(),
+            model_id: "user:code_intel.lsp.review".into(),
+            action: SyncActionCode::U,
+            data: Some(serde_json::json!({
+                "key": "code_intel.lsp.review",
+                "scope": "user",
+                "value": true,
+            })),
+        }])
+        .await
+        .unwrap();
+    let status = e.core.code_intel_status(&e.project.id).await.unwrap();
+    assert!(status.lsp.review.on && status.lsp.review.from_config.is_none());
+    e.core
+        .code_intel_set_lsp(set_lsp(&e.project.id, REVIEW, false))
+        .await
+        .unwrap();
+    let status = e.core.code_intel_status(&e.project.id).await.unwrap();
+    assert!(!status.lsp.review.on);
+}
+
+#[tokio::test]
+async fn a_switch_reopens_the_worktrees_it_changes() {
+    let e = code_env().await;
     // A space served once is reopened when its policy changes.
-    std::fs::remove_file(&global).unwrap();
     let s = e.create("").await;
     let open = format!("open {} Trusted []", s.worktree);
     wait_until(|| e.f.code_intel.calls().contains(&open)).await;
@@ -534,10 +689,7 @@ async fn lsp_toggles_sit_under_your_files_and_reopen_what_they_change() {
     };
     assert_eq!(count(&e), 1, "unchanged: not reopened");
     e.core
-        .code_intel_set_lsp(theodore_contract::CodeIntelLspRequest {
-            scope: theodore_contract::CodeLspScope::Spaces,
-            on: false,
-        })
+        .code_intel_set_lsp(set_lsp(&e.project.id, SPACES, false))
         .await
         .unwrap();
     e.core.code_status(&scope).await.unwrap();
@@ -661,7 +813,7 @@ async fn a_declined_language_is_not_suggested_and_install_forgets_the_no() {
         .await;
     no_ephemeral(&mut e.recv, suggestion).await;
 
-    // Settings → Languages shows it declined.
+    // Project settings → Languages shows it declined.
     let s = e.create("").await;
     wait_until(|| opened(&e, &format!("open {}", s.worktree))).await;
     let status = e.core.code_intel_status(&e.project.id).await.unwrap();
@@ -966,4 +1118,183 @@ async fn find_symbol_asks_code_intel_first_and_greps_when_it_has_nothing() {
     *f.code_intel.fail.lock().unwrap() = Some(CodeIntelError::Other("boom".into()));
     let grep = core.find_symbol(find(&pr)).await.unwrap();
     assert_eq!(grep[0].line, 9);
+}
+
+// ── hover, limits, remove, progress ────────────────────────────────────────
+
+#[tokio::test]
+async fn hover_asks_at_the_prs_head_worktree() {
+    let f = fixtures();
+    let (core, _recv, pr) = open_pr_with_code(&f).await;
+    *f.code_intel.hover.lock().unwrap() = Some(theodore_ports::Hover {
+        text: "```rust\nfn helper()\n```".into(),
+        source: Source::Syntax,
+    });
+    let req = theodore_contract::CodeHoverRequest {
+        pr: pr.clone(),
+        path: "src/lib.rs".into(),
+        line: 3,
+        col: 5,
+    };
+    let got = core.code_intel_hover(req.clone()).await.unwrap().unwrap();
+    assert_eq!(got.text, "```rust\nfn helper()\n```");
+    assert_eq!(got.source, SymbolSource::Syntax);
+    assert!(
+        f.code_intel
+            .calls()
+            .contains(&"hover src/lib.rs:3:5".to_string())
+    );
+
+    *f.code_intel.hover.lock().unwrap() = None;
+    assert_eq!(core.code_intel_hover(req.clone()).await.unwrap(), None);
+    let outside = theodore_contract::CodeHoverRequest {
+        path: "../etc/passwd".into(),
+        ..req
+    };
+    assert!(matches!(
+        core.code_intel_hover(outside).await,
+        Err(AppError::Invalid(_))
+    ));
+}
+
+#[tokio::test]
+async fn limits_come_from_the_global_file_only_and_apply_when_it_changes() {
+    let f = fixtures();
+    let global = f.data_dir.path().join("config.yaml");
+    std::fs::write(&global, "code_intel:\n  max_servers: 2\n  cache_mb: 100\n").unwrap();
+    let (core, _recv, _pr) = open_pr_with_code(&f).await;
+    let applied = |f: &Fixtures| -> Vec<String> {
+        f.code_intel
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("set_limits"))
+            .collect()
+    };
+    wait_until(|| !applied(&f).is_empty()).await;
+    assert_eq!(applied(&f), ["set_limits 2 10 1024 100"]);
+
+    // Unchanged: not sent again.
+    core.apply_code_limits().await;
+    assert_eq!(applied(&f).len(), 1);
+
+    std::fs::write(&global, "code_intel:\n  max_file_kb: 64\n").unwrap();
+    core.apply_code_limits().await;
+    assert_eq!(
+        applied(&f),
+        ["set_limits 2 10 1024 100", "set_limits 4 10 64 512"]
+    );
+
+    // A repo or local file setting one is warned about: it has no effect.
+    use crate::config::editor::validate_layer;
+    use theodore_contract::ConfigLayer;
+    let text = "code_intel:\n  max_servers: 9\n";
+    for layer in [ConfigLayer::Repo, ConfigLayer::Local] {
+        let p = validate_layer(text, layer);
+        assert!(
+            p.iter().any(|p| p.line == Some(2)
+                && p.message
+                    .starts_with("`code_intel.max_servers`: ignored here")),
+            "{layer:?}: {p:?}"
+        );
+    }
+    assert!(validate_layer(text, ConfigLayer::Global).is_empty());
+}
+
+#[tokio::test]
+async fn remove_closes_the_settings_worktree_and_counts_as_declined() {
+    let e = code_env().await;
+    *e.f.code_intel.status.lock().unwrap() = vec![missing_server("rust", "rust-analyzer")];
+    let folder = e.project.path.clone().unwrap();
+    // Project settings → Languages opens the folder itself.
+    e.core.code_intel_status(&e.project.id).await.unwrap();
+    assert!(opened(&e, &format!("open {folder}")));
+
+    // Refused by the port: the error comes back, nothing is declined.
+    *e.f.code_intel.remove_error.lock().unwrap() = Some(CodeIntelError::Other(
+        "rust is in use by an open worktree (/x)".into(),
+    ));
+    let err = e.core.code_intel_remove("rust").await.unwrap_err();
+    assert!(err.to_string().contains("in use"), "{err}");
+    let calls = e.f.code_intel.calls();
+    let close = calls.iter().position(|c| *c == format!("close {folder}"));
+    let remove = calls.iter().position(|c| c == "remove rust");
+    assert!(close.is_some() && close < remove, "{calls:?}");
+    let status = e.core.code_intel_status(&e.project.id).await.unwrap();
+    assert_eq!(
+        status.languages[0].server.as_ref().unwrap().install,
+        theodore_contract::CodeInstall::Missing
+    );
+
+    *e.f.code_intel.remove_error.lock().unwrap() = None;
+    e.core.code_intel_remove("rust").await.unwrap();
+    let status = e.core.code_intel_status(&e.project.id).await.unwrap();
+    assert_eq!(
+        status.languages[0].server.as_ref().unwrap().install,
+        theodore_contract::CodeInstall::Declined
+    );
+    // `install: always` leaves a removed language alone too.
+    let before = e.f.code_intel.calls().len();
+    e.core
+        .code_install_flow(Path::new("/tmp/wt"), InstallPolicy::Always, None)
+        .await;
+    assert!(
+        !e.f.code_intel.calls()[before..]
+            .iter()
+            .any(|c| c.starts_with("install")),
+        "{:?}",
+        e.f.code_intel.calls()
+    );
+}
+
+#[tokio::test]
+async fn install_progress_reaches_the_ui() {
+    use theodore_contract::{CodeInstallItem, CodeInstallProgress};
+    use theodore_ports::{InstallItem, InstallProgress, InstallProgressState};
+    let mut e = code_env().await;
+    let step = |state| InstallProgress {
+        language: LanguageId::new("rust"),
+        what: InstallItem::Server,
+        name: "rust-analyzer".into(),
+        state,
+    };
+    *e.f.code_intel.progress.lock().unwrap() = vec![
+        step(InstallProgressState::Downloading {
+            received: 10,
+            total: Some(100),
+        }),
+        step(InstallProgressState::Installed),
+    ];
+    e.core.code_intel_install("rust").await.unwrap();
+    let mut got = Vec::new();
+    while got.len() < 2 {
+        let ev = tokio::time::timeout(Duration::from_secs(2), e.recv.ephemeral.recv())
+            .await
+            .expect("an event")
+            .unwrap();
+        if let Ephemeral::CodeIntelProgress { .. } = ev {
+            got.push(ev);
+        }
+    }
+    assert_eq!(
+        got,
+        [
+            Ephemeral::CodeIntelProgress {
+                project: None,
+                language: "rust".into(),
+                what: CodeInstallItem::Server,
+                name: "rust-analyzer".into(),
+                state: CodeInstallProgress::Downloading {
+                    received: 10,
+                    total: Some(100)
+                },
+            },
+            Ephemeral::CodeIntelProgress {
+                project: None,
+                language: "rust".into(),
+                what: CodeInstallItem::Server,
+                name: "rust-analyzer".into(),
+                state: CodeInstallProgress::Installed,
+            },
+        ]
+    );
 }

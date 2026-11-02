@@ -143,6 +143,8 @@ impl Core {
         let r#where = crate::usecases::telemetry::wire_str(&req.layer);
         let result = self.save_config_inner(req).await;
         if result.is_ok() {
+            // A new global file may change the machine-wide limits.
+            self.apply_code_limits().await;
             theodore_telemetry::product(theodore_telemetry::ProductEvent::ConfigSaved { r#where });
         }
         result
@@ -622,7 +624,7 @@ fn short(sha: &Sha) -> String {
 
 /// Writes `text` to `path` through a temporary file and a rename, so a
 /// reader never sees half a file.
-async fn write_file(path: &Path, text: &str) -> AppResult<()> {
+pub(crate) async fn write_file(path: &Path, text: &str) -> AppResult<()> {
     let io = |e: std::io::Error| AppError::Invalid(format!("{}: {e}", path.display()));
     if let Some(dir) = path.parent() {
         tokio::fs::create_dir_all(dir).await.map_err(io)?;
@@ -640,7 +642,7 @@ async fn write_file(path: &Path, text: &str) -> AppResult<()> {
 
 /// Appends `.theodore/config.local.yaml` to the folder's `.gitignore`
 /// unless a line already names it. Whether it appended.
-async fn ensure_gitignored(folder: &Path) -> AppResult<bool> {
+pub(crate) async fn ensure_gitignored(folder: &Path) -> AppResult<bool> {
     let path = folder.join(".gitignore");
     let text = match tokio::fs::read_to_string(&path).await {
         Ok(t) => t,

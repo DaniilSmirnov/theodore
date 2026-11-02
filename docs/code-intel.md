@@ -7,7 +7,8 @@ Instead of grepping a name and reading whole files, an agent asks "where is
 
 Status: **built**. Grammars download from the `grammars-<tag>` release
 (`.github/workflows/grammars.yml`); language servers are found on the
-machine or downloaded on consent. Open: the eval (§10).
+machine or downloaded on consent, with progress; Remove deletes them. The
+index has a size cap; limits apply live. Open: the eval (§10).
 
 | Hook | Where |
 | --- | --- |
@@ -275,6 +276,36 @@ as processes, so they are.
 - Offline, or a check fails → that language has no code intelligence; review
   works as it does today.
 
+Progress: an install (`code_intel_install`, or `install: always`) emits
+`Ephemeral::CodeIntelProgress` per item, at most four times a second while
+it downloads:
+
+```
+install(rust) ─▶ grammar tree-sitter-rust ─▶ downloading{received, total?} … ─▶ installed | failed{error}
+              ─▶ server  rust-analyzer    ─▶ downloading{…} …               ─▶ installed | failed{error}
+                 (on disk already: installed only; found on the machine: no server event)
+```
+
+### 5.1.1 Remove
+
+Project settings → Languages → Remove (`code_intel_remove(language)`, §9.1):
+
+```
+close worktrees opened only for the settings ─▶ an open review or space has the language? ── yes ─▶ refused, names the worktree
+                                                     └─ no ─▶ stop the server's sessions (every worktree)
+                                                              ─▶ delete servers/<name>/ (every version) and the grammar package
+                                                              ─▶ both Missing; language "removed" + declined
+```
+
+| After Remove | Grammar | Server |
+| --- | --- | --- |
+| a worktree with the language opens | not fetched on its own (`removed.json`): text search | not suggested, not installed by `always` |
+| Install | downloaded again, the mark is gone | downloaded again, the No is forgotten |
+
+- A grammar package takes all its languages: removing `typescript`
+  removes `tsx`.
+- A server found on the machine is not ours: it stays, and still serves.
+
 ### 5.2 Index by blob, not by worktree
 
 The cache key is the git blob sha of a file. Worktrees of one repo share it.
@@ -301,8 +332,19 @@ new PR revision           ─▶ only changed blobs are parsed
 - Queries never wait for the index: they answer from what is indexed and say
   `index: 62%`, and fill gaps with a text search for the name.
 - Skipped: `.gitignore`d, `linguist-generated`, vendored, files over
-  `code_intel.max_file_kb`.
-- Eviction: LRU per repo when the cache exceeds its size limit.
+  `code_intel.max_file_kb`. A larger limit, set while worktrees are open,
+  retries the files skipped under the old one.
+- Eviction: `index.sqlite` is kept under `code_intel.cache_mb`, least
+  recently used blob first. A blob is used when it is indexed, found cached
+  by a worktree opening, or answers a query.
+
+```
+open · close · every 10 min · a smaller cap ─▶ used bytes ≤ cap? ── yes ─▶ nothing (three pragmas)
+   └─ no ─▶ 1. blobs no open worktree has, oldest first  ─┐ down to 90% of the cap
+            2. still over: blobs of open worktrees        ─┘ they count as not indexed:
+                                                             text search fills in, a query re-indexes the file
+         ─▶ incremental_vacuum: the file shrinks
+```
 
 ### 5.3 Spaces: follow the edits
 
@@ -327,6 +369,13 @@ idle code_intel.idle_minutes ─▶ shutdown ─▶ exit ─▶ kill after 5 s
   `workspaceFolders`; worktrees join it as folders. Otherwise one per
   worktree.
 - At most `code_intel.max_servers` alive; the least recently used goes first.
+  A change of it or of `idle_minutes` restarts the pool.
+- Locations a server answers outside the worktree (std, a dependency's
+  source) never enter `items`, whose paths are repo-relative. They are
+  counted, and the note says so: `1 result outside the worktree (std /
+  dependencies): /…/core/src/option.rs`. A definition only outside the
+  worktree is still the server's answer: no fallback to a same-named local
+  symbol.
 - A server sees one tree. Base files are served by the syntax layer; a second
   server on the base is started only when a question needs it.
 - A server that crashes is restarted once per session; a second crash marks
@@ -353,9 +402,24 @@ Every tool returns locations with a few lines of context and its source:
 | `diagnostics(path?)` | errors and warnings on the head |
 | `status()` | per language: grammar, server, index %, warming |
 
-The UI uses the same port: go-to-definition and hover in the diff. Grouping
-can use references to link "changed here" with "called there" without an LLM
-call.
+The UI uses the same port: go-to-definition (`find_symbol`) and hover
+(`code_intel_hover({pr, path, line, col})`, at the PR's head worktree) in
+the diff. Grouping can use references to link "changed here" with "called
+there" without an LLM call.
+
+```
+hover(path, line, col) ─▶ server ready? ── yes ─▶ its hover text         source: lsp
+                                        └─ no / empty ─▶ definition by name ─▶ its signature lines   source: syntax
+                                                         (to the body's `{`, `:` or `;`, ≤ 4 lines)
+                                                         "Matched by name, no language server: path:line"
+                                                         none ─▶ null
+```
+
+In the diff (`ui/src/ui/symbols/hover.ts`): the pointer rests 0.5 s on an
+identifier of a head-side line (⌘ held: 80 ms), one call per position
+(`pr@head:path:line:col`, cached, a failure retried), the markdown shown in
+a card under the word; a `syntax` answer is marked "from the parser".
+Leaving, scrolling, a click or Esc hides it.
 
 ### 7.2 Spaces (`space-tools`)
 
@@ -415,20 +479,60 @@ Some servers run code from the project they open.
 | `code_intel.install` | `ask` | `ask` / `always` / `never` (§5.1) |
 | `code_intel.languages` | `[]` | empty: detected |
 | `code_intel.servers.<language>` | — | preferred server name |
-| `code_intel.max_servers` | `4` | alive at once |
-| `code_intel.idle_minutes` | `10` | idle server shutdown |
-| `code_intel.max_file_kb` | `1024` | larger files are not indexed |
-| `code_intel.lsp.review` | `false` | language servers in review runs: a PR's code may run (§8); global / local file only, never the repo's |
-| `code_intel.lsp.spaces` | `true` | language servers in spaces (§8); global / local file only |
+| `code_intel.max_servers` | `4` | alive at once; global file only ¹ |
+| `code_intel.idle_minutes` | `10` | idle server shutdown; global file only ¹ |
+| `code_intel.max_file_kb` | `1024` | larger files are not indexed; global file only ¹ |
+| `code_intel.cache_mb` | `512` | `index.sqlite` size cap, LRU (§5.2); at least 16; global file only ¹ |
+| `code_intel.lsp.review` | `false` | language servers in review runs: a PR's code may run (§8); global / local file only, never the repo's; the project's switch writes its local file (§9.1) |
+| `code_intel.lsp.spaces` | `true` | language servers in spaces (§8); global / local file only; switch: §9.1 |
 
-Settings → Languages lists each detected language with its grammar, server
-(found / downloaded / not available), index progress, and Install / Remove.
+¹ Machine-wide: the app has one server pool and one index for every
+project, so only `~/.theodore/config.yaml` sets these; a repo's or a local
+file's value is ignored, and the config editor warns about it. Read at
+startup and applied live (no restart) when the file changes: after a save
+in the config editor, or by the next worktree opened after a hand edit.
+
+### 9.1 Project settings → Languages
+
+Settings → Projects → ⟨project⟩ → Languages: one project's switches and
+languages, next to its other settings and its config editor.
+
+```
+Language servers in reviews   [ ]   off by default: a PR's code can run on this Mac
+Language servers in spaces    [x]
+  switch ─▶ code_intel.lsp.<review|spaces> in the project's local file
+            (<folder>/.theodore/config.local.yaml, gitignored; a host project's
+             <data dir>/projects/<host>/<owner>/<name>/config.local.yaml)
+
+Rust · 214 files    Grammar Installed   rust-analyzer System  Ready   100% indexed   [Remove]
+C++  · 3 files      Grammar Installed   clangd Downloading
+                    clangd · 12.3 of 40 MB ▓▓▓▓░░░░░                     40% indexed
+```
+
+| Switch's value | Comes from |
+| --- | --- |
+| the project's local file sets it | that file (what the switch writes) |
+| else your global file sets it | `~/.theodore/config.yaml`: the default under every project |
+| else | the app-wide switch of earlier versions, if you flipped it, else the default |
+
+- The switch edits the one line (`code_intel.lsp.review: true`) and keeps
+  the rest of the file, comments included. A shape a line edit can't
+  handle (a flow mapping, a dotted key) is refused with the file untouched:
+  set it in the config editor. Never the repo's file (§8).
+- Each language: grammar, server (found / downloaded / not available),
+  run state, index progress; Install, Decline (a missing server) and
+  Remove (what Theodore downloaded, §5.1.1; asks first, and shows the
+  refusal when a review or a space uses the language).
+- Install progress comes from `Ephemeral::CodeIntelProgress` (§5.1): the
+  row shows the bar and reads the status again once an item settles. The
+  status is polled (every 5 s) only while a server warms up, or a download
+  shows no events.
 
 ## 10. Rollout
 
 ```
 S1  syntax layer + toolchain/manifest + grammar CI + review-tools   ✓
-    Settings → Languages                                            ✓
+    project settings → Languages (was a global Settings page)       ✓
 S2  LSP client + pool + trust switches + space-tools edits          ✓
     reindex after each space turn (the checkpoint's diff)           ✓
 S3  eval with and without the tools; limits; Grep decision          open

@@ -71,6 +71,7 @@ mod space_update_tests;
 mod spaces_tests;
 
 pub use agent_defaults::AgentDefaults;
+pub use config::global_limits as code_intel_limits;
 pub use core::{Core, Receivers};
 pub use deps::{CodeTools, Deps, Grouper, GroupingAgent, OnPartial, RunTools, TokenStatus};
 pub use error::{AppError, AppResult, GrouperError};

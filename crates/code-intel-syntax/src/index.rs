@@ -3,14 +3,25 @@
 //! rebuilt.
 //!
 //! ```text
-//! blobs  id · sha (unique) · language · grammar fingerprint · status · indexed_at
+//! blobs  id · sha (unique) · language · grammar fingerprint · status · indexed_at · last_used
 //!   └─< tags  blob · name · kind · syntax · is_def · range · name range · container
 //!             (by name, by blob)
 //! ```
 //!
 //! One row per blob: indexing a blob again under a new grammar fingerprint
 //! replaces its tags.
+//!
+//! Size cap ([`SyntaxIndex::evict`]), LRU by `last_used` (set when a blob is
+//! indexed, found cached by a worktree's indexer, or answers a query):
+//!
+//! ```text
+//! used bytes ≤ cap ─▶ nothing
+//!   └─ over ─▶ 1. blobs no open worktree has, oldest first ─┐ until ≤ 90% of cap
+//!              2. still over: blobs open worktrees have    ─┘ (they forget them)
+//!           ─▶ incremental_vacuum: the file shrinks
+//! ```
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -25,7 +36,7 @@ use crate::grammar::{CompiledGrammar, Grammar, GrammarCache, kind_str};
 
 /// Bump when the schema or what a row means changes: older files are
 /// dropped and rebuilt on open.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE blobs (
@@ -34,8 +45,11 @@ CREATE TABLE blobs (
     language   TEXT NOT NULL,
     grammar    TEXT NOT NULL,
     status     INTEGER NOT NULL,
-    indexed_at INTEGER NOT NULL
+    indexed_at INTEGER NOT NULL,
+    -- Unix ms: indexed, found cached, or queried. The eviction order.
+    last_used  INTEGER NOT NULL
 );
+CREATE INDEX blobs_by_last_used ON blobs(last_used);
 CREATE TABLE tags (
     blob            INTEGER NOT NULL REFERENCES blobs(id) ON DELETE CASCADE,
     name            TEXT NOT NULL,
@@ -73,6 +87,21 @@ impl BlobStatus {
             _ => Self::Indexed,
         }
     }
+}
+
+/// Most blobs one eviction round deletes before it measures again.
+const EVICT_BATCH: u64 = 1000;
+
+/// What [`SyntaxIndex::evict`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Eviction {
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    /// Blobs no open worktree had.
+    pub unused: Vec<String>,
+    /// Blobs of open worktrees, deleted because the rest did not free
+    /// enough: those worktrees must forget them (`WorkspaceIndex::forget`).
+    pub in_use: Vec<String>,
 }
 
 /// What [`SyntaxIndex::index_blob`] did.
@@ -175,6 +204,11 @@ impl SyntaxIndex {
         for t in tables {
             conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{}\";", t.replace('"', "")))?;
         }
+        // Deleted blobs give their pages back to the file
+        // (`incremental_vacuum` after an eviction). The mode only changes
+        // on a VACUUM, cheap here: every table is gone.
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        conn.execute_batch("VACUUM;")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -299,13 +333,15 @@ impl SyntaxIndex {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
         tx.execute(
-            "INSERT INTO blobs (sha, language, grammar, status, indexed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO blobs (sha, language, grammar, status, indexed_at, last_used) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 sha,
                 grammar.language_id.as_str(),
                 grammar.fingerprint,
                 status as i64,
-                now
+                now,
+                now_ms()
             ],
         )?;
         let blob = tx.last_insert_rowid();
@@ -341,6 +377,114 @@ impl SyntaxIndex {
             BlobStatus::TooLarge => IndexOutcome::TooLarge,
             BlobStatus::Binary => IndexOutcome::Binary,
         })
+    }
+
+    /// Marks blobs used now (a worktree has them, a query answered from
+    /// them): the eviction keeps the most recently used.
+    pub fn touch<'a>(&self, shas: impl IntoIterator<Item = &'a str>) -> Result<()> {
+        let now = now_ms();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut up = tx.prepare_cached(
+                "UPDATE blobs SET last_used = ?1 WHERE sha = ?2 AND last_used < ?1",
+            )?;
+            for sha in shas {
+                up.execute(params![now, sha])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Bytes the stored rows take: the file's pages minus free ones.
+    pub fn used_bytes(&self) -> Result<u64> {
+        let conn = self.lock();
+        Self::used_in(&conn)
+    }
+
+    fn used_in(conn: &Connection) -> Result<u64> {
+        let pages: i64 = conn.pragma_query_value(None, "page_count", |r| r.get(0))?;
+        let free: i64 = conn.pragma_query_value(None, "freelist_count", |r| r.get(0))?;
+        let size: i64 = conn.pragma_query_value(None, "page_size", |r| r.get(0))?;
+        Ok((pages - free).max(0) as u64 * size.max(0) as u64)
+    }
+
+    /// Keeps the index under `cap_bytes` (see the module doc): when over,
+    /// deletes least recently used blobs down to 90% of the cap, blobs
+    /// outside `in_use` (the open worktrees' snapshots) first. Under the
+    /// cap it costs three pragmas.
+    pub fn evict(&self, cap_bytes: u64, in_use: &HashSet<String>) -> Result<Eviction> {
+        let mut conn = self.lock();
+        let before = Self::used_in(&conn)?;
+        let mut out = Eviction {
+            bytes_before: before,
+            bytes_after: before,
+            ..Eviction::default()
+        };
+        if before <= cap_bytes {
+            return Ok(out);
+        }
+        let target = cap_bytes / 10 * 9;
+        for referenced in [false, true] {
+            loop {
+                let used = Self::used_in(&conn)?;
+                if used <= target {
+                    break;
+                }
+                let blobs: i64 = conn.query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))?;
+                if blobs == 0 {
+                    break;
+                }
+                // Blobs to drop this round, from the average blob's share.
+                let per_blob = (used / blobs as u64).max(1);
+                let want = (used - target).div_ceil(per_blob).clamp(1, EVICT_BATCH) as usize;
+                let picked: Vec<(i64, String)> = {
+                    let mut stmt =
+                        conn.prepare_cached("SELECT id, sha FROM blobs ORDER BY last_used, id")?;
+                    let mut rows = stmt.query([])?;
+                    let mut picked = Vec::with_capacity(want);
+                    while let Some(row) = rows.next()? {
+                        let sha: String = row.get(1)?;
+                        if in_use.contains(&sha) == referenced {
+                            picked.push((row.get(0)?, sha));
+                            if picked.len() == want {
+                                break;
+                            }
+                        }
+                    }
+                    picked
+                };
+                if picked.is_empty() {
+                    break;
+                }
+                let tx = conn.transaction()?;
+                {
+                    let mut del_tags = tx.prepare_cached("DELETE FROM tags WHERE blob = ?1")?;
+                    let mut del_blob = tx.prepare_cached("DELETE FROM blobs WHERE id = ?1")?;
+                    for (id, _) in &picked {
+                        del_tags.execute([id])?;
+                        del_blob.execute([id])?;
+                    }
+                }
+                tx.commit()?;
+                let shas = picked.into_iter().map(|(_, sha)| sha);
+                if referenced {
+                    out.in_use.extend(shas);
+                } else {
+                    out.unused.extend(shas);
+                }
+            }
+        }
+        conn.execute_batch("PRAGMA incremental_vacuum;")?;
+        out.bytes_after = Self::used_in(&conn)?;
+        tracing::info!(
+            target: "code_intel",
+            before, after = out.bytes_after, cap = cap_bytes,
+            unused = out.unused.len(), in_use = out.in_use.len(),
+            "index evicted"
+        );
+        Ok(out)
     }
 
     /// Every tag named `name` in any blob (callers keep the snapshot's).
@@ -395,6 +539,12 @@ fn tag_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TagRow> {
         },
         container: r.get(12)?,
     })
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 /// Git's own heuristic: a NUL byte in the first 8 KiB.

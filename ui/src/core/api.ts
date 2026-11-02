@@ -88,6 +88,8 @@ import type {
   GlobalConfigInfo,
   ConfigDraft,
   CheckConfigRequest,
+  CodeHover,
+  CodeHoverRequest,
   CodeIntelLspRequest,
   CodeIntelStatus,
   ConfigCheck,
@@ -372,20 +374,29 @@ export const api = {
     call<ConfigCheck>('check_config', { req }, true),
   saveConfig: (req: SaveConfigRequest) =>
     call<SaveConfigResult>('save_config', { req }),
-  /** Settings → Languages, polled while something downloads: shown
+  /** Project settings → Languages, read again as installs settle: shown
    *  inline, never toasted. */
   codeIntelStatus: (project: string) =>
     call<CodeIntelStatus>('code_intel_status', { project }, true),
-  /** A language's grammar and server: Settings → Languages → Install, or
-   *  an install suggestion's Download. */
+  /** A language's grammar and server: project settings → Languages →
+   *  Install, or an install suggestion's Download. */
   codeIntelInstall: (language: string) =>
     call<null>('code_intel_install', { language }),
   /** An install suggestion's Not now: not suggested again. */
   codeIntelDecline: (language: string) =>
     call<null>('code_intel_decline', { language }),
-  /** Language servers in reviews or in spaces, on or off. */
+  /** Deletes a language's downloaded server and grammar. Its refusal (a
+   *  review or a space uses it) shows in the confirmation, not a toast. */
+  codeIntelRemove: (language: string) =>
+    call<null>('code_intel_remove', { language }, true),
+  /** One project's language servers in reviews or in spaces, on or off:
+   *  written to its local config file. */
   codeIntelSetLsp: (req: CodeIntelLspRequest) =>
     call<null>('code_intel_set_lsp', { req }),
+  /** Hover text for the identifier under the pointer in a PR's diff;
+   *  `null` when there is none. Never toasted: hovering is incidental. */
+  codeIntelHover: (req: CodeHoverRequest) =>
+    call<CodeHover | null>('code_intel_hover', { req }, true),
   globalConfig: () => call<GlobalConfigInfo>('global_config'),
   /** Creates the global config from a template when missing, then opens
    *  it in the default editor. */

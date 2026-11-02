@@ -75,7 +75,11 @@ async fn rust_analyzer_resolves_a_definition_in_this_crate() {
         col: call.col + "text::".len() as u32 + 1,
     };
     let t1 = Instant::now();
-    let defs = s.definition(root, "src/session.rs", at).await.unwrap();
+    let defs = s
+        .definition(root, "src/session.rs", at)
+        .await
+        .unwrap()
+        .items;
     eprintln!("definition: {defs:?} in {:?}", t1.elapsed());
     let text_rs = std::fs::read_to_string(root.join("src/text.rs")).unwrap();
     let def = find(&text_rs, "fn resolve(");

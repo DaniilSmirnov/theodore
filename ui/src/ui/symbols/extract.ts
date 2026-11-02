@@ -5,10 +5,18 @@
  *  `find_symbol` is never asked to search for something that was never a
  *  name to begin with. */
 export function identifierAt(text: string, offset: number): string | null {
+  return identifierSpan(text, offset)?.name ?? null;
+}
+
+/** `identifierAt` with the identifier's UTF-16 bounds in `text`. */
+export function identifierSpan(
+  text: string,
+  offset: number,
+): { name: string; start: number; end: number } | null {
   let a = offset;
   let b = offset;
   while (a > 0 && /[\w$]/.test(text[a - 1]!)) a--;
   while (b < text.length && /[\w$]/.test(text[b]!)) b++;
-  const word = text.slice(a, b);
-  return /^[A-Za-z_$][\w$]*$/.test(word) ? word : null;
+  const name = text.slice(a, b);
+  return /^[A-Za-z_$][\w$]*$/.test(name) ? { name, start: a, end: b } : null;
 }

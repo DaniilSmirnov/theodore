@@ -101,6 +101,7 @@ import { diffFiles, isCollapsed, showsOnlyOutliers } from './review/hunks';
 import { InterdiffPanel } from './review/InterdiffPanel';
 import { interdiffByHunk, interdiffView } from './review/interdiff';
 import { SymbolPeek, type SymbolPeekTarget } from './SymbolPeek';
+import { CodeHoverHost } from './symbols/CodeHoverHost';
 import { identifierAt } from './symbols/extract';
 
 export interface ComposerState {
@@ -508,6 +509,7 @@ export const DiffPane = observer(function DiffPane({
         onScroll={(e) => ui.setReviewScroll(pr, e.currentTarget.scrollTop)}
         className="diff min-w-0 overflow-auto bg-background px-6 pb-20 pt-5"
       >
+        <CodeHoverHost pr={pr} rev={rev.head} root={mainRef} />
         {splitDowngraded && (
           <Alert status="default" className="split-note mb-4">
             <Alert.Content>
@@ -1865,6 +1867,9 @@ const Line = memo(function Line(props: LineProps) {
     <>
       <div
         className={`ln t-${l.kind}${lineAsk?.status === 'asking' ? ' ln-asking' : ''}`}
+        // For the hover (`CodeHoverHost`): head-side lines only.
+        data-path={l.new_no != null ? path : undefined}
+        data-line={l.new_no ?? undefined}
         onClick={(e) => {
           if (!(e.metaKey || e.ctrlKey)) return;
           const name = symbolAt(e);

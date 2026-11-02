@@ -243,6 +243,29 @@ export type ClientLog = {
 
 export type ClientLogLevel = "error" | "warn" | "info";
 
+export type CodeHover = {
+	/**  Markdown. */
+	text: string,
+	/**
+	 *  `lsp`: the language server's hover. `syntax`: the signature of a
+	 *  definition with that name (matched by name: may be another symbol).
+	 */
+	source: SymbolSource,
+};
+
+/**
+ *  `code_intel_hover`: the identifier under the pointer in a PR's diff, at
+ *  the PR's head.
+ */
+export type CodeHoverRequest = {
+	pr: PrId,
+	/**  Repo-relative. */
+	path: string,
+	/**  1-based line and char column. */
+	line: number,
+	col: number,
+};
+
 /**  Where a grammar or a server stands. */
 export type CodeInstall =
 /**  Not on disk; can be downloaded. */
@@ -256,11 +279,27 @@ export type CodeInstall =
 /**  You said no to the install suggestion. */
 { state: "declined" } | { state: "failed"; error: string };
 
+/**  What an install is downloading (`Ephemeral::CodeIntelProgress`). */
+export type CodeInstallItem = "grammar" | "server";
+
 /**  `code_intel.install`. */
 export type CodeInstallPolicy = "ask" | "always" | "never";
 
-/**  `code_intel_set_lsp`: Settings → Languages' toggles. */
+/**
+ *  One step of an install: `downloading` a few times a second at most,
+ *  then `installed` or `failed` once per item.
+ */
+export type CodeInstallProgress = { kind: "downloading"; received: number;
+/**  `None` when the server didn't say. */
+total: number | null } | { kind: "installed" } | { kind: "failed"; error: string };
+
+/**
+ *  `code_intel_set_lsp`: project settings → Languages' switches. Writes
+ *  `code_intel.lsp.<scope>` into the project's local config file
+ *  (`config.local.yaml`), never the repo's.
+ */
 export type CodeIntelLspRequest = {
+	project: string,
 	scope: CodeLspScope,
 	on: boolean,
 };
@@ -303,10 +342,15 @@ export type CodeLsp = {
 export type CodeLspScope = "review" | "spaces";
 
 export type CodeLspToggle = {
+	/**
+	 *  Effective for the project: its local file, else your global file,
+	 *  else the default.
+	 */
 	on: boolean,
 	/**
-	 *  The global or local config file that sets it: the file wins over
-	 *  the toggle until the line is removed. A repo's file never does.
+	 *  The global or local config file that sets it; `None`: the default.
+	 *  A repo's file never does. The switch writes the local file, so it
+	 *  wins over the global one.
 	 */
 	from_config: string | null,
 };
@@ -602,6 +646,19 @@ url: string } |
 project: string | null; language: string;
 /**  The server that would be downloaded (`clangd`). */
 server: string } |
+/**
+ *  An install (`code_intel_install`, or `code_intel.install: always`)
+ *  downloading `language`'s grammar or server: `downloading` at most
+ *  four times a second per item, then `installed` or `failed`.
+ */
+{ type: "code_intel_progress";
+/**  The project whose worktree asked for it; `None` from Settings. */
+project: string | null; language: string; what: CodeInstallItem;
+/**
+ *  The grammar package (`tree-sitter-rust`) or server
+ *  (`rust-analyzer`).
+ */
+name: string; state: CodeInstallProgress } |
 /**
  *  Raw PTY output of a space's terminal (docs/spaces.md "Terminal"),
  *  base64 (control sequences and all) so a chunk split mid UTF-8 still

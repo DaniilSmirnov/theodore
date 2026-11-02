@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use theodore_ports::code_intel::{CodeIntelError, CodeIntelResult, LanguageId};
 
-use crate::download::{fetch_verified, io_err, sha256_file};
+use crate::download::{OnBytes, fetch_verified, io_err, sha256_file};
 use crate::manifest::GrammarSpec;
 
 /// A grammar ready to parse with.
@@ -57,17 +57,19 @@ pub(crate) async fn install(
     spec: &GrammarSpec,
     platform: &str,
     dir: &Path,
+    on_bytes: Option<&OnBytes>,
 ) -> CodeIntelResult<()> {
     let dl = spec.downloads.get(platform).ok_or_else(|| {
         CodeIntelError::Unsupported(format!("{}: no build for {platform}", spec.package))
     })?;
     let tmp_dir = root.join("tmp");
-    let lib = fetch_verified(http, dl, &tmp_dir).await?;
+    // Progress is the library's: the tags queries are a few KB.
+    let lib = fetch_verified(http, dl, &tmp_dir, on_bytes).await?;
     let mut tags = Vec::new();
     for l in &spec.languages {
         tags.push((
             tags_file(&l.id),
-            fetch_verified(http, &l.tags_query, &tmp_dir).await?,
+            fetch_verified(http, &l.tags_query, &tmp_dir, None).await?,
         ));
     }
 

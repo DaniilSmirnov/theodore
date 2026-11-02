@@ -242,11 +242,15 @@ fn workos_account() -> Arc<dyn theodore_ports::AccountPort> {
 /// Code intelligence over `<data dir>/code-intel` (docs/code-intel.md).
 /// Off in sandbox and fixture runs: they have no real worktrees to index.
 /// A facade that fails to start leaves the feature off, never the app.
-fn code_intel(cfg: &RuntimeConfig) -> Option<Arc<dyn theodore_ports::CodeIntelPort>> {
+/// Started with the global config's machine-wide limits (one pool, one
+/// index for the app); the core applies later edits of that file live.
+async fn code_intel(cfg: &RuntimeConfig) -> Option<Arc<dyn theodore_ports::CodeIntelPort>> {
     if cfg.sandbox.is_some() || cfg.fixtures.is_some() {
         return None;
     }
-    let options = theodore_code_intel::CodeIntelOptions::new(cfg.data_dir.join("code-intel"));
+    let limits = theodore_app::code_intel_limits(&cfg.data_dir).await;
+    let options = theodore_code_intel::CodeIntelOptions::new(cfg.data_dir.join("code-intel"))
+        .with_limits(limits);
     match theodore_code_intel::CodeIntel::new(options) {
         Ok(ci) => Some(Arc::new(ci)),
         Err(e) => {
@@ -302,7 +306,7 @@ pub async fn start(cfg: &RuntimeConfig) -> anyhow::Result<Runtime> {
         worktree_lease: Arc::new(worktree_gc::WorktreeLeaseAdapter::new(
             worktree_locks.clone(),
         )),
-        code_intel: code_intel(cfg),
+        code_intel: code_intel(cfg).await,
     };
     let (core, receivers) = Core::start(deps);
     if let Some(sb) = &sandbox {

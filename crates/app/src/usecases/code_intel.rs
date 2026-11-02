@@ -1,7 +1,7 @@
 //! Code intelligence above the port (docs/code-intel.md): which worktrees
 //! are open on `CodeIntelPort`, under which trust, the install flow, the
-//! MCP tools' calls (queries, and edits applied here), and Settings →
-//! Languages.
+//! MCP tools' calls (queries, and edits applied here), and project
+//! settings → Languages.
 //!
 //! ```text
 //! PR opened / review run ─▶ open(PR worktree, Review) ─┐
@@ -20,15 +20,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use theodore_contract::{
-    CodeInstall, CodeInstallPolicy, CodeIntelLspRequest, CodeIntelStatus, CodeLanguage, CodeLsp,
-    CodeLspScope, CodeLspToggle, CodeServer, CodeServerState, ConfigLayer, Ephemeral, Project,
-    Setting, Space, SpaceMode, SpaceStatus, models,
+    CodeHover, CodeHoverRequest, CodeInstall, CodeInstallItem, CodeInstallPolicy,
+    CodeInstallProgress, CodeIntelLspRequest, CodeIntelStatus, CodeLanguage, CodeLsp, CodeLspScope,
+    CodeLspToggle, CodeServer, CodeServerState, ConfigLayer, Ephemeral, Project, Setting, Space,
+    SpaceMode, SpaceStatus, SymbolSource, models,
 };
 use theodore_domain::{PrId, RepoRef};
 use theodore_ports::{
-    Answer, CodeHit, CodeIntelError, CodeIntelPort, CodeSymbol, CodeSymbolKind, Diagnostic,
-    InstallState, LanguageId, LanguageStatus, NewAction, Position, ServerState, SyncActionCode,
-    TextEdit, TrustMode, Workspace,
+    Answer, CodeHit, CodeIntelError, CodeIntelLimits, CodeIntelPort, CodeSymbol, CodeSymbolKind,
+    Diagnostic, InstallItem, InstallProgress, InstallProgressFn, InstallProgressState,
+    InstallState, LanguageId, LanguageStatus, NewAction, Position, ServerState, Source,
+    SyncActionCode, TextEdit, TrustMode, Workspace,
 };
 
 use crate::config::{
@@ -42,12 +44,15 @@ use crate::settings::SCOPE_USER;
 /// The setting holding the languages whose server you declined
 /// (`code_intel.install: ask`).
 pub(crate) const DECLINED_KEY: &str = "code_intel.declined";
-/// Settings → Languages' toggles, below a global or local config file.
+/// The config keys of the two switches. Also the app-wide setting rows
+/// the old Settings → Languages page wrote: still read, below the files,
+/// so a switch flipped there keeps its value until a file sets the key.
 pub(crate) const LSP_REVIEW_KEY: &str = "code_intel.lsp.review";
 pub(crate) const LSP_SPACES_KEY: &str = "code_intel.lsp.spaces";
 
-/// Where language servers may run (`code_intel.lsp`), resolved: your
-/// global / local file, else the Settings toggle, else the default. The
+/// Where language servers may run (`code_intel.lsp`), resolved: the
+/// project's local file (where its switches write), else your global
+/// file, else an app-wide switch from before, else the default. The
 /// repo's file never sets it (`config::repo_may_not_set`).
 /// Handed to the port per workspace (`Workspace::lsp`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,14 +69,18 @@ struct Opened {
     project: Option<String>,
     /// Language servers may serve it (`LspPolicy`).
     lsp: bool,
+    /// Opened only for project settings → Languages (a local folder's checkout):
+    /// closed before a Remove, reopened by the next status.
+    settings: bool,
 }
 
-/// In-memory: what is open, and which languages were suggested this
-/// session.
+/// In-memory: what is open, which languages were suggested this session,
+/// and the limits last handed to the port.
 #[derive(Default)]
 pub(crate) struct CodeIntelState {
     open: std::sync::Mutex<HashMap<PathBuf, Opened>>,
     suggested: std::sync::Mutex<HashSet<String>>,
+    limits: std::sync::Mutex<Option<CodeIntelLimits>>,
 }
 
 /// Who a code tool call is for: the root comes from the run, never from
@@ -179,7 +188,8 @@ impl Core {
         self.merge_cached(&layers).config.code_intel.clone()
     }
 
-    /// `cfg.lsp` with the Settings toggles and defaults under it.
+    /// `cfg.lsp` (the merged files) with the old app-wide switches and the
+    /// defaults under it.
     pub(crate) async fn lsp_policy(&self, cfg: &CodeIntelConfig) -> LspPolicy {
         let setting = |key: &'static str| async move {
             self.setting_value_scoped(key, None)
@@ -224,7 +234,7 @@ impl Core {
             lsp: None,
         };
         if self
-            .open_code_workspace(ws, lsp, cfg.install, project)
+            .open_code_workspace(ws, lsp, cfg.install, project, false)
             .await
         {
             CodeTools::Read
@@ -269,7 +279,7 @@ impl Core {
             focus_paths: Vec::new(),
             lsp: None,
         };
-        self.open_code_workspace(ws, lsp, code.install, Some(project.id.clone()))
+        self.open_code_workspace(ws, lsp, code.install, Some(project.id.clone()), false)
             .await
     }
 
@@ -310,14 +320,18 @@ impl Core {
         lsp: bool,
         install: InstallPolicy,
         project: Option<String>,
+        settings: bool,
     ) -> bool {
         let Some(port) = self.code_port() else {
             return false;
         };
+        // A hand edit of the global file lands here at the latest.
+        self.apply_code_limits().await;
         let want = Opened {
             trust: ws.trust,
             project: project.clone(),
             lsp,
+            settings,
         };
         let before = self
             .0
@@ -439,8 +453,11 @@ impl Core {
                 continue;
             };
             match install {
+                // A language you removed stays removed until Install.
+                InstallPolicy::Always if declined.iter().any(|d| d == l.language.as_str()) => {}
                 InstallPolicy::Always => {
-                    if let Err(e) = port.install(&l.language).await {
+                    let progress = self.install_progress(project.clone());
+                    if let Err(e) = port.install(&l.language, Some(progress)).await {
                         tracing::warn!(
                             error.code = "code_intel.install_failed",
                             language = %l.language,
@@ -508,7 +525,7 @@ impl Core {
             .unwrap_or_default()
     }
 
-    // ── Settings → Languages ────────────────────────────────────────────
+    // ── project settings → Languages ────────────────────────────────────
 
     /// Each language of `project`: from a worktree of it already open,
     /// else (a local folder) the folder itself, read-only.
@@ -559,7 +576,7 @@ impl Core {
                 lsp: None,
             };
             if self
-                .open_code_workspace(ws, policy.review, cfg.install, Some(p.id.clone()))
+                .open_code_workspace(ws, policy.review, cfg.install, Some(p.id.clone()), true)
                 .await
             {
                 root = Some(PathBuf::from(folder));
@@ -584,15 +601,53 @@ impl Core {
         })
     }
 
-    /// Settings → Languages: one LSP toggle, for every project. A global
-    /// or local file setting the key still wins.
+    /// Project settings → Languages: one switch of one project, written as
+    /// `code_intel.lsp.<scope>` into its local file — the folder's
+    /// `.theodore/config.local.yaml` (gitignored), or a host project's in
+    /// the data directory. Never the repo's file (docs/code-intel.md §8).
+    /// The local layer wins over the global file, which stays the
+    /// default under it. Worktrees open under the old value reopen on
+    /// their next use (`open_code_workspace`).
+    ///
+    /// ```text
+    /// switch ─▶ local file: line edit (comments kept) ─▶ checked ─▶ written
+    ///                      └─ a shape a line edit can't handle ─▶ refused, nothing written
+    /// ```
     pub async fn code_intel_set_lsp(&self, req: CodeIntelLspRequest) -> AppResult<()> {
-        let key = match req.scope {
-            CodeLspScope::Review => LSP_REVIEW_KEY,
-            CodeLspScope::Spaces => LSP_SPACES_KEY,
+        let leaf = match req.scope {
+            CodeLspScope::Review => "review",
+            CodeLspScope::Spaces => "spaces",
         };
-        self.write_user_setting(key, serde_json::json!(req.on))
-            .await
+        // One writer at a time with the config editor's save.
+        let _guard = self.0.ship_lock.lock().await;
+        let project = self
+            .project_row(&req.project)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("project {}", req.project)))?;
+        let folder = project.path.as_deref().map(Path::new);
+        let path = match folder {
+            Some(folder) => folder.join(crate::config::LOCAL_FILE),
+            None => crate::config::host_local_path(&self.0.deps.data_dir, &project.repo),
+        };
+        let text = tokio::fs::read_to_string(&path).await.ok();
+        let next = crate::config::editor::set_leaf(
+            text.as_deref(),
+            &["code_intel", "lsp", leaf],
+            if req.on { "true" } else { "false" },
+        )
+        .map_err(|why| {
+            AppError::Invalid(format!(
+                "couldn't edit {}: {why}. Set code_intel.lsp.{leaf} there by hand",
+                path.display()
+            ))
+        })?;
+        crate::usecases::config_editor::write_file(&path, &next).await?;
+        if let Some(folder) = folder
+            && self.0.deps.git.is_repo(folder).await.unwrap_or(false)
+        {
+            crate::usecases::config_editor::ensure_gitignored(folder).await?;
+        }
+        Ok(())
     }
 
     /// "Install": downloads `language`'s grammar and server, and forgets
@@ -608,9 +663,131 @@ impl Core {
             declined.retain(|l| l != language);
             self.write_declined(declined).await?;
         }
-        port.install(&LanguageId::new(language))
+        port.install(
+            &LanguageId::new(language),
+            Some(self.install_progress(None)),
+        )
+        .await
+        .map_err(code_err)
+    }
+
+    /// The port's install progress as `Ephemeral::CodeIntelProgress`.
+    fn install_progress(&self, project: Option<String>) -> InstallProgressFn {
+        let core = self.clone();
+        Arc::new(move |p: InstallProgress| {
+            core.emit(Ephemeral::CodeIntelProgress {
+                project: project.clone(),
+                language: p.language.0,
+                what: match p.what {
+                    InstallItem::Grammar => CodeInstallItem::Grammar,
+                    InstallItem::Server => CodeInstallItem::Server,
+                },
+                name: p.name,
+                state: match p.state {
+                    InstallProgressState::Downloading { received, total } => {
+                        CodeInstallProgress::Downloading { received, total }
+                    }
+                    InstallProgressState::Installed => CodeInstallProgress::Installed,
+                    InstallProgressState::Failed { error } => CodeInstallProgress::Failed { error },
+                },
+            });
+        })
+    }
+
+    /// Project settings → Languages → Remove: deletes what was downloaded for
+    /// `language` (its server, its grammar). Worktrees opened only for this
+    /// page close first; a review or a space with the language open makes
+    /// the port refuse. Afterwards it counts as declined: not suggested,
+    /// not installed by `install: always`, until Install.
+    pub async fn code_intel_remove(&self, language: &str) -> AppResult<()> {
+        let port = self.code_port().ok_or_else(off)?;
+        let language = language.trim();
+        if language.is_empty() {
+            return Err(AppError::Invalid("no language".into()));
+        }
+        let settings_only: Vec<PathBuf> = self
+            .0
+            .code_intel
+            .open
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(_, o)| o.settings)
+            .map(|(r, _)| r.clone())
+            .collect();
+        for root in settings_only {
+            self.close_code_root(&root).await;
+        }
+        port.remove(&LanguageId::new(language))
             .await
-            .map_err(code_err)
+            .map_err(code_err)?;
+        self.code_intel_decline(language).await
+    }
+
+    /// Hover in a PR's diff (docs/code-intel.md §7.1): at the PR's current
+    /// head worktree, like `find_symbol`. `None`: nothing to show, or code
+    /// intelligence is off for the project.
+    pub async fn code_intel_hover(&self, req: CodeHoverRequest) -> AppResult<Option<CodeHover>> {
+        let Some(port) = self.code_port() else {
+            return Ok(None);
+        };
+        let path = relative(&req.path)?.to_string();
+        self.ensure_open(&req.pr).await?;
+        let detail = self.load_pr_detail(&req.pr).await?;
+        let head = self
+            .0
+            .current_head
+            .read()
+            .await
+            .get(&req.pr)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound(format!("pr {}", req.pr)))?;
+        let worktree = self.0.deps.git.worktree(&detail.summary.pr, &head).await?;
+        if self.review_code_tools(&req.pr).await == CodeTools::Off {
+            return Ok(None);
+        }
+        let at = Position {
+            line: req.line.max(1),
+            col: req.col.max(1),
+        };
+        let hover = port
+            .hover(&worktree.path, &path, at)
+            .await
+            .map_err(code_err)?;
+        Ok(hover.map(|h| CodeHover {
+            text: h.text,
+            source: match h.source {
+                Source::Lsp => SymbolSource::Lsp,
+                Source::Syntax => SymbolSource::Syntax,
+                Source::Text => SymbolSource::Text,
+            },
+        }))
+    }
+
+    /// Hands the global file's machine-wide limits (`config::MACHINE_WIDE`)
+    /// to the port when they changed since the last call. Called on every
+    /// worktree open and after a config save, so a hand edit of the file
+    /// applies by the next review or space at the latest.
+    pub async fn apply_code_limits(&self) {
+        let Some(port) = self.code_port() else {
+            return;
+        };
+        let layers = crate::config::read_layers(&self.0.deps.data_dir, None, None).await;
+        let limits = self.merge_cached(&layers).config.code_intel.limits();
+        let changed = {
+            let mut last = self
+                .0
+                .code_intel
+                .limits
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let changed = *last != Some(limits);
+            *last = Some(limits);
+            changed
+        };
+        if changed {
+            port.set_limits(limits).await;
+        }
     }
 
     /// "No": `language`'s server isn't suggested again.

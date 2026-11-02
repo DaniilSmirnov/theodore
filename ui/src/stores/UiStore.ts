@@ -31,7 +31,7 @@ export type SettingsPage =
   | 'agents'
   | 'integrations'
   | 'projects'
-  /** Code intelligence per project (docs/code-intel.md §9). */
+  /** Old id: languages moved into each project's settings (Projects). */
   | 'languages'
   | 'updates'
   | 'about'
