@@ -81,6 +81,7 @@ impl LiveRun {
             AgentEvent::Thinking { .. }
             | AgentEvent::Usage { .. }
             | AgentEvent::Session { .. }
+            | AgentEvent::Plan { .. }
             | AgentEvent::Done { .. }
             | AgentEvent::Error { .. } => vec![],
         }

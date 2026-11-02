@@ -306,7 +306,7 @@ impl Core {
             return CodeTools::Off;
         }
         match mode {
-            SpaceMode::Ask => CodeTools::Read,
+            SpaceMode::Ask | SpaceMode::Plan => CodeTools::Read,
             SpaceMode::Edit | SpaceMode::Run => CodeTools::Edit,
         }
     }
@@ -925,7 +925,7 @@ impl Core {
         port.status(&root).await.map_err(code_err)
     }
 
-    /// The worktree of a space turn that may edit: refused in Ask mode
+    /// The worktree of a space turn that may edit: refused in Ask and Plan mode
     /// (the space's `mode` is the current turn's) and on a review run.
     async fn edit_root(&self, scope: &CodeScope) -> AppResult<(Arc<dyn CodeIntelPort>, PathBuf)> {
         let CodeScope::Space(id) = scope else {
@@ -934,11 +934,15 @@ impl Core {
             ));
         };
         let (space, _) = self.code_space(id).await?;
-        if space.mode == SpaceMode::Ask {
-            return Err(AppError::Invalid(
-                "this turn is in Ask mode: code edits are off. Ask the user to switch to Edit"
-                    .into(),
-            ));
+        if matches!(space.mode, SpaceMode::Ask | SpaceMode::Plan) {
+            return Err(AppError::Invalid(format!(
+                "this turn is in {} mode: code edits are off. Ask the user to switch to Edit",
+                if space.mode == SpaceMode::Plan {
+                    "Plan"
+                } else {
+                    "Ask"
+                }
+            )));
         }
         self.code_root(scope).await
     }

@@ -200,6 +200,18 @@ fn args_with(
             args.push("--permission-mode".to_string());
             args.push("acceptEdits".to_string());
         }
+        AgentMode::Plan => {
+            // Claude Code's plan mode: it explores and writes its plan to
+            // its own plan file (`~/.claude/plans/`), nothing else. Shell
+            // and edits are denied outright, as for a review run; `Write`
+            // stays for the plan file, which the mode confines it to.
+            args.push("--allowedTools".to_string());
+            args.push(format!("{READ_TOOLS},{mcp_tools}"));
+            args.push("--disallowedTools".to_string());
+            args.push("Bash,Edit,MultiEdit,NotebookEdit".to_string());
+            args.push("--permission-mode".to_string());
+            args.push("plan".to_string());
+        }
         AgentMode::Run => {
             // Every tool, no prompts: the CLI's own settings are the limit.
             args.push("--permission-mode".to_string());
@@ -256,6 +268,14 @@ fn edit_settings(req: &AgentRequest, guard: Option<&Path>) -> Option<String> {
     }
     let mut roots = vec![req.cwd.clone()];
     roots.extend(attachment_dirs(req).into_iter().map(Path::to_path_buf));
+    if req.mode == AgentMode::Plan {
+        // Plan writes only its plan file (`plans`); the worktree stays
+        // untouched. No config dir known: every write is denied, and the
+        // plan comes from the final message instead.
+        roots = crate::models::claude_config_dir()
+            .map(|d| vec![d.join("plans")])
+            .unwrap_or_default();
+    }
     let mut settings = serde_json::json!({});
     if req.mode == AgentMode::Edit {
         let mut allow: Vec<String> = Vec::new();
@@ -373,6 +393,41 @@ impl ClaudeParser {
             usage: std::mem::take(&mut self.usage),
         }
     }
+}
+
+/// The plan a plan-mode run hands in, from its tool calls. Recorded from
+/// `claude -p … --permission-mode plan` (2.1.312, `tests/fixtures/
+/// claude_plan_mode.jsonl`): `-p` has no `ExitPlanMode`, so the plan is
+/// the file it `Write`s under `~/.claude/plans/` (Plan mode denies `Edit`,
+/// so a revision writes it whole again). An `ExitPlanMode` call, where a
+/// version has one, carries it as `input.plan`.
+fn plans(events: &[AgentEvent]) -> Vec<AgentEvent> {
+    events
+        .iter()
+        .filter_map(|ev| {
+            let AgentEvent::ToolCall { name, input, .. } = ev else {
+                return None;
+            };
+            let text = |key: &str| {
+                input
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.trim().is_empty())
+                    .map(str::to_string)
+            };
+            match name.as_str() {
+                "ExitPlanMode" => text("plan"),
+                "Write" if text("file_path").is_some_and(|p| is_plan_file(&p)) => text("content"),
+                _ => None,
+            }
+        })
+        .map(|text| AgentEvent::Plan { text })
+        .collect()
+}
+
+/// A file under Claude Code's plan directory (`~/.claude/plans/*.md`).
+fn is_plan_file(path: &str) -> bool {
+    path.contains("/.claude/plans/") && path.ends_with(".md")
 }
 
 /// Pure: one stream-json line in, zero or more normalized events out.
@@ -563,10 +618,19 @@ fn claude_usage(u: &Value, usd: f64) -> Usage {
 
 impl LineParser for ClaudeParser {
     fn on_line(&mut self, line: &str) -> Vec<AgentEvent> {
-        if self.stdin_input {
-            return self.on_stdin_line(line);
-        }
-        parse_line(line)
+        let mut events = if self.stdin_input {
+            self.on_stdin_line(line)
+        } else {
+            parse_line(line)
+        };
+        let plans = plans(&events);
+        // Before `Done`: the plan is part of the run, not after it.
+        let at = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Done { .. } | AgentEvent::Error { .. }))
+            .unwrap_or(events.len());
+        events.splice(at..at, plans);
+        events
     }
 
     fn on_exit(&mut self, success: bool, stderr_tail: &str) -> AgentEvent {
@@ -1088,6 +1152,23 @@ mod run_mode_tests {
         assert!(s["hooks"]["PreToolUse"][0]["hooks"][0]["command"].is_string());
         // A binary that never installed the guard offers no hook.
         assert!(settings_of(&build_args_guarded(&req, &Default::default(), None, None)).is_none());
+
+        // Plan: the guard's only root is Claude's plan directory, so the
+        // plan file is written and the worktree never is.
+        req.mode = AgentMode::Plan;
+        let s = settings_of(&build_args_guarded(
+            &req,
+            &Default::default(),
+            None,
+            Some(exe),
+        ))
+        .expect("settings");
+        assert!(s.get("permissions").is_none());
+        let cmd = s["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(cmd.ends_with("/plans'"), "{cmd}");
+        assert!(!cmd.contains("/data/spaces/a1"), "{cmd}");
 
         req.mode = AgentMode::ReadOnly;
         let args = build_args_guarded(&req, &Default::default(), None, Some(exe));

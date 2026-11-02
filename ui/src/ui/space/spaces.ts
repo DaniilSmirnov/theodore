@@ -251,9 +251,9 @@ export function spaceKeyAction(
   }
 }
 
-const MODE_ORDER: SpaceMode[] = ['ask', 'edit', 'run'];
+const MODE_ORDER: SpaceMode[] = ['ask', 'plan', 'edit', 'run'];
 
-/** `M` cycles Ask → Edit → Run → Ask. */
+/** `M` cycles Ask → Plan → Edit → Run → Ask. */
 export function nextMode(m: SpaceMode): SpaceMode {
   return MODE_ORDER[(MODE_ORDER.indexOf(m) + 1) % MODE_ORDER.length]!;
 }
@@ -426,17 +426,33 @@ export function nativeNotice(
   return { title: `${spaceTitle(next)}: turn finished` };
 }
 
+/** The agent just asked you something (`ask_user`): the notice, `null`
+ *  when no new question came — "<space>: question" and the first one. */
+export function questionAsked(
+  prev: Pick<Space, 'question'> | undefined,
+  next: Pick<Space, 'question' | 'name' | 'goal'>,
+): { title: string; body: string } | null {
+  const q = next.question;
+  if (!q || prev?.question?.id === q.id) return null;
+  return {
+    title: `${spaceTitle(next)}: question`,
+    body: q.questions[0]?.question ?? '',
+  };
+}
+
 /** The dock badge: spaces whose last turn ended after you last looked
- *  (finished or failed), archived ones aside. */
+ *  (finished or failed), and spaces whose agent waits on your answer;
+ *  archived ones aside. */
 export function waitingSpaces(
-  spaces: Pick<Space, 'id' | 'status' | 'updated_at' | 'turns'>[],
+  spaces: Pick<Space, 'id' | 'status' | 'updated_at' | 'turns' | 'question'>[],
   seen: (id: string) => number | undefined,
 ): number {
   return spaces.filter(
     (s) =>
-      (s.status === 'idle' || s.status === 'failed') &&
-      s.turns > 0 &&
-      (seen(s.id) ?? 0) < s.updated_at,
+      (s.status === 'running' && !!s.question) ||
+      ((s.status === 'idle' || s.status === 'failed') &&
+        s.turns > 0 &&
+        (seen(s.id) ?? 0) < s.updated_at),
   ).length;
 }
 
@@ -512,4 +528,26 @@ export function canContinue(
     s.status !== 'archived' &&
     prState === 'merged'
   );
+}
+
+/** Plan turns' plans, by the reply that carries them. */
+export function plansByReply(
+  log: Pick<SpaceTurn, 'reply' | 'plan' | 'undone'>[] | undefined,
+): Map<string, string> {
+  return new Map(
+    (log ?? [])
+      .filter((t) => !t.undone && t.plan)
+      .map((t) => [t.reply, t.plan!]),
+  );
+}
+
+/** The reply whose plan Approve / Revise act on: the last turn's, while
+ *  the space can take a turn. `null` otherwise. */
+export function actionablePlan(
+  s: Pick<Space, 'status' | 'turn_log'>,
+): string | null {
+  if (s.status === 'running' || s.status === 'archived') return null;
+  const log = (s.turn_log ?? []).filter((t) => !t.undone);
+  const last = log[log.length - 1];
+  return last?.plan ? last.reply : null;
 }

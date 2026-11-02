@@ -107,3 +107,43 @@ fn gemini_documented_stream_fixture() {
             .any(|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "testTool"))
     );
 }
+
+/// Recorded from `claude -p … --permission-mode plan` (2.1.312, redacted):
+/// `-p` has no `ExitPlanMode`, the plan is the file it writes under
+/// `~/.claude/plans/`. The parser reports it as `Plan`, before `Done`.
+#[test]
+fn claude_plan_mode_fixture_reports_the_plan_file() {
+    use theodore_agents::process::LineParser;
+    let fixture = include_str!("fixtures/claude_plan_mode.jsonl");
+    let mut parser = claude::ClaudeParser::new();
+    let events: Vec<AgentEvent> = fixture.lines().flat_map(|l| parser.on_line(l)).collect();
+    let plans: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Plan { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(plans.len(), 1, "{events:?}");
+    assert!(plans[0].starts_with("# Plan: make main.rs print"));
+    assert!(plans[0].contains("## Verification"));
+    let at = |f: fn(&AgentEvent) -> bool| events.iter().position(f).unwrap();
+    assert!(
+        at(|e| matches!(e, AgentEvent::Plan { .. })) < at(|e| matches!(e, AgentEvent::Done { .. }))
+    );
+    assert_eq!(terminals(&events).len(), 1);
+}
+
+#[test]
+fn claude_exit_plan_mode_input_is_the_plan() {
+    use theodore_agents::process::LineParser;
+    let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"ExitPlanMode","input":{"plan":"1. Do it"}}]}}"#;
+    let events = claude::ClaudeParser::new().on_line(line);
+    assert!(events.contains(&AgentEvent::Plan {
+        text: "1. Do it".into()
+    }));
+    // A write anywhere else is not a plan.
+    let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Write","input":{"file_path":"/repo/notes.md","content":"x"}}]}}"#;
+    let events = claude::ClaudeParser::new().on_line(line);
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Plan { .. })));
+}

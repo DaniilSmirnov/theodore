@@ -20,6 +20,7 @@ use theodore_mcp::{
 };
 use theodore_ports::{
     Answer, CodeHit, CodeSymbol, CodeSymbolKind, Diagnostic, LanguageStatus, McpEndpoint, Position,
+    UserAnswer, UserQuestion,
 };
 
 /// Backend over the core. Created before the core exists (the core needs the
@@ -269,6 +270,17 @@ impl SpaceToolsBackend for CoreTools {
     ) -> Result<(), SpaceToolError> {
         self.space_core()?
             .space_tool_progress(space, &run_id.0, steps, note)
+            .await
+    }
+
+    async fn ask_user(
+        &self,
+        space: &str,
+        run_id: &RunId,
+        questions: Vec<UserQuestion>,
+    ) -> Result<Vec<UserAnswer>, SpaceToolError> {
+        self.space_core()?
+            .space_tool_ask(space, &run_id.0, questions)
             .await
     }
 }

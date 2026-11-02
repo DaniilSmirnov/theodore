@@ -30,7 +30,7 @@ pub fn claude_models() -> Vec<ModelInfo> {
 }
 
 /// `CLAUDE_CONFIG_DIR`, else `~/.claude`.
-fn claude_config_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn claude_config_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".claude")))

@@ -192,6 +192,8 @@ impl Core {
             fork_sha,
             issue: start.issue,
             pinned: false,
+            build_mode: None,
+            question: None,
         };
         self.apply(vec![NewAction {
             model: models::SPACE.into(),
@@ -287,6 +289,17 @@ impl Core {
     /// `chat_message` row.
     pub async fn space_send(&self, req: SpaceSendRequest) -> AppResult<String> {
         let _queue = self.space_queue_lock(&req.space).await;
+        self.space_send_as(req, None).await
+    }
+
+    /// `space_send`, with `prompt` (when set) as the turn's ask instead of
+    /// the message as typed (an approved plan, `space_plan`). Caller holds
+    /// the space's queue lock.
+    pub(crate) async fn space_send_as(
+        &self,
+        req: SpaceSendRequest,
+        prompt: Option<String>,
+    ) -> AppResult<String> {
         let space = self.space_row(&req.space).await?;
         if space.status == SpaceStatus::Archived {
             return Err(AppError::Invalid("this space is archived".into()));
@@ -302,6 +315,12 @@ impl Core {
             return Err(AppError::Invalid("empty message".into()));
         }
         if running {
+            if prompt.is_some() {
+                // Its ask isn't the message: it can't wait in the queue.
+                return Err(AppError::Invalid(
+                    "the agent is still working in this space".into(),
+                ));
+            }
             return self.queue_message(&space, &req, text, attachments).await;
         }
         let message = ChatMessage {
@@ -315,7 +334,7 @@ impl Core {
             attachments,
             queued: None,
         };
-        self.start_turn(space, &req, message, false).await
+        self.start_turn(space, &req, message, false, prompt).await
     }
 
     /// Refused while the space sets up: the goal goes first.
@@ -332,14 +351,16 @@ impl Core {
     }
 
     /// Stores `message` (new, or a queued one now sent: `stored`) and
-    /// starts its turn with `req`'s picks. Caller holds the space's queue
-    /// lock; the space isn't running.
+    /// starts its turn with `req`'s picks; `prompt`, when set, is the
+    /// turn's ask instead of the message (an approved plan). Caller holds
+    /// the space's queue lock; the space isn't running.
     pub(crate) async fn start_turn(
         &self,
         space: Space,
         req: &SpaceSendRequest,
         message: ChatMessage,
         stored: bool,
+        prompt: Option<String>,
     ) -> AppResult<String> {
         let project = self.space_project(&space).await?;
         let (text, attachments) = (message.text.clone(), message.attachments.clone());
@@ -361,6 +382,21 @@ impl Core {
         let message_id = message.id.clone();
         let now = message.at;
         let run_id = format!("space:{}:{message_id}", space.id);
+        let mut patch = serde_json::json!({
+            "status": SpaceStatus::Running,
+            "run": run_id,
+            "agent": agent,
+            "model": model,
+            "mode": mode,
+            "error": null,
+            // Said once, in this turn's prompt.
+            "continue_note": null,
+            "updated_at": now,
+        });
+        if matches!(mode, SpaceMode::Edit | SpaceMode::Run) {
+            // What an approved plan is built in (docs/spaces.md §5).
+            patch["build_mode"] = serde_json::json!(mode);
+        }
         self.apply(vec![
             NewAction {
                 model: models::CHAT_MESSAGE.into(),
@@ -377,17 +413,7 @@ impl Core {
                 model: models::SPACE.into(),
                 model_id: space.id.clone(),
                 action: SyncActionCode::C,
-                data: Some(serde_json::json!({
-                    "status": SpaceStatus::Running,
-                    "run": run_id,
-                    "agent": agent,
-                    "model": model,
-                    "mode": mode,
-                    "error": null,
-                    // Said once, in this turn's prompt.
-                    "continue_note": null,
-                    "updated_at": now,
-                })),
+                data: Some(patch),
             },
         ])
         .await?;
@@ -403,8 +429,10 @@ impl Core {
         // turn's instructions, and the attached files are listed after it;
         // the transcript keeps the text as typed.
         let claude_home = &self.0.deps.claude_home;
-        let ask = expand_skill(&text, |id| space_skill_content(id, &wt.path, claude_home))
-            .unwrap_or_else(|| text.clone());
+        let ask = prompt.unwrap_or_else(|| {
+            expand_skill(&text, |id| space_skill_content(id, &wt.path, claude_home))
+                .unwrap_or_else(|| text.clone())
+        });
         let ask = with_attachments(ask, &attachments);
         let ultracode = agent == AgentId::Claude
             && self.setting_string("agents.claude.effort", "").await.trim() == ULTRACODE;
@@ -458,11 +486,14 @@ impl Core {
             system: self
                 .space_review_rules(&space, &project, &wt.path)
                 .await
-                .with_system(Some(system_prompt(
-                    &space,
-                    self.0.deps.tools.is_some(),
-                    code,
-                    self.user_mcp_allowed().await,
+                .with_system(Some(crate::usecases::space_plan::with_plan_rules(
+                    system_prompt(
+                        &space,
+                        self.0.deps.tools.is_some(),
+                        code,
+                        self.user_mcp_allowed().await,
+                    ),
+                    mode,
                 )))
                 .unwrap_or_default(),
             env: self.space_agent_env(&space).await,
@@ -894,6 +925,8 @@ struct Streamed {
     session_gone: bool,
     /// The last session id the run reported.
     session: Option<String>,
+    /// The plan a Plan turn handed in (`AgentEvent::Plan`).
+    plan: Option<String>,
 }
 
 async fn stream_run(
@@ -923,10 +956,14 @@ async fn stream_run(
             _ = cancel.cancelled() => { run.cancel.cancel(); break; }
             event = run.events.recv() => {
                 let Some(event) = event else { break };
-                live.show(core, &event);
+                // Quiet because it waits on your answer, not stuck.
+                if !(event == AgentEvent::Stalled && core.asking(run_id)) {
+                    live.show(core, &event);
+                }
                 match event {
                     AgentEvent::Text { text: t } => out.text.push_str(&t),
                     AgentEvent::Session { id } => out.session = Some(id),
+                    AgentEvent::Plan { text } => out.plan = Some(text),
                     AgentEvent::Done { final_text, .. } => {
                         if !final_text.is_empty() {
                             out.text = final_text;
@@ -1003,6 +1040,7 @@ async fn drive_turn(core: &Core, turn: Turn) {
             SpaceMode::Ask => AgentMode::ReadOnly,
             SpaceMode::Edit => AgentMode::Edit,
             SpaceMode::Run => AgentMode::Run,
+            SpaceMode::Plan => AgentMode::Plan,
         },
         mcp,
         model,
@@ -1033,8 +1071,17 @@ async fn drive_turn(core: &Core, turn: Turn) {
         text,
         mut error,
         session,
+        plan,
         ..
     } = streamed;
+    // Questions still waiting go with the run that asked them.
+    core.end_space_questions(&run_id);
+    // A Plan turn's reply is its plan (the card's text, and what a later
+    // turn's replayed transcript carries).
+    let plan = (mode == SpaceMode::Plan && error.is_none() && !cancel.is_cancelled())
+        .then(|| crate::usecases::space_plan::plan_of(plan, &text))
+        .flatten();
+    let text = plan.clone().unwrap_or(text);
     // The session this turn ran in is the one the next turn continues. A
     // resumed run that reported none (it failed to start) leaves it as is;
     // a new one that reported none (Gemini) means there is none to continue.
@@ -1150,6 +1197,7 @@ async fn drive_turn(core: &Core, turn: Turn) {
         "agent_session": agent_session,
         // The tracker is the turn's: it goes when the agent is done.
         "progress": null,
+        "question": null,
         "updated_at": core.0.deps.clock.now(),
     });
     if let Some(extra) = saved.patch {
@@ -1180,6 +1228,7 @@ async fn drive_turn(core: &Core, turn: Turn) {
                 finished_at: None,
             }),
             base_before: saved.base_before.clone(),
+            plan,
         });
         patch["turn_log"] = serde_json::json!(log);
     }
@@ -1489,7 +1538,8 @@ pub(crate) const SPACE_TOOLS_PROMPT: &str = "Theodore's space-tools MCP server r
      base, uncommitted edits included; get_review_comments reads the review's comments \
      and add_review_comment leaves one on a line; set_base changes the base branch when \
      the user asks; update_progress shows your plan above the user's message box, for \
-     work with several steps.";
+     work with several steps; ask_user asks the user 1-3 multiple-choice questions and \
+     waits for the answer, only when you can't go on without their decision.";
 
 /// Told to the agent when its turn has the user's own MCP servers.
 const USER_MCP_PROMPT: &str = "The user's own MCP servers (Linear, GitHub, docs and \

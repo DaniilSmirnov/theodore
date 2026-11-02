@@ -12,6 +12,7 @@ import {
   labsVisible,
   nativeNotice,
   notifyOn,
+  questionAsked,
   spaceOfReview,
   spaceTitle,
   turnEnded,
@@ -76,7 +77,8 @@ export function watchSpaceTurns(store: RootStore): () => void {
           const route = store.ui.route;
           const looking = route.name === 'space' && route.id === s.id;
           const away = !windowFocused();
-          const native = nativeNotice(before, s);
+          const asked = questionAsked(before, s);
+          const native = asked ?? nativeNotice(before, s);
           if (native && away && notifyOn(store.models.settings.all())) {
             const id = s.id;
             void notifySpace(id, native.title, native.body)
@@ -85,7 +87,9 @@ export function watchSpaceTurns(store: RootStore): () => void {
                 pending = clicks ? null : id;
               });
           }
-          const notice = turnEnded(before, s);
+          const notice = asked
+            ? { level: 'info' as const, text: asked.title }
+            : turnEnded(before, s);
           if (!notice || (looking && !away)) continue;
           store.ephemeral.toast(notice.text, notice.level, {
             label: 'Open',

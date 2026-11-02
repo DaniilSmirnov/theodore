@@ -347,6 +347,17 @@ pub trait CoreApi: Send + Sync {
     ) -> Result<String, CommandError> {
         Err(not_ready())
     }
+    /// Approve on a plan card: the next turn implements the plan.
+    async fn approve_space_plan(&self, _space: String) -> Result<String, CommandError> {
+        Err(not_ready())
+    }
+    /// Your answers to the agent's `ask_user` questions.
+    async fn answer_space_question(
+        &self,
+        _req: theodore_contract::SpaceAnswerRequest,
+    ) -> Result<(), CommandError> {
+        Err(not_ready())
+    }
     // ── project config (docs/config.md) ──────────────────────────────────
 
     /// What a space runs, where each command comes from, trust.

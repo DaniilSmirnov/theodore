@@ -94,6 +94,7 @@ import {
   useSpaceLogsSeed,
 } from './SpaceCommands';
 import { TerminalDrawer, TerminalToggle } from './Terminal';
+import { PlanActions, QuestionCard } from './SpacePlan';
 import {
   AUTO_ARCHIVE_KEY,
   BUILD_MODE_KEY,
@@ -102,8 +103,10 @@ import {
   autoArchiveDays,
   defaultTitle,
   diffStat,
+  actionablePlan,
   nextMode,
   notifyOn,
+  plansByReply,
   spaceKeyAction,
   spaceChatKey,
   spaceStage,
@@ -116,6 +119,11 @@ import {
 /** What the agent may do in a turn (docs/spaces.md §5). */
 const MODES: { id: SpaceMode; label: string; hint: string }[] = [
   { id: 'ask', label: 'Ask', hint: 'Read only, no edits' },
+  {
+    id: 'plan',
+    label: 'Plan',
+    hint: 'Explore, then a plan to approve before any edit',
+  },
   { id: 'edit', label: 'Edit', hint: 'Edit files in the space' },
   { id: 'run', label: 'Run', hint: 'Edit and run any command' },
 ];
@@ -761,6 +769,12 @@ export const SpaceChat = observer(function SpaceChat({
   const undone = undoneMessages(space);
   const undo = undoState(space);
   const checks = checksByReply(space.turn_log);
+  const plans = plansByReply(space.turn_log);
+  const planHere = actionablePlan(space);
+  const [revising, setRevising] = useState(false);
+  useEffect(() => {
+    if (planHere == null) setRevising(false);
+  }, [planHere]);
   const turnRuns = runsByReply(space.id, space.turn_log);
   // A finished turn's tool calls, kept for this session; the turn still
   // running (its check) shows them below instead.
@@ -810,6 +824,7 @@ export const SpaceChat = observer(function SpaceChat({
     if ((!t && !files.ids.length) || files.busy) return;
     if (space.status === 'archived') return;
     setText('');
+    setRevising(false);
     void (now ? api.spaceSendNow : api.spaceSend)({
       space: space.id,
       text: t,
@@ -851,14 +866,20 @@ export const SpaceChat = observer(function SpaceChat({
           const undoneReply = agent && undone.has(m.id);
           const undoHere =
             undo.turn?.reply === m.id && space.status !== 'archived';
+          const plan = agent && plans.has(m.id) && !undoneReply;
           return (
             <ChatMessage
               key={m.id}
               m={m}
               className={undone.has(m.id) ? 'space-undone opacity-50' : ''}
               badges={
-                undoneReply || undoHere ? (
+                undoneReply || undoHere || plan ? (
                   <>
+                    {plan && (
+                      <span className="space-plan-badge rounded-full bg-default px-1.5 text-[10px] text-accent">
+                        plan
+                      </span>
+                    )}
                     {undoneReply && (
                       <span className="rounded-full bg-default px-1.5 text-[10px] text-muted">
                         undone
@@ -880,6 +901,16 @@ export const SpaceChat = observer(function SpaceChat({
                     {checks.has(m.id) && (
                       <CheckChip check={checks.get(m.id)!} />
                     )}
+                    {planHere === m.id && (
+                      <PlanActions
+                        space={space}
+                        onRevise={() => {
+                          setMode('plan');
+                          setRevising(true);
+                          input.current?.focus();
+                        }}
+                      />
+                    )}
                   </>
                 ) : undefined
               }
@@ -895,6 +926,13 @@ export const SpaceChat = observer(function SpaceChat({
           />
         )}
         <QueuedMessages space={space} queued={queued} />
+        {run && space.question?.run === run && (
+          <QuestionCard
+            key={space.question.id}
+            space={space}
+            question={space.question}
+          />
+        )}
       </ChatLog>
       <div className="chat-input px-4 pb-3 pt-1">
         <div className="mx-auto flex w-full max-w-[860px] flex-col gap-2">
@@ -919,7 +957,9 @@ export const SpaceChat = observer(function SpaceChat({
                   ? 'Setting up…'
                   : run
                     ? 'Queue a message for after this turn…'
-                    : 'Ask the agent to change something…'
+                    : revising
+                      ? 'What should change in the plan?'
+                      : 'Ask the agent to change something…'
             }
             disabled={space.status === 'archived' || settingUp(space)}
             running={!!run}

@@ -30,6 +30,9 @@ pub enum SpaceMode {
     /// Edit, plus run shell commands (tests, installs) without asking. No
     /// sandbox of Theodore's own: the agent CLI runs as configured.
     Run,
+    /// Read and explore, no edits; the turn ends with a plan you approve
+    /// (the next turn implements it in `Space::build_mode`) or revise.
+    Plan,
 }
 
 /// How a space was shipped (docs/spaces.md §1).
@@ -175,6 +178,14 @@ pub struct Space {
     /// Set only by `set_space_pinned`, never by a client transaction.
     #[serde(default)]
     pub pinned: bool,
+    /// The mode that writes, Edit or Run, a turn last ran in: what an
+    /// approved plan is implemented in. `None` = Edit.
+    #[serde(default)]
+    pub build_mode: Option<SpaceMode>,
+    /// The agent's `ask_user` questions waiting for your answer; the turn
+    /// is paused on them.
+    #[serde(default)]
+    pub question: Option<SpaceQuestion>,
 }
 
 /// A merge of the base into the space, left in progress on conflicts
@@ -200,6 +211,45 @@ pub struct SpaceBaseStatus {
     pub base_tip: Sha,
     /// Commits on the base since `base_sha`.
     pub behind: u32,
+}
+
+/// Questions the agent asked mid-turn (`ask_user` on `space-tools`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct SpaceQuestion {
+    pub id: String,
+    /// The turn that asked (`Space::run`).
+    pub run: String,
+    /// 1–3, each with 2–4 options; "Other" is always offered too.
+    pub questions: Vec<SpaceQuestionItem>,
+    pub asked_at: Millis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct SpaceQuestionItem {
+    pub question: String,
+    pub options: Vec<String>,
+    /// Several options may be picked.
+    #[serde(default)]
+    pub multi: bool,
+}
+
+/// Your answers to a [`SpaceQuestion`], one per question, in order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct SpaceAnswerRequest {
+    pub space: String,
+    /// `SpaceQuestion::id`.
+    pub question: String,
+    pub answers: Vec<SpaceAnswerItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct SpaceAnswerItem {
+    /// The options picked, as written.
+    #[serde(default)]
+    pub selected: Vec<String>,
+    /// Free text under "Other".
+    #[serde(default)]
+    pub other: Option<String>,
 }
 
 /// One merged round of a continued space.
@@ -252,6 +302,10 @@ pub struct SpaceTurn {
     /// which Undo puts back.
     #[serde(default)]
     pub base_before: Option<Sha>,
+    /// A Plan-mode turn's plan: the reply shows as a plan card with
+    /// Approve / Revise.
+    #[serde(default)]
+    pub plan: Option<String>,
 }
 
 /// Where a new space's work starts (docs/spaces.md §3 "New space"), instead

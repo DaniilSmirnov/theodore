@@ -59,6 +59,10 @@ pub(crate) fn interrupted_patch(
         patch.insert("run".into(), serde_json::Value::Null);
         patch.insert("error".into(), serde_json::json!(WHY));
     }
+    // Its `ask_user` wait ended with the process that asked.
+    if space.question.is_some() {
+        patch.insert("question".into(), serde_json::Value::Null);
+    }
     if let Some(p) = &space.process
         && p.status == ProcessStatus::Running
     {

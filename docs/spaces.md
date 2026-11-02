@@ -428,6 +428,7 @@ the turn ends.
 | --- | --- | --- | --- |
 | turn finished | diff refreshes | toast "fix-login: turn done" [Open] + ● | notification "fix-login: turn finished" |
 | turn failed | error in chat | error toast [Open] + ✕ | notification "fix-login: turn failed" + the error |
+| agent asks (`ask_user`) | question card in chat | toast "fix-login: question" [Open] | notification "fix-login: question" + the first question |
 | PR checks / reviews | header + tabs | existing inbox | existing |
 
 "In the background" = the window isn't focused. The notification respects
@@ -454,8 +455,9 @@ closed or cleared from Notification Center (the thread then ends); one left
 in Notification Center keeps its thread until the app quits. At most 16
 wait at once; past that a notification is only shown and falls back to the
 next window focus. The dock badge counts the spaces whose last
-turn ended after you last looked at them (finished or failed); a space only
-counts as seen while the window has focus.
+turn ended after you last looked at them (finished or failed), plus the
+spaces whose agent waits on your answer; a space only counts as seen while
+the window has focus.
 
 ---
 
@@ -520,10 +522,11 @@ Toggled from the header (and `⌃\``), it opens as a drawer under the page;
 | Mode | The agent may | Port mapping |
 | --- | --- | --- |
 | Ask | read, skills, subagents, todos, web, MCP; no writes or commands | `AgentMode::ReadOnly` |
+| Plan | Ask, ending in a plan you approve or revise (below) | `AgentMode::Plan`: Claude `--permission-mode plan`; Codex `read-only`; Gemini `default` |
 | Edit (default) | + edit files in the space | `AgentMode::Edit` |
 | Run | + any shell command (tests, installs), no prompts | `AgentMode::Run`: Claude `--permission-mode bypassPermissions`; Codex `workspace-write` with network access; Gemini `--approval-mode yolo`. No sandbox of Theodore's own (§12 #4) |
 
-Mode is picked next to Send (Ask · Edit · Run) and sticky per space. Edit
+Mode is picked next to Send (Ask · Plan · Edit · Run, `M` cycles) and sticky per space. Edit
 is unchanged from before: Claude's Edit already pre-approves Bash, Codex's
 `workspace-write` already runs commands in its own sandbox; Run lifts the
 remaining prompts and limits.
@@ -573,6 +576,48 @@ remaining prompts and limits.
     Gemini's shell) can still write outside its directory. Later: run agents
     under a macOS sandbox profile that only allows writes inside the space
     (open question 4).
+
+### Plan first
+
+```text
+Plan turn ─▶ reply = the plan, badge "plan" ─┬─ Approve ─▶ next turn in build_mode
+ (explores, no edits)                        │    "Plan approved, implement it." in chat;
+                                             │    the agent gets the plan in full
+                                             └─ Revise ─▶ composer "What should change
+                                                  in the plan?" ─▶ another Plan turn
+```
+
+- The plan: Claude Code's plan file (it has no `ExitPlanMode` under `-p`,
+  so it writes `~/.claude/plans/*.md`; an `ExitPlanMode` call wins if one
+  comes), else the turn's final message. Stored on its turn as
+  `SpaceTurn::plan`, and as the reply's text, so a replayed transcript
+  carries it.
+- `build_mode`: the space's last Edit or Run, Edit when it had neither.
+  Approve sends that mode explicitly, so the space leaves Plan.
+- Approve / Revise sit only on the last live turn's plan, while no turn
+  runs. A stopped or failed Plan turn has no plan.
+- Every agent gets the same Plan rules in its system prompt: explore, edit
+  nothing, end with context, numbered steps per file, how to verify.
+
+### Questions
+
+`ask_user` (on `space-tools`, every mode): 1–3 questions, each 2–4 options,
+`multi` to pick several; "Other" (free text) is always offered.
+
+```text
+agent ─▶ ask_user ─▶ Space::question ─▶ card in chat + notice + badge
+                       │
+  Send answer ─────────┼─▶ tool result: question, selected, other ─▶ turn goes on
+  Stop ────────────────┼─▶ "the user stopped the turn"
+  30 min, no answer ───┼─▶ "go on with your best judgment and say what you assumed"
+  restart ─────────────┴─▶ turn interrupted as any other
+  (each way: Space::question cleared)
+```
+
+- One set at a time per space; a second `ask_user` while one waits is
+  refused. Only the running turn's run may ask.
+- The wait is in memory; the "agent is quiet" hint stays off while it waits.
+- Answers are checked against the options (one per question unless `multi`).
 
 ### One session per space
 
@@ -641,6 +686,7 @@ configured commands, never a shell of the agent's choosing.
 | `add_review_comment` | a finding on a line of the space's review: shows in Review, "Send to agent" sends it back |
 | `set_base` | a new base branch: fetched, the diff is vs the merge-base from then on |
 | `update_progress` | the turn's plan as steps (pending · active · done) above the composer |
+| `ask_user` | asks you 1–3 multiple-choice questions and waits for the answer (§5 Questions) |
 
 ```
 turn ─▶ token for this space ─▶ agent ─▶ run_check ─▶ check ─▶ result ─▶ agent fixes ─▶ …
@@ -1018,6 +1064,8 @@ downloaded to this Mac yet".
 | `space_base_status` | the base's tip in the copy on this Mac and how many commits the space is behind it; no network |
 | `update_space_from_base` | merge the base's tip into the space (§6); while `updating`, complete that merge if no markers are left |
 | `abort_space_update` | `merge --abort`, back to `updating.from` on the old base |
+| `approve_space_plan` | the last turn's plan as the next turn, in the space's `build_mode` |
+| `answer_space_question` | your answers to a waiting `ask_user`; refused when they don't fit its options |
 | `ship_space` | `open_pr` · `open_draft_pr` · `push` (host project) or `merge_locally` · `keep_branch` (local folder), with an optional title (§6) |
 | `space_setup_assist` | "Set up with agent": no `spaces:` commands at all — a turn asking the agent to look at the repo and write them (`docs/config.md` §2, §8) |
 | `space_fix_setup` | "Fix with agent": setup failed — a turn with the command, its exit status and the log tail, asking the agent to fix the cause |
@@ -1056,6 +1104,8 @@ no row, or `true`, means on. The flag forces them on and locks the switch.
 | **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; `max_parallel`; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; Update from base (merge, never rebase): "Base moved: N commits behind", conflicts resolved by an agent turn, Complete merge / Abort; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent" for setup; "Fix with agent" on the Checks tab, sending a failing check's log (GitHub Actions) or link as one turn |
 | **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel`; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; the agent's `space-tools` for the change: `ship`, `get_space_diff`, `get_review_comments`, `add_review_comment`, `set_base`, `update_progress` (the tracker above the composer); interactive terminal tabs (§3 "Terminal") over a real PTY, surviving navigation, closed on archive / app quit; sends while running are queued (held after Stop / a failure / a restart; Send · Edit · Cancel) and Send now steers a running Claude Code turn; Update from base (merge, never rebase): "Base moved: N commits behind", conflicts resolved by an agent turn, Complete merge / Abort; in review on the space page: Changes · Threads · Checks tabs, Merge (`merge_space`: host default method, auto-merge, merge queue), Continue after merge (`continue_space`, `rounds`), the sidebar's `⎇ #n` glyph; Open PR fills the repo's PR template and links back (`theodore://space/<id>`) |
 | **v2** | My PRs "Drafting" group; "Send all to agent" footer and feedback tracked as tasks; `space_run` rows and per-turn diffs; Delete and ref GC; `max_parallel`; an agent tool over `space_terminal_tail`; Continue for a space merged locally or kept as a branch |
+| **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; `max_parallel`; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; Update from base (merge, never rebase): "Base moved: N commits behind", conflicts resolved by an agent turn, Complete merge / Abort; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent" for setup; "Fix with agent" on the Checks tab, sending a failing check's log (GitHub Actions) or link as one turn; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent" |
+| **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel` |
 | **Later** | OS sandbox for agents; live diff during a turn (snapshot the working tree through a temporary index); signed shipped commits; spaces started from an issue or a failing check; several agents racing one goal, pick the best diff |
 
 ## 12. Decisions (owner, 2026-10-21)

@@ -911,6 +911,28 @@ pub async fn space_fix_ci(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn approve_space_plan(
+    op: crate::op::Op,
+    space: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<String, CommandError> {
+    op.run(async move { core.approve_space_plan(space).await })
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn answer_space_question(
+    op: crate::op::Op,
+    req: theodore_contract::SpaceAnswerRequest,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<(), CommandError> {
+    op.run(async move { core.answer_space_question(req).await })
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn account_status(
     op: crate::op::Op,
     core: State<'_, Arc<dyn CoreApi>>,

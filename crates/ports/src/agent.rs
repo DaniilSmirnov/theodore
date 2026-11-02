@@ -26,6 +26,10 @@ pub enum AgentMode {
     /// Run mode, docs/spaces.md §5). Theodore adds no sandbox of its own:
     /// the CLI's own configuration is what limits it.
     Run,
+    /// read and explore, never edit; the turn ends with a plan (a space's
+    /// Plan mode, docs/spaces.md §5). Claude Code's own plan mode; the
+    /// others run read-only and are told to answer with a numbered plan.
+    Plan,
 }
 
 /// The MCP server name a PR run's tools go under (`mcp__review-tools__*`).
@@ -132,6 +136,12 @@ pub enum AgentEvent {
         usage: Usage,
     },
     Stalled,
+    /// The plan a plan-mode run handed in (Claude Code's `ExitPlanMode`
+    /// input, or the plan file it wrote), next to the run's own events.
+    /// The last one counts; a run that reports none planned in its text.
+    Plan {
+        text: String,
+    },
     /// The CLI's session id for this run (Claude Code's `session_id`,
     /// Codex's `thread_id`): what [`AgentRequest::resume`] takes to continue
     /// it. May come more than once; the last one counts.

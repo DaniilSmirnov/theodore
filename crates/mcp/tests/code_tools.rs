@@ -321,7 +321,7 @@ async fn an_ask_mode_turn_hears_why_it_cannot_edit() {
     .await;
     assert_eq!(refused.is_error, Some(true));
     let text = &refused.content[0].as_text().unwrap().text;
-    assert!(text.contains("Ask mode"), "{text}");
+    assert!(text.contains("Ask or Plan mode"), "{text}");
     assert!(
         code.calls.lock().unwrap().is_empty(),
         "never reached the backend"

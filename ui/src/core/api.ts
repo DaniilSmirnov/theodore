@@ -71,6 +71,7 @@ import type {
   ShipSpaceRequest,
   Space,
   SpaceBaseStatus,
+  SpaceAnswerRequest,
   SpaceFeedbackRequest,
   SpaceFixCiRequest,
   SpaceIssue,
@@ -331,6 +332,12 @@ export const api = {
   /** "Fix with agent": the space PR's failing checks' logs as the next
    *  turn. */
   spaceFixCi: (req: SpaceFixCiRequest) => call<string>('space_fix_ci', { req }),
+  /** Approve on a plan card: the next turn implements the plan. */
+  approveSpacePlan: (space: string) =>
+    call<string>('approve_space_plan', { space }),
+  /** Your answers to the agent's `ask_user` questions. */
+  answerSpaceQuestion: (req: SpaceAnswerRequest) =>
+    call<null>('answer_space_question', { req }),
   /** What a space runs, where each command comes from, and trust. */
   spaceConfig: (space: string) =>
     call<SpaceConfigView>('space_config', { space }),

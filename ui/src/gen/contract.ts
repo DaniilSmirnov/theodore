@@ -1712,6 +1712,31 @@ export type Space = {
 	 *  Set only by `set_space_pinned`, never by a client transaction.
 	 */
 	pinned?: boolean,
+	/**
+	 *  The mode that writes, Edit or Run, a turn last ran in: what an
+	 *  approved plan is implemented in. `None` = Edit.
+	 */
+	build_mode?: SpaceMode | null,
+	/**
+	 *  The agent's `ask_user` questions waiting for your answer; the turn
+	 *  is paused on them.
+	 */
+	question?: SpaceQuestion | null,
+};
+
+export type SpaceAnswerItem = {
+	/**  The options picked, as written. */
+	selected?: string[],
+	/**  Free text under "Other". */
+	other?: string | null,
+};
+
+/**  Your answers to a [`SpaceQuestion`], one per question, in order. */
+export type SpaceAnswerRequest = {
+	space: string,
+	/**  `SpaceQuestion::id`. */
+	question: string,
+	answers: SpaceAnswerItem[],
 };
 
 /**
@@ -1802,7 +1827,12 @@ export type SpaceMode =
  *  Edit, plus run shell commands (tests, installs) without asking. No
  *  sandbox of Theodore's own: the agent CLI runs as configured.
  */
-"run";
+"run" |
+/**
+ *  Read and explore, no edits; the turn ends with a plan you approve
+ *  (the next turn implements it in `Space::build_mode`) or revise.
+ */
+"plan";
 
 /**  The space's long-running `run` command. */
 export type SpaceProcess = {
@@ -1838,6 +1868,23 @@ export type SpaceProgressState = "pending" | "active" | "done";
 export type SpaceProgressStep = {
 	label: string,
 	state: SpaceProgressState,
+};
+
+/**  Questions the agent asked mid-turn (`ask_user` on `space-tools`). */
+export type SpaceQuestion = {
+	id: string,
+	/**  The turn that asked (`Space::run`). */
+	run: string,
+	/**  1–3, each with 2–4 options; "Other" is always offered too. */
+	questions: SpaceQuestionItem[],
+	asked_at: number,
+};
+
+export type SpaceQuestionItem = {
+	question: string,
+	options: string[],
+	/**  Several options may be picked. */
+	multi?: boolean,
 };
 
 export type SpaceQueuedRequest = {
@@ -2015,6 +2062,11 @@ export type SpaceTurn = {
 	 *  which Undo puts back.
 	 */
 	base_before?: Sha | null,
+	/**
+	 *  A Plan-mode turn's plan: the reply shows as a plan card with
+	 *  Approve / Revise.
+	 */
+	plan?: string | null,
 };
 
 /**

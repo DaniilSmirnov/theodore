@@ -29,7 +29,10 @@ pub const SETTINGS_PATH_ENV_VAR: &str = "GEMINI_CLI_SYSTEM_SETTINGS_PATH";
 /// `ReadFileTool` / `GlobTool` / `ShellTool` are a best guess pending `--help`.
 fn core_tools(mode: AgentMode) -> Vec<&'static str> {
     match mode {
-        AgentMode::ReadOnly => vec!["ReadFileTool", "GlobTool", "SearchTextTool"],
+        // Plan: read only; the system prompt asks for the plan.
+        AgentMode::ReadOnly | AgentMode::Plan => {
+            vec!["ReadFileTool", "GlobTool", "SearchTextTool"]
+        }
         AgentMode::Edit | AgentMode::Run => {
             vec![
                 "ReadFileTool",
@@ -54,6 +57,11 @@ pub fn settings_json(req: &AgentRequest) -> Value {
                 "headers": { "Authorization": format!("Bearer {}", mcp.token) },
             }
         });
+        if crate::waits_on_user(req) {
+            // `ask_user` waits for you; Gemini's own default is 10 min.
+            settings["mcpServers"][&mcp.name]["timeout"] =
+                serde_json::json!(crate::USER_TOOL_TIMEOUT_MS);
+        }
     }
     settings
 }
@@ -81,7 +89,7 @@ pub fn build_args(req: &AgentRequest, cfg: &AgentBinaryConfig) -> Vec<String> {
     args.push("--approval-mode".to_string());
     args.push(
         match req.mode {
-            AgentMode::ReadOnly => "default",
+            AgentMode::ReadOnly | AgentMode::Plan => "default",
             AgentMode::Edit => "auto_edit",
             // Shell commands too, without asking.
             AgentMode::Run => "yolo",

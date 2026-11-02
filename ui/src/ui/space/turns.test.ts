@@ -10,6 +10,9 @@ import {
   undoState,
   undoneMessages,
   waitingSpaces,
+  questionAsked,
+  plansByReply,
+  actionablePlan,
 } from './spaces';
 
 const space = (over: Partial<Space> & { id: string }): Space => ({
@@ -200,5 +203,52 @@ describe('notifications', () => {
     ];
     const seen = (id: string) => (id === 'seen' ? 10 : undefined);
     expect(waitingSpaces(spaces, seen)).toBe(2);
+    // A turn waiting on your answer counts too.
+    const asking = space({
+      id: 'asking',
+      status: 'running',
+      turns: 1,
+      question: { id: 'q', run: 'r', questions: [], asked_at: 0 },
+    });
+    expect(waitingSpaces([...spaces, asking], seen)).toBe(3);
+  });
+
+  it('a new question is a notice once, with its first question', () => {
+    const q = {
+      id: 'q1',
+      run: 'r',
+      questions: [{ question: 'Which store?', options: ['a', 'b'] }],
+      asked_at: 0,
+    };
+    const next = { name: 'fix', goal: '', question: q };
+    expect(questionAsked({ question: null }, next)).toEqual({
+      title: 'fix: question',
+      body: 'Which store?',
+    });
+    expect(questionAsked({ question: q }, next)).toBeNull();
+    expect(questionAsked(undefined, { ...next, question: null })).toBeNull();
+  });
+
+  it('only the last, live plan turn gets Approve / Revise', () => {
+    const t = (reply: string, plan: string | null, undone = false) =>
+      ({ reply, plan, undone }) as never;
+    const log = [t('a1', '1. old'), t('a2', null), t('a3', '1. new')];
+    expect(plansByReply(log)).toEqual(
+      new Map([
+        ['a1', '1. old'],
+        ['a3', '1. new'],
+      ]),
+    );
+    expect(actionablePlan({ status: 'idle', turn_log: log })).toBe('a3');
+    expect(actionablePlan({ status: 'running', turn_log: log })).toBeNull();
+    expect(
+      actionablePlan({ status: 'idle', turn_log: [...log, t('a4', null)] }),
+    ).toBeNull();
+    expect(
+      actionablePlan({
+        status: 'idle',
+        turn_log: [t('a1', '1. p'), t('a2', null, true)],
+      }),
+    ).toBe('a1');
   });
 });

@@ -283,7 +283,8 @@ describe('space keys', () => {
   });
 
   it('cycles modes', () => {
-    expect(nextMode('ask')).toBe('edit');
+    expect(nextMode('ask')).toBe('plan');
+    expect(nextMode('plan')).toBe('edit');
     expect(nextMode('edit')).toBe('run');
     expect(nextMode('run')).toBe('ask');
   });

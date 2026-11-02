@@ -117,6 +117,10 @@ pub(crate) struct Inner {
     /// The app's URL scheme a space's PR links back with
     /// (`Core::set_space_link_scheme`).
     pub space_link_scheme: std::sync::Mutex<Option<String>>,
+    /// `ask_user` questions waiting for your answer, by question id
+    /// (`usecases::space_questions`).
+    pub questions:
+        std::sync::Mutex<HashMap<String, crate::usecases::space_questions::PendingQuestion>>,
 }
 
 /// Inbound streams the shell (Tauri or the CLI) forwards to the UI.
@@ -169,6 +173,7 @@ impl Core {
             term_rt: std::sync::Mutex::new(HashMap::new()),
             space_queue: Default::default(),
             space_link_scheme: std::sync::Mutex::new(None),
+            questions: std::sync::Mutex::new(HashMap::new()),
         });
 
         let core = Core(inner.clone());

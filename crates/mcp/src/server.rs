@@ -35,11 +35,12 @@ use crate::backend::{
     ReviewToolsBackend, RunContext, SpaceToolError, SpaceToolsBackend, ToolSet,
 };
 use crate::tools::{
-    AddFindingParams, AddFindingResult, BaseFileResult, CodeAnswerResult, CodeEditResult,
-    CodeStatusResult, DiagnosticItem, DiagnosticsParams, FindSymbolParams, GetBaseFileParams,
-    GetGroupParams, GetSymbolParams, GroupResult, HitItem, InsertAfterSymbolParams, PositionParams,
-    PrContextResult, ProposePatchParams, ProposePatchResult, ReadLogsParams, RenameSymbolParams,
-    ReplaceSymbolBodyParams, SymbolBodyResult, SymbolItem,
+    AddFindingParams, AddFindingResult, AskUserParams, AskUserResult, BaseFileResult,
+    CodeAnswerResult, CodeEditResult, CodeStatusResult, DiagnosticItem, DiagnosticsParams,
+    FindSymbolParams, GetBaseFileParams, GetGroupParams, GetSymbolParams, GroupResult, HitItem,
+    InsertAfterSymbolParams, PositionParams, PrContextResult, ProposePatchParams,
+    ProposePatchResult, ReadLogsParams, RenameSymbolParams, ReplaceSymbolBodyParams,
+    SymbolBodyResult, SymbolItem,
 };
 
 /// Live run registrations: bearer token → run context. Shared between the auth
@@ -346,6 +347,27 @@ impl ReviewToolsServer {
         let (_, space) = run_space(&parts)?;
         space_result(self.spaces.space_info(&space).await)
     }
+
+    #[tool(
+        description = "Ask the user 1-3 questions when you can't go on without their decision (which approach, which name, what they meant). Each question has 2-4 short options; the user may pick one (or several with multi) or type their own. Waits until they answer and returns the answers. Don't ask what you can find out yourself."
+    )]
+    async fn ask_user(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(params): Parameters<AskUserParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (run, space) = run_space(&parts)?;
+        let questions = params.into_questions();
+        if let Some(why) = theodore_ports::invalid_questions(&questions) {
+            return Err(ErrorData::invalid_params(why, None));
+        }
+        space_result(
+            self.spaces
+                .ask_user(&space, &run.run_id, questions)
+                .await
+                .map(|answers| AskUserResult { answers }),
+        )
+    }
 }
 
 /// Code intelligence (docs/code-intel.md §7): listed only for runs whose
@@ -529,8 +551,8 @@ impl ServerHandler for ReviewToolsServer {
             {
                 return Ok(CallToolResponse::Complete(CallToolResult::error(vec![
                     ContentBlock::text(
-                        "code edits are off: this turn is in Ask mode. Ask the user to switch \
-                         the space to Edit",
+                        "code edits are off: this turn is in Ask or Plan mode. Ask the user to \
+                         switch the space to Edit",
                     ),
                 ])));
             }

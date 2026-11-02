@@ -37,6 +37,20 @@ pub use config::{AgentBinaryConfig, AgentCliConfig};
 pub use pty::PtyRunner;
 pub use shell::ShellRunner;
 
+/// A space turn's `space-tools` has `ask_user`, which waits for you (up
+/// to `ASK_USER_TIMEOUT_MS`): each CLI's MCP call timeout is raised past
+/// it, and so is the run's runtime cap.
+pub(crate) fn waits_on_user(req: &AgentRequest) -> bool {
+    req.mcp
+        .as_ref()
+        .is_some_and(|m| m.name == theodore_ports::SPACE_TOOLS)
+}
+
+/// The MCP tool-call timeout of a run that may wait on you: the question's
+/// own timeout plus a margin, so Theodore's answer (or its timeout) always
+/// comes before the CLI gives up on the call.
+pub(crate) const USER_TOOL_TIMEOUT_MS: u64 = theodore_ports::ASK_USER_TIMEOUT_MS + 5 * 60 * 1000;
+
 /// `AgentPort` over local CLI processes.
 #[derive(Debug, Clone, Default)]
 pub struct AgentCli {
@@ -163,6 +177,12 @@ impl AgentCli {
 
         let args = match req.agent {
             AgentId::Claude => {
+                if waits_on_user(&req) && !child_env.iter().any(|(k, _)| k == "MCP_TOOL_TIMEOUT") {
+                    child_env.push((
+                        "MCP_TOOL_TIMEOUT".to_string(),
+                        USER_TOOL_TIMEOUT_MS.to_string(),
+                    ));
+                }
                 // Written to a 0600 temp file, not argv: `--mcp-config`'s
                 // JSON carries the review-tools bearer token, and argv is
                 // visible to any process on the host via `ps`/`/proc`.
@@ -206,7 +226,12 @@ impl AgentCli {
             cwd: req.cwd.clone(),
             env: child_env,
             stall_after_ms: req.stall_after_ms,
-            max_runtime_ms: process::DEFAULT_MAX_RUNTIME_MS,
+            // Time spent waiting on your answer doesn't count as a hang.
+            max_runtime_ms: if waits_on_user(&req) {
+                process::DEFAULT_MAX_RUNTIME_MS + theodore_ports::ASK_USER_TIMEOUT_MS
+            } else {
+                process::DEFAULT_MAX_RUNTIME_MS
+            },
             guards,
             pid_dir: self.pid_dir.clone(),
             agent: req.agent.as_str().to_string(),

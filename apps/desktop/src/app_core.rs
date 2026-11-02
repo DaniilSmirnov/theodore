@@ -1045,6 +1045,15 @@ impl CoreApi for AppCore {
     ) -> Result<String, CommandError> {
         self.core.space_fix_ci(req).await.map_err(err)
     }
+    async fn approve_space_plan(&self, space: String) -> Result<String, CommandError> {
+        self.core.approve_space_plan(&space).await.map_err(err)
+    }
+    async fn answer_space_question(
+        &self,
+        req: theodore_contract::SpaceAnswerRequest,
+    ) -> Result<(), CommandError> {
+        self.core.answer_space_question(req).await.map_err(err)
+    }
     async fn account_status(&self) -> Result<AccountStatus, CommandError> {
         self.core.account_status().await.map_err(err)
     }

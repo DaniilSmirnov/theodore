@@ -875,7 +875,7 @@ async fn edit_space(e: &Env) -> (theodore_contract::Space, PathBuf) {
 }
 
 #[tokio::test]
-async fn edits_are_refused_in_ask_mode_and_on_a_review() {
+async fn edits_are_refused_in_ask_and_plan_mode_and_on_a_review() {
     let e = code_env().await;
     let (s, root) = edit_space(&e).await;
     set_mode(&e, &s.id, "ask").await;
@@ -886,6 +886,15 @@ async fn edits_are_refused_in_ask_mode_and_on_a_review() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("Ask mode"), "{err}");
+    // Plan explores only: no edits either.
+    set_mode(&e, &s.id, "plan").await;
+    let err = e
+        .core
+        .code_replace_symbol(&scope, "src/lib.rs", "héllo", "fn héllo() {}")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Plan mode"), "{err}");
+    set_mode(&e, &s.id, "ask").await;
     let pr = CodeScope::Pr(s.review_pr.clone().unwrap());
     let err = e
         .core

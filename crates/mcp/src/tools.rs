@@ -633,6 +633,44 @@ impl From<crate::backend::CodeEditOutcome> for CodeEditResult {
     }
 }
 
+// ── ask_user ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AskUserParams {
+    /// 1 to 3 questions, asked together.
+    pub questions: Vec<AskUserQuestionParam>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AskUserQuestionParam {
+    /// The question, one sentence.
+    pub question: String,
+    /// 2 to 4 short answers to pick from. The user may also type their own.
+    pub options: Vec<String>,
+    /// The user may pick several options.
+    #[serde(default)]
+    pub multi: bool,
+}
+
+impl AskUserParams {
+    pub fn into_questions(self) -> Vec<crate::backend::UserQuestion> {
+        self.questions
+            .into_iter()
+            .map(|q| crate::backend::UserQuestion {
+                question: q.question,
+                options: q.options,
+                multi: q.multi,
+            })
+            .collect()
+    }
+}
+
+/// `ask_user`'s result: one answer per question, in order.
+#[derive(Debug, Serialize)]
+pub struct AskUserResult {
+    pub answers: Vec<crate::backend::UserAnswer>,
+}
+
 #[cfg(test)]
 mod code_tests {
     use super::*;

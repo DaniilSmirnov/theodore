@@ -18,6 +18,7 @@ use theodore_mcp::{
     NewPatch, PrContext, REVIEW_TOOL_NAMES, ReviewToolsBackend, RunContext, SPACE_TOOL_NAMES,
     SpaceCommandName, SpaceInfo, SpaceToolError, SpaceToolsBackend, ToolSet,
 };
+use theodore_ports::{UserAnswer, UserQuestion};
 
 struct EmptyReview;
 
@@ -144,6 +145,23 @@ impl SpaceToolsBackend for FakeSpaces {
             env: vec!["THEODORE_PORT".into()],
             commands: vec![],
         })
+    }
+    /// Answers each question with its first option.
+    async fn ask_user(
+        &self,
+        space: &str,
+        run: &RunId,
+        questions: Vec<UserQuestion>,
+    ) -> Result<Vec<UserAnswer>, SpaceToolError> {
+        self.record(format!("ask_user {space} {run} {}", questions.len()));
+        Ok(questions
+            .into_iter()
+            .map(|q| UserAnswer {
+                selected: vec![q.options[0].clone()],
+                question: q.question,
+                other: None,
+            })
+            .collect())
     }
 }
 
@@ -409,5 +427,52 @@ async fn approve_tool_lets_mcp_tools_through_and_denies_the_rest() {
         }
         drop(client);
     }
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn ask_user_returns_the_answers_and_refuses_bad_questions() {
+    let spaces = FakeSpaces::new(true);
+    let handle = McpServer::start_with_spaces(Arc::new(EmptyReview), spaces.clone())
+        .await
+        .unwrap();
+    let endpoint = handle.register_run(space_run());
+    let client = connect(&endpoint.url, &endpoint.token).await;
+    let answered = json_of(
+        &call(
+            &client,
+            "ask_user",
+            json!({ "questions": [
+                { "question": "Which store?", "options": ["SQLite", "Postgres"] },
+                { "question": "Which tests?", "options": ["unit", "e2e"], "multi": true },
+            ] }),
+        )
+        .await,
+    );
+    assert_eq!(
+        answered,
+        json!({ "answers": [
+            { "question": "Which store?", "selected": ["SQLite"] },
+            { "question": "Which tests?", "selected": ["unit"] },
+        ] })
+    );
+    // One option, or none at all: refused before the user sees anything.
+    for bad in [
+        json!({ "questions": [{ "question": "Sure?", "options": ["yes"] }] }),
+        json!({ "questions": [] }),
+    ] {
+        let r = client
+            .call_tool(
+                CallToolRequestParams::new("ask_user")
+                    .with_arguments(bad.as_object().unwrap().clone()),
+            )
+            .await;
+        assert!(
+            r.as_ref().map_or(true, |r| r.is_error == Some(true)),
+            "{r:?}"
+        );
+    }
+    assert_eq!(spaces.calls(), ["ask_user s1 space:s1:m1 2"]);
+    drop(client);
     handle.shutdown().await;
 }
