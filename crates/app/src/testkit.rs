@@ -345,6 +345,13 @@ impl Secrets for FakeSecrets {
 
 // ── git ───────────────────────────────────────────────────────────────────
 
+/// `(folder, space, to, from)`.
+pub type MirrorSyncCall = (PathBuf, String, Sha, Sha);
+/// `(folder, space, to, paths)`.
+pub type MirrorEditedCall = (PathBuf, String, Sha, Vec<String>);
+/// `(folder, from, paths)`.
+pub type MirrorRestoreCall = (PathBuf, Sha, Vec<String>);
+
 pub struct FakeGit {
     pub repo_path: PathBuf,
     /// What `grep` returns for any pattern; `None`: `Unsupported`, like
@@ -401,6 +408,17 @@ pub struct FakeGit {
     pub merge_calls: Mutex<Vec<(&'static str, String, Sha)>>,
     /// Shipping a space: identity, squashed commits, pushes, folder ops.
     pub ship: Mutex<FakeShip>,
+    // ── mirroring a space into a local folder (docs/spaces.md) ──────────
+    /// `(folder, space, to, from)` of every `mirror_sync`; empty queue: it
+    /// answers `Ok(vec![])` (nothing changed).
+    pub mirror_syncs: Mutex<Vec<MirrorSyncCall>>,
+    mirror_sync_responses: Mutex<VecDeque<GitResult<Vec<String>>>>,
+    /// `(folder, space, to, paths)` of every `mirror_edited`.
+    pub mirror_edited_calls: Mutex<Vec<MirrorEditedCall>>,
+    mirror_edited_value: Mutex<GitResult<Vec<String>>>,
+    /// `(folder, from, paths)` of every `mirror_restore`.
+    pub mirror_restores: Mutex<Vec<MirrorRestoreCall>>,
+    mirror_restore_value: Mutex<GitResult<Vec<String>>>,
     // ── offline (a PR opened from its local copy) ──────────────────────
     /// `cached_repo` finds the clone on disk (default `true`).
     cached: Mutex<bool>,
@@ -518,6 +536,12 @@ impl FakeGit {
                 }),
                 ..FakeShip::default()
             }),
+            mirror_syncs: Mutex::new(Vec::new()),
+            mirror_sync_responses: Mutex::new(VecDeque::new()),
+            mirror_edited_calls: Mutex::new(Vec::new()),
+            mirror_edited_value: Mutex::new(Ok(Vec::new())),
+            mirror_restores: Mutex::new(Vec::new()),
+            mirror_restore_value: Mutex::new(Ok(Vec::new())),
             cached: Mutex::new(true),
             missing_commits: Mutex::new(std::collections::HashSet::new()),
             network_calls: Mutex::new(Vec::new()),
@@ -596,6 +620,26 @@ impl FakeGit {
 
     pub fn push_commit_and_push(&self, r: GitResult<Sha>) {
         self.push_responses.lock().unwrap().push_back(r);
+    }
+
+    /// The next `mirror_sync` answers `r` instead of `Ok(vec![])`.
+    pub fn push_mirror_sync(&self, r: GitResult<Vec<String>>) {
+        self.mirror_sync_responses.lock().unwrap().push_back(r);
+    }
+
+    /// Every `mirror_sync` call so far, oldest first.
+    pub fn mirror_syncs(&self) -> Vec<MirrorSyncCall> {
+        self.mirror_syncs.lock().unwrap().clone()
+    }
+
+    /// Makes `mirror_edited` answer `value` instead of the default `Ok(vec![])`.
+    pub fn set_mirror_edited(&self, value: GitResult<Vec<String>>) {
+        *self.mirror_edited_value.lock().unwrap() = value;
+    }
+
+    /// Makes `mirror_restore` answer `value` instead of the default `Ok(vec![])`.
+    pub fn set_mirror_restore(&self, value: GitResult<Vec<String>>) {
+        *self.mirror_restore_value.lock().unwrap() = value;
     }
 
     pub fn set_head(&self, head: Sha) {
@@ -1096,6 +1140,58 @@ impl GitPort for FakeGit {
         ship.branches
             .push((folder.to_path_buf(), space.to_string(), branch.to_string()));
         Ok(())
+    }
+
+    async fn mirror_sync(
+        &self,
+        folder: &Path,
+        _repo: &Path,
+        space: &str,
+        to: &Sha,
+        from: &Sha,
+    ) -> GitResult<Vec<String>> {
+        self.mirror_syncs.lock().unwrap().push((
+            folder.to_path_buf(),
+            space.to_string(),
+            to.clone(),
+            from.clone(),
+        ));
+        self.mirror_sync_responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(Vec::new()))
+    }
+
+    async fn mirror_edited(
+        &self,
+        folder: &Path,
+        _repo: &Path,
+        space: &str,
+        to: &Sha,
+        paths: &[String],
+    ) -> GitResult<Vec<String>> {
+        self.mirror_edited_calls.lock().unwrap().push((
+            folder.to_path_buf(),
+            space.to_string(),
+            to.clone(),
+            paths.to_vec(),
+        ));
+        clone_git_result(&self.mirror_edited_value.lock().unwrap())
+    }
+
+    async fn mirror_restore(
+        &self,
+        folder: &Path,
+        from: &Sha,
+        paths: &[String],
+    ) -> GitResult<Vec<String>> {
+        self.mirror_restores.lock().unwrap().push((
+            folder.to_path_buf(),
+            from.clone(),
+            paths.to_vec(),
+        ));
+        clone_git_result(&self.mirror_restore_value.lock().unwrap())
     }
 
     async fn commit_file(

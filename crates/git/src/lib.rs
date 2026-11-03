@@ -21,6 +21,7 @@ mod history;
 mod local;
 mod locks;
 mod meta;
+mod mirror;
 mod parse;
 mod process;
 pub use process::isolate_from_user_config;
@@ -566,6 +567,37 @@ impl GitPort for GitCli {
     ) -> GitResult<()> {
         self.write_folder_branch_op(folder, repo, space, branch)
             .await
+    }
+
+    async fn mirror_sync(
+        &self,
+        folder: &Path,
+        repo: &Path,
+        space: &str,
+        to: &Sha,
+        from: &Sha,
+    ) -> GitResult<Vec<String>> {
+        self.mirror_sync_op(folder, repo, space, to, from).await
+    }
+
+    async fn mirror_edited(
+        &self,
+        folder: &Path,
+        repo: &Path,
+        space: &str,
+        to: &Sha,
+        paths: &[String],
+    ) -> GitResult<Vec<String>> {
+        self.mirror_edited_op(folder, repo, space, to, paths).await
+    }
+
+    async fn mirror_restore(
+        &self,
+        folder: &Path,
+        from: &Sha,
+        paths: &[String],
+    ) -> GitResult<Vec<String>> {
+        self.mirror_restore_op(folder, from, paths).await
     }
 
     async fn commit_file(

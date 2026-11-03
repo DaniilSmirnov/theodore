@@ -878,6 +878,64 @@ Update ─▶ fetch the base ─▶ tip == base_sha? ─▶ "already up to date"
 - *Keep as branch*: writes `refs/heads/space/<slug>` in the folder and
   nothing else; refused if that branch exists.
 
+### Mirror into a local folder
+
+Some projects can't run from a separate worktree at all — fixed ports, one
+local database, a docker compose stack, an IDE run config bound to the
+folder's own path. "Try in my folder" writes the space's working state
+straight into the user's own checkout instead, so they run it there while
+the space keeps drafting.
+
+```
+Mirror on  ─▶ folder clean (untracked count) ─▶ remember its HEAD + branch
+           ─▶ first sync: write what changed since the space's own base
+turn ends / "Sync now" ─▶ re-sync: only the paths that changed are rewritten
+Mirror off ─▶ restore every mirrored path to its content at the remembered HEAD
+           ─▶ refused if the folder disagrees with what mirroring wrote there
+              (shows which paths), unless Discard
+```
+
+- **At most one space per folder.** Turning mirroring on for another space
+  of the same project turns it off for whichever one had it first — the
+  same edited-folder refusal applies to that switch, so it can be blocked
+  too until it's resolved there.
+- **Only working tree files move.** The folder's branch, `HEAD` and index
+  are never touched by mirroring, in either direction; ignored files
+  (deps, build output) are never part of the space's tree in the first
+  place (a checkpoint is `git add -A`), so they're never part of a sync.
+- **One-way.** Edits made in the folder are never synced back into the
+  space — the banner says so while it's on.
+- **No file watcher.** A turn is already the space's unit of change, so
+  mirroring re-syncs after every turn and on "Sync now"; nothing watches
+  the worktree between turns. Simpler than a watcher, and just as current
+  in practice (`crates/app/src/usecases/mirror.rs`).
+- **Paused, not auto-resumed.** A mirror still `On` when Theodore last
+  closed comes back `Paused` on startup — nothing is ever written into a
+  folder without the window having been open to show it
+  (`pause_resumed_mirrors`). Resuming re-checks the folder is clean, the
+  same as turning it on fresh.
+
+Git plumbing (`crates/git/src/mirror.rs`): every operation fetches the
+space's checkpoint ref into the folder first (objects only, the same
+`--no-write-fetch-head` shape as `merge_into_folder`/`write_folder_branch`:
+no `FETCH_HEAD`, no new ref), then a temporary index (`GIT_INDEX_FILE`) —
+never the folder's own — does the rest:
+
+| Step | How |
+| --- | --- |
+| Which paths changed | `git diff --name-only` between two checkpoints (ancestry doesn't matter, so this is correct even across an Undo) |
+| Write them | `read-tree` the target commit into a temp index, `checkout-index` just those paths |
+| Remove a dropped path | deleted directly (not in the target tree, so `checkout-index` has nothing for it) |
+| Was a path edited since | temp index of the last mirrored commit, then `git diff --name-only` with no revision args — the default "index vs working tree" comparison, by content, never a timestamp |
+| Restore on Mirror off | the same temp-index checkout, from the remembered `HEAD` |
+
+`Space.mirror` doesn't store a per-sync diff: it keeps `touched`, the
+union of every sync's changed paths since mirroring turned on. A path the
+agent added and later removed again has no net difference between the
+remembered `HEAD` and the latest checkpoint, but still needs watching and
+restoring — the union catches it; a single two-commit diff at Mirror-off
+time would not.
+
 ---
 
 ## 7. Lifecycle and data
@@ -903,6 +961,7 @@ New synced model `space` (core-owned, written only by commands):
 | `updating` | an Update from base resolving its conflicts: `base_tip`, `from` (the checkpoint it started at), `conflicts`, `started_at` (§6) |
 | `rounds` | earlier rounds of a continued space, oldest first: the merged `pr`, its `branch`, `base_sha`, the last pushed `head_sha`, `at` |
 | `continue_note` | after Continue: one line the next turn's prompt opens with, then cleared |
+| `mirror` | mirroring into the project's local folder (§6 "Mirror into a local folder"): `status` (`on · paused`), `remembered_head`, `remembered_branch`, `mirrored_head`, `touched`; `None` when it was never turned on, or after Mirror off |
 
 | Data | Where |
 | --- | --- |
@@ -1077,6 +1136,9 @@ downloaded to this Mac yet".
 | `space_fix_ci` | "Fix with agent" on the Checks tab: the space PR's failing checks' logs (or links), as one turn |
 | `merge_space` | merges the space's PR: an optional method, else the host's default; now, auto-merge or the merge queue (§3); refused with turns not pushed |
 | `continue_space` | after the PR merged: a new branch on the base's fresh tip, the round kept (§7) |
+| `mirror_space` | "Mirror into `<folder>`": on fresh, or resuming a paused one (§6 "Mirror into a local folder") |
+| `sync_mirror` | "Sync now": re-syncs by hand; a no-op when mirroring is off or paused |
+| `unmirror_space` | "Mirror off": restores the folder; refused (named paths, unless `discard`) if it was edited meanwhile |
 
 ## 10. The flag
 
@@ -1095,7 +1157,7 @@ no row, or `true`, means on. The flag forces them on and locks the switch.
 
 | Phase | Scope |
 | --- | --- |
-| **Built** | `space` model; create / send / stop / review / archive; transcript in chat rows; checkpoint per turn; sidebar section; space page with chat + diff; Review opens the grouped review; crash → failed. Shipping: squash into one commit by you; Open PR / Open as draft (`HostAdapter::create_pr` + `find_open_pr` on GitHub, GitLab, Bitbucket, sandbox and fixtures, through the outbox, idempotent by head branch) and Push (never forced); branch `<login>/<slug>`; Merge locally and Keep as branch for local folders; modes Ask / Edit / Run; Archive button and `spaces.auto_archive_days`. "Send to agent" on a space PR's / own review's threads, drafts and findings; Undo last turn (`turn_log`); Unarchive; one agent session per space (Claude Code `--resume`, Codex `exec resume`); background notifications and the dock badge (`spaces.notify`); names transliterated from Cyrillic and accented goals, `-2` for repeats; a chat-agent-proposed name and title in the background, never delaying turn 1 (`space_naming`); a cached, once-generated handoff summary for a space that outgrows the replayed window (`space_handoff`); `setup` / `run` / `check` / `archive` from the project config (`docs/config.md`) with logs and Open app; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; the agent's `space-tools` for the change: `ship`, `get_space_diff`, `get_review_comments`, `add_review_comment`, `set_base`, `update_progress` (the tracker above the composer) |
+| **Built** | `space` model; create / send / stop / review / archive; transcript in chat rows; checkpoint per turn; sidebar section; space page with chat + diff; Review opens the grouped review; crash → failed. Shipping: squash into one commit by you; Open PR / Open as draft (`HostAdapter::create_pr` + `find_open_pr` on GitHub, GitLab, Bitbucket, sandbox and fixtures, through the outbox, idempotent by head branch) and Push (never forced); branch `<login>/<slug>`; Merge locally and Keep as branch for local folders; modes Ask / Edit / Run; Archive button and `spaces.auto_archive_days`. "Send to agent" on a space PR's / own review's threads, drafts and findings; Undo last turn (`turn_log`); Unarchive; one agent session per space (Claude Code `--resume`, Codex `exec resume`); background notifications and the dock badge (`spaces.notify`); names transliterated from Cyrillic and accented goals, `-2` for repeats; a chat-agent-proposed name and title in the background, never delaying turn 1 (`space_naming`); a cached, once-generated handoff summary for a space that outgrows the replayed window (`space_handoff`); `setup` / `run` / `check` / `archive` from the project config (`docs/config.md`) with logs and Open app; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; the agent's `space-tools` for the change: `ship`, `get_space_diff`, `get_review_comments`, `add_review_comment`, `set_base`, `update_progress` (the tracker above the composer); mirroring into a local folder's own working tree — on / Sync now / off with Discard, at most one per folder, paused (not auto-written) across a restart (§6 "Mirror into a local folder") |
 | **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel`; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent" |
 | **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel`; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent" |
 | **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel`; interactive terminal tabs (§3 "Terminal") over a real PTY, surviving navigation, closed on archive / app quit |

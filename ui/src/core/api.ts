@@ -111,6 +111,7 @@ import type {
   TransactionResult,
   UiEvent,
   TriageRequest,
+  UnmirrorSpaceRequest,
   UpdateInfo,
   WriteTerminalRequest,
 } from '../gen/contract';
@@ -338,6 +339,15 @@ export const api = {
   /** Your answers to the agent's `ask_user` questions. */
   answerSpaceQuestion: (req: SpaceAnswerRequest) =>
     call<null>('answer_space_question', { req }),
+  /** "Mirror into `<folder>`": on fresh, or resuming a paused one. */
+  mirrorSpace: (space: string) => call<Space>('mirror_space', { space }),
+  /** "Sync now": re-syncs a mirrored space into its folder by hand. */
+  syncMirror: (space: string) => call<Space>('sync_mirror', { space }),
+  /** "Mirror off": refused (unless `discard`) if the folder was edited.
+   *  Quiet: the caller (the mirror banner) shows the refusal itself, with
+   *  a Discard button, instead of a toast. */
+  unmirrorSpace: (req: UnmirrorSpaceRequest) =>
+    call<Space>('unmirror_space', { req }, true),
   /** What a space runs, where each command comes from, and trust. */
   spaceConfig: (space: string) =>
     call<SpaceConfigView>('space_config', { space }),

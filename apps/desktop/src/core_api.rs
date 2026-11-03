@@ -358,6 +358,22 @@ pub trait CoreApi: Send + Sync {
     ) -> Result<(), CommandError> {
         Err(not_ready())
     }
+    /// "Mirror into `<folder>`": on fresh, or resuming a paused one.
+    async fn mirror_space(&self, _space: String) -> Result<theodore_contract::Space, CommandError> {
+        Err(not_ready())
+    }
+    /// "Sync now": re-syncs a mirrored space into its folder by hand.
+    async fn sync_mirror(&self, _space: String) -> Result<theodore_contract::Space, CommandError> {
+        Err(not_ready())
+    }
+    /// "Mirror off": restores the folder, refused (unless `discard`) if it
+    /// was edited meanwhile.
+    async fn unmirror_space(
+        &self,
+        _req: theodore_contract::UnmirrorSpaceRequest,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        Err(not_ready())
+    }
     // ── project config (docs/config.md) ──────────────────────────────────
 
     /// What a space runs, where each command comes from, trust.

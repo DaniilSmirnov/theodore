@@ -16,6 +16,7 @@ import {
   CodeMerge,
   CodePullRequest,
   Folder,
+  FolderOpen,
   LayoutSideContentRight,
   Pencil,
 } from '@gravity-ui/icons';
@@ -46,7 +47,7 @@ import type {
   SpaceMode,
   SpaceStart,
 } from '../../gen/contract';
-import { api } from '../../core/api';
+import { api, CommandFailure } from '../../core/api';
 import { STORAGE_NS } from '../../stores/UiStore';
 import { ALL } from '../../core/workspaces';
 import { FEATURES } from '../../features';
@@ -383,6 +384,14 @@ export const SpacePage = observer(function SpacePage({ id }: { id: string }) {
           onClose={() => setTerminalOpen(false)}
         />
       )}
+      {space.mirror && (
+        <MirrorBanner
+          space={space}
+          folder={
+            store.models.projects.get(space.project)?.path ?? 'the folder'
+          }
+        />
+      )}
       {space.status === 'archived' && <ArchivedBanner space={space} />}
       <MergedBanner space={space} />
       <Hints>
@@ -514,6 +523,9 @@ const SpaceHeader = observer(function SpaceHeader({
           <CodePullRequest className="size-3.5" />
           PR
         </Button>
+      )}
+      {!archived && project?.path != null && (
+        <MirrorToggle space={space} folder={project.path} />
       )}
       <Tooltip>
         <Button
@@ -742,6 +754,139 @@ const ShipControls = observer(function ShipControls({
         </Dropdown.Popover>
       </Dropdown>
     </div>
+  );
+});
+
+/** "Mirror into `<folder>`" (docs/spaces.md "Mirror into a local folder"):
+ *  turns it on, fresh or resuming a paused one. Once it's on, the banner
+ *  below the header is where you sync or turn it off — this button just
+ *  shows that it's on. */
+const MirrorToggle = observer(function MirrorToggle({
+  space,
+  folder,
+}: {
+  space: Space;
+  folder: string;
+}) {
+  const [busy, setBusy] = useState(false);
+  const mirror = space.mirror;
+  const on = mirror != null;
+  const name = folder.split('/').filter(Boolean).pop() ?? folder;
+  return (
+    <Tooltip>
+      <ToggleButton
+        isIconOnly
+        size="sm"
+        aria-label="Mirror into the folder"
+        className="space-mirror shrink-0"
+        isSelected={on}
+        isDisabled={busy || on}
+        onChange={() => {
+          if (on) return;
+          setBusy(true);
+          void api
+            .mirrorSpace(space.id)
+            .catch(() => {
+              // toasted by api.ts
+            })
+            .finally(() => setBusy(false));
+        }}
+      >
+        {on ? <FolderOpen className="size-4" /> : <Folder className="size-4" />}
+      </ToggleButton>
+      <Tooltip.Content>
+        {on
+          ? mirror?.status === 'paused'
+            ? `Mirroring into ${name} is paused`
+            : `Mirroring into ${name} — see the banner below`
+          : `Mirror into ${name}: write this space's changes into your own checkout so you can run it there`}
+      </Tooltip.Content>
+    </Tooltip>
+  );
+});
+
+/** While a space mirrors into a local folder: its state, "Sync now" /
+ *  "Resume", and "Mirror off" — refused, with the edited paths named, if
+ *  the folder disagrees with what mirroring wrote there, until you
+ *  Discard. Edits made in the folder are never synced back into the
+ *  space. */
+const MirrorBanner = observer(function MirrorBanner({
+  space,
+  folder,
+}: {
+  space: Space;
+  folder: string;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [refusal, setRefusal] = useState<string | null>(null);
+  const mirror = space.mirror;
+  if (!mirror) return null;
+  const paused = mirror.status === 'paused';
+
+  const off = async (discard: boolean) => {
+    setBusy(true);
+    try {
+      await api.unmirrorSpace({ space: space.id, discard });
+      setRefusal(null);
+    } catch (e) {
+      setRefusal(
+        e instanceof CommandFailure ? e.message : 'Mirror off failed.',
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+  const resumeOrSync = async () => {
+    setBusy(true);
+    try {
+      await (paused ? api.mirrorSpace(space.id) : api.syncMirror(space.id));
+    } catch {
+      // toasted by api.ts
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Alert status={refusal ? 'danger' : 'accent'} className="m-3 items-center">
+      <Alert.Content>
+        <Alert.Description>
+          {refusal ??
+            (paused
+              ? `Mirroring into ${folder} is paused — nothing is written until you resume it.`
+              : `Mirroring into ${folder}. Edits made there aren't synced back.`)}
+        </Alert.Description>
+      </Alert.Content>
+      {refusal ? (
+        <Button
+          size="sm"
+          variant="danger"
+          isPending={busy}
+          onPress={() => void off(true)}
+        >
+          Discard and turn off
+        </Button>
+      ) : (
+        <>
+          <Button
+            size="sm"
+            variant="secondary"
+            isPending={busy}
+            onPress={() => void resumeOrSync()}
+          >
+            {paused ? 'Resume' : 'Sync now'}
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            isPending={busy}
+            onPress={() => void off(false)}
+          >
+            Mirror off
+          </Button>
+        </>
+      )}
+    </Alert>
   );
 });
 

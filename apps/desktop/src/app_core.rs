@@ -1054,6 +1054,18 @@ impl CoreApi for AppCore {
     ) -> Result<(), CommandError> {
         self.core.answer_space_question(req).await.map_err(err)
     }
+    async fn mirror_space(&self, space: String) -> Result<theodore_contract::Space, CommandError> {
+        self.core.mirror_space(&space).await.map_err(err)
+    }
+    async fn sync_mirror(&self, space: String) -> Result<theodore_contract::Space, CommandError> {
+        self.core.sync_mirror(&space).await.map_err(err)
+    }
+    async fn unmirror_space(
+        &self,
+        req: theodore_contract::UnmirrorSpaceRequest,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        self.core.unmirror_space(req).await.map_err(err)
+    }
     async fn account_status(&self) -> Result<AccountStatus, CommandError> {
         self.core.account_status().await.map_err(err)
     }

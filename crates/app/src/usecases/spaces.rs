@@ -194,6 +194,7 @@ impl Core {
             pinned: false,
             build_mode: None,
             question: None,
+            mirror: None,
         };
         self.apply(vec![NewAction {
             model: models::SPACE.into(),
@@ -1277,6 +1278,10 @@ async fn drive_turn(core: &Core, turn: Turn) {
                 text: format!("{}: diff refresh failed: {e}", space.name),
             });
         }
+        // Mirroring into a local folder (docs/spaces.md "Mirror into a
+        // local folder") re-syncs here, after every turn; a no-op for the
+        // common case of a space that doesn't mirror.
+        core.sync_mirror_after_turn(&space).await;
     }
 
     if checking {

@@ -857,6 +857,36 @@ pub async fn set_space_pinned(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn mirror_space(
+    op: crate::op::Op,
+    space: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::Space, CommandError> {
+    op.run(async move { core.mirror_space(space).await }).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn sync_mirror(
+    op: crate::op::Op,
+    space: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::Space, CommandError> {
+    op.run(async move { core.sync_mirror(space).await }).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn unmirror_space(
+    op: crate::op::Op,
+    req: theodore_contract::UnmirrorSpaceRequest,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::Space, CommandError> {
+    op.run(async move { core.unmirror_space(req).await }).await
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn space_send_feedback(
     op: crate::op::Op,
     req: theodore_contract::SpaceFeedbackRequest,

@@ -12,6 +12,7 @@ pub mod interdiff;
 pub mod linear;
 pub(crate) mod live;
 pub mod merge;
+pub mod mirror;
 pub(crate) mod one_shot;
 pub mod open_pr;
 pub mod projects;

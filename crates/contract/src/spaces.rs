@@ -186,6 +186,11 @@ pub struct Space {
     /// is paused on them.
     #[serde(default)]
     pub question: Option<SpaceQuestion>,
+    /// Mirroring into the project's local folder (docs/spaces.md "Mirror
+    /// into a local folder"); `None` when it was never turned on, or after
+    /// Mirror off. At most one space of a project mirrors at a time.
+    #[serde(default)]
+    pub mirror: Option<SpaceMirror>,
 }
 
 /// A merge of the base into the space, left in progress on conflicts
@@ -442,6 +447,7 @@ pub struct SentFeedback {
     pub item: SpaceFeedback,
     pub turn: u32,
 }
+
 /// "Fix with agent" on a space PR's failing checks (docs/spaces.md "Fix
 /// CI"): fetches each failed job's log and sends them to the space's agent
 /// as one turn.
@@ -475,4 +481,52 @@ pub struct MergeSpaceResult {
 pub struct SetSpacePinnedRequest {
     pub space: String,
     pub pinned: bool,
+}
+
+/// Mirroring into a local folder project ("Try in my folder" — some
+/// projects can't run from a separate worktree: fixed ports, one local
+/// database, a docker compose stack, an IDE run config bound to the
+/// folder's own path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum MirrorStatus {
+    /// Writing into the folder after every turn and on "Sync now".
+    On,
+    /// Was on when Theodore last closed; nothing is written until you
+    /// resume it (never auto-writing into your folder on startup).
+    Paused,
+}
+
+/// `Space::mirror`: the folder's own state before mirroring began (what
+/// Mirror off restores), and the running set of paths mirroring has ever
+/// touched there (what Mirror off only needs to look at or rewrite).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct SpaceMirror {
+    pub status: MirrorStatus,
+    /// The folder's `HEAD` when mirroring turned on.
+    pub remembered_head: Sha,
+    /// The folder's checked-out branch at that point, for display only.
+    #[serde(default)]
+    pub remembered_branch: Option<String>,
+    /// The last space checkpoint written into the folder; `None` before
+    /// the first sync lands.
+    #[serde(default)]
+    pub mirrored_head: Option<Sha>,
+    /// Every path a sync has ever written or removed in the folder, oldest
+    /// first, deduplicated: what Mirror off restores or checks for edits,
+    /// even a path the space added and then removed again (no net
+    /// difference between the remembered `HEAD` and the latest checkpoint,
+    /// but still touched).
+    #[serde(default)]
+    pub touched: Vec<String>,
+    pub updated_at: Millis,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct UnmirrorSpaceRequest {
+    pub space: String,
+    /// Overwrite edits made in the folder while mirroring was on, instead
+    /// of refusing and naming them.
+    #[serde(default)]
+    pub discard: bool,
 }

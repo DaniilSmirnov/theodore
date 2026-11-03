@@ -44,6 +44,8 @@ mod interdiff_tests;
 #[cfg(test)]
 mod linear_tests;
 #[cfg(test)]
+mod mirror_tests;
+#[cfg(test)]
 mod offline_tests;
 #[cfg(test)]
 mod projects_tests;

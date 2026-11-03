@@ -1039,6 +1039,21 @@ export type MergeSpaceResult = {
 
 export type MergeState = "clean" | "blocked" | "behind" | "dirty" | "unstable" | "unknown";
 
+/**
+ *  Mirroring into a local folder project ("Try in my folder" — some
+ *  projects can't run from a separate worktree: fixed ports, one local
+ *  database, a docker compose stack, an IDE run config bound to the
+ *  folder's own path).
+ */
+export type MirrorStatus =
+/**  Writing into the folder after every turn and on "Sync now". */
+"on" |
+/**
+ *  Was on when Theodore last closed; nothing is written until you
+ *  resume it (never auto-writing into your folder on startup).
+ */
+"paused";
+
 export type MutationOp = { op: "create"; model: string; id: string; data: unknown } |
 /**  `data` holds changed fields only. */
 { op: "update"; model: string; id: string; data: unknown } | { op: "archive"; model: string; id: string } | { op: "delete"; model: string; id: string };
@@ -1722,6 +1737,12 @@ export type Space = {
 	 *  is paused on them.
 	 */
 	question?: SpaceQuestion | null,
+	/**
+	 *  Mirroring into the project's local folder (docs/spaces.md "Mirror
+	 *  into a local folder"); `None` when it was never turned on, or after
+	 *  Mirror off. At most one space of a project mirrors at a time.
+	 */
+	mirror?: SpaceMirror | null,
 };
 
 export type SpaceAnswerItem = {
@@ -1815,6 +1836,33 @@ export type SpaceLogLine = {
 	line: string,
 	stderr: boolean,
 	at: number,
+};
+
+/**
+ *  `Space::mirror`: the folder's own state before mirroring began (what
+ *  Mirror off restores), and the running set of paths mirroring has ever
+ *  touched there (what Mirror off only needs to look at or rewrite).
+ */
+export type SpaceMirror = {
+	status: MirrorStatus,
+	/**  The folder's `HEAD` when mirroring turned on. */
+	remembered_head: Sha,
+	/**  The folder's checked-out branch at that point, for display only. */
+	remembered_branch?: string | null,
+	/**
+	 *  The last space checkpoint written into the folder; `None` before
+	 *  the first sync lands.
+	 */
+	mirrored_head?: Sha | null,
+	/**
+	 *  Every path a sync has ever written or removed in the folder, oldest
+	 *  first, deduplicated: what Mirror off restores or checks for edits,
+	 *  even a path the space added and then removed again (no net
+	 *  difference between the remembered `HEAD` and the latest checkpoint,
+	 *  but still touched).
+	 */
+	touched?: string[],
+	updated_at: number,
 };
 
 /**  What the agent may do in a turn (docs/spaces.md §5). */
@@ -2260,6 +2308,15 @@ export type UiEvent =
  *  `agents`, `projects`, `done`.
  */
 { event: "onboarding_step"; step: string };
+
+export type UnmirrorSpaceRequest = {
+	space: string,
+	/**
+	 *  Overwrite edits made in the folder while mirroring was on, instead
+	 *  of refusing and naming them.
+	 */
+	discard?: boolean,
+};
 
 export type UpdateInfo = {
 	version: string,

@@ -182,6 +182,7 @@ impl Core {
             tokio::spawn(async move {
                 core.fail_interrupted_runs().await;
                 core.fail_interrupted_spaces().await;
+                core.pause_resumed_mirrors().await;
             });
         }
         // Host traffic waits for the account gate (`account_hold`): the
