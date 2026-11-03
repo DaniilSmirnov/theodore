@@ -78,7 +78,7 @@ jobs:
         env:
           CODESIGN_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           CODESIGN_KEYCHAIN: ${{ env.GRAMMARS_KEYCHAIN }}
-        run: sh scripts/build-grammars.sh
+        run: bash scripts/build-grammars.sh
 
       - name: delete signing keychain
         if: always() && env.HAS_APPLE_CERT == 'true'
