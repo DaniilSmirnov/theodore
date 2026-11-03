@@ -29,6 +29,12 @@ use crate::process::LineParser;
 /// `ps`/`/proc/<pid>/cmdline` on this host, or any other process running as
 /// the same user, can read another process's argv but not an 0600 file
 /// owned by that process's own user.
+///
+/// `alwaysLoad`: Claude Code otherwise defers MCP tools behind its
+/// ToolSearch, and an agent that already has Grep and Read never goes
+/// looking — in the code-tools eval, 0 of 34 runs touched a deferred
+/// symbol tool. Only Theodore's server is loaded up front; the user's own
+/// servers keep the default.
 fn mcp_config_json(mcp: &theodore_ports::agent::McpEndpoint) -> Value {
     serde_json::json!({
         "mcpServers": {
@@ -36,6 +42,7 @@ fn mcp_config_json(mcp: &theodore_ports::agent::McpEndpoint) -> Value {
                 "type": "http",
                 "url": mcp.url,
                 "headers": { "Authorization": format!("Bearer {}", mcp.token) },
+                "alwaysLoad": true,
             }
         }
     })
@@ -905,6 +912,8 @@ mod mcp_config_tests {
         req.mcp.as_mut().unwrap().name = theodore_ports::SPACE_TOOLS.into();
         let config = mcp_config_json(req.mcp.as_ref().unwrap());
         assert!(config["mcpServers"]["space-tools"]["url"].is_string());
+        // Never deferred behind ToolSearch.
+        assert_eq!(config["mcpServers"]["space-tools"]["alwaysLoad"], true);
         assert!(config["mcpServers"].get("review-tools").is_none());
         let args = build_args(&req, &Default::default(), None);
         let i = args.iter().position(|a| a == "--allowedTools").unwrap();
