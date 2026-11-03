@@ -8,6 +8,9 @@
 //!               ├─ identical edit shape ─────────────▶ rollout cliques
 //!               └─ file-name roots, test ↔ source ───▶ name edges
 //!  git history ──── co-change (Jaccard) ─────────────▶ co-change edges
+//!  code intel ───── hunk defines X ↔ hunk uses X ─────▶ link edges
+//!                   (`RepoContext::symbol_links`)       (+ hunk pairs kept
+//!                                                        for prompts, coarsening)
 //!                                │
 //!            drop hub files ─▶ Louvain ─▶ communities ─▶ hubs rejoin
 //!                                                        their strongest one
@@ -25,7 +28,7 @@ pub(crate) mod symbols;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use theodore_domain::grouping::RepoContext;
+use theodore_domain::grouping::{RepoContext, SymbolLink};
 use theodore_domain::{FileDiff, HunkId, LineKind, Revision};
 
 use crate::prepass::PrePass;
@@ -42,6 +45,12 @@ const W_SHAPE: f64 = 0.6;
 const W_NAME: f64 = 0.8;
 const W_TEST: f64 = 0.5;
 const W_CO_CHANGE: f64 = 1.5;
+/// Per distinct symbol linking two files' hunks (code intelligence): a
+/// resolved reference, as strong as an import.
+const W_LINK: f64 = 1.0;
+/// Code-intelligence links kept from the context: plenty for a hint, and
+/// bounded work for the graph.
+const MAX_HUNK_LINKS: usize = 400;
 
 /// A compound identifier shared by more files than this is vocabulary,
 /// not a link.
@@ -80,6 +89,10 @@ pub struct Edge {
     pub name_root: Option<String>,
     pub test_pair: bool,
     co_change: f64,
+    /// A hunk of one file uses a symbol defined in a hunk of the other
+    /// (code intelligence).
+    link: f64,
+    pub link_name: Option<String>,
 }
 
 impl Edge {
@@ -93,6 +106,7 @@ impl Edge {
             + self.name
             + if self.test_pair { W_TEST } else { 0.0 }
             + self.co_change
+            + self.link.min(2.0)
     }
 
     /// Whether the edge is only "part of a larger rollout" — those are
@@ -105,6 +119,7 @@ impl Edge {
             && (self.token == 0.0 || self.shape + self.co_use > 0.0)
             && self.name == 0.0
             && self.co_change == 0.0
+            && self.link == 0.0
     }
 }
 
@@ -145,6 +160,19 @@ pub struct RelGraph {
     /// all switching to one dispatcher are one review step, even though
     /// each also imports its own controller).
     bundles: Vec<Vec<usize>>,
+    /// Code-intelligence links between visible hunks, in context order.
+    hunk_links: Vec<SymbolLink>,
+    /// The same links as unordered hunk pairs.
+    linked: BTreeSet<(HunkId, HunkId)>,
+}
+
+/// `(a, b)` with the smaller id first.
+fn hunk_pair(a: &HunkId, b: &HunkId) -> (HunkId, HunkId) {
+    if a < b {
+        (a.clone(), b.clone())
+    } else {
+        (b.clone(), a.clone())
+    }
 }
 
 #[derive(Default)]
@@ -265,6 +293,7 @@ impl RelGraph {
         g.add_shape_edges(&facts);
         g.add_name_edges();
         g.add_co_change_edges(ctx);
+        g.add_link_edges(ctx);
         g.hubs = g.find_hubs();
         g.community = g.detect_communities();
         debug_assert_eq!(g.community.len(), n);
@@ -567,6 +596,30 @@ impl RelGraph {
         }
     }
 
+    /// Code-intelligence links (`RepoContext::symbol_links`) between
+    /// visible hunks: kept per hunk pair, plus one file edge per distinct
+    /// symbol across two files.
+    fn add_link_edges(&mut self, ctx: &RepoContext) {
+        let mut seen: BTreeSet<(usize, usize, &str)> = BTreeSet::new();
+        for l in &ctx.symbol_links {
+            if self.hunk_links.len() >= MAX_HUNK_LINKS {
+                break;
+            }
+            let (Some(a), Some(b)) = (self.file_of(&l.from), self.file_of(&l.to)) else {
+                continue;
+            };
+            if l.from == l.to || !self.linked.insert(hunk_pair(&l.from, &l.to)) {
+                continue;
+            }
+            self.hunk_links.push(l.clone());
+            if a != b && seen.insert((a.min(b), a.max(b), l.symbol.as_str())) {
+                let e = self.edge(a, b).expect("distinct files");
+                e.link += W_LINK;
+                e.link_name.get_or_insert_with(|| l.symbol.clone());
+            }
+        }
+    }
+
     /// Hub files — a barrel, a DI container, a base class every controller
     /// now calls into — touch so many others that keeping them in would glue
     /// every community into one. Counted on direct references (imports and
@@ -576,7 +629,7 @@ impl RelGraph {
         let threshold = 10usize.max((2.0 * (n as f64).sqrt()).ceil() as usize);
         let mut degree = vec![0usize; n];
         for (&(a, b), e) in &self.edges {
-            if e.import > 0.0 || e.mention > 0.0 || e.symbol > 0.0 {
+            if e.import > 0.0 || e.mention > 0.0 || e.symbol > 0.0 || e.link > 0.0 {
                 degree[a] += 1;
                 degree[b] += 1;
             }
@@ -665,6 +718,22 @@ impl RelGraph {
         by.into_values().collect()
     }
 
+    /// Code-intelligence links between visible hunks.
+    pub fn hunk_links(&self) -> &[SymbolLink] {
+        &self.hunk_links
+    }
+
+    /// How many code-intelligence links join a hunk of `a` to one of `b`.
+    pub fn hunk_links_between(&self, a: &[HunkId], b: &[HunkId]) -> usize {
+        if self.linked.is_empty() {
+            return 0;
+        }
+        a.iter()
+            .flat_map(|x| b.iter().map(move |y| (x, y)))
+            .filter(|(x, y)| self.linked.contains(&hunk_pair(x, y)))
+            .count()
+    }
+
     pub fn edge_between(&self, a: usize, b: usize) -> Option<&Edge> {
         self.edges.get(&(a.min(b), a.max(b)))
     }
@@ -707,8 +776,13 @@ impl Edge {
         if self.mention > 0.0 {
             r.push((self.mention.min(1.0), "names the file".into()));
         }
-        if let Some(s) = &self.symbol_name {
+        if let Some(s) = &self.symbol_name
+            && self.link_name.as_ref() != Some(s)
+        {
             r.push((self.symbol.min(2.0), format!("`{s}`")));
+        }
+        if let Some(s) = &self.link_name {
+            r.push((self.link.min(2.0), format!("uses `{s}`")));
         }
         if let Some(t) = &self.token_name {
             r.push((self.token.min(1.0), format!("`{t}`")));

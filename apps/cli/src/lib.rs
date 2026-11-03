@@ -2,11 +2,14 @@
 //! drive each command's testable core directly (with a fake `AgentPort`)
 //! instead of going through `main`.
 
+pub mod code_tools_mcp;
 pub mod deps;
 pub mod difffile;
 pub mod endpoint;
 pub mod eval;
+pub mod eval_tools;
 pub mod graph_check;
 pub mod group;
+pub mod links;
 pub mod mcp_bridge;
 pub mod sandbox;

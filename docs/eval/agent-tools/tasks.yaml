@@ -1,0 +1,221 @@
+# Task suite: an agent with and without the code-intelligence tools.
+# Ground truth, derivations and the check results: TASKS.md next to this file.
+# check.run paths are relative to the Theodore repo root; cwd = the agent's worktree.
+
+- id: smoke-domain-crate-name
+  repo: '.'
+  rev: 2a142d87e162ed38212e55a91704a9a90a5ab506
+  kind: answer
+  prompt: |
+    What is the package name in crates/domain/Cargo.toml? Reply with just the name.
+  check:
+    type: contains
+    value: 'theodore-domain'
+  timeout_s: 120
+
+- id: rust-trace-language-remove
+  repo: '.'
+  rev: 2a142d87e162ed38212e55a91704a9a90a5ab506
+  kind: answer
+  prompt: |
+    Project settings → Languages → Remove ends up in the `code_intel_remove` Tauri
+    command. Trace the Rust call path from that command down to the code that deletes
+    the downloaded language server from disk. List each hop as function and file.
+  check:
+    type: regex
+    value: '(?is)remove_language.*remove_server'
+  timeout_s: 600
+
+- id: rust-impl-telemetry-sink
+  repo: '.'
+  rev: 2a142d87e162ed38212e55a91704a9a90a5ab506
+  kind: answer
+  prompt: |
+    Which types implement the `Sink` trait of the telemetry crate? Finish your answer
+    with one line `IMPLEMENTORS: <type names, comma-separated, sorted alphabetically>`.
+  check:
+    type: regex
+    value: '(?im)^[\s>*_#-]*IMPLEMENTORS[*_`]*:[*_`]*[ \t]*[`*_]*(?:(?:[\w:]+::))?Capture(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:(?:[\w:]+::))?FileSink(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:(?:[\w:]+::))?OtlpSink(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:(?:[\w:]+::))?PosthogSink(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:(?:[\w:]+::))?StderrSink(?:\(\))?[`*_]*[\s.*_`]*$'
+  timeout_s: 600
+
+- id: rust-callers-code-intel-status
+  repo: '.'
+  rev: 2a142d87e162ed38212e55a91704a9a90a5ab506
+  kind: answer
+  prompt: |
+    Outside of tests, which functions call the `status` method of the `CodeIntelPort`
+    trait? Finish your answer with one line `CALLERS: <function names,
+    comma-separated>`.
+  check:
+    type: regex
+    value: '(?im)^[\s>*_#-]*CALLERS[*_`]*:[*_`]*[ \t]*(?:[`*_]*(?:Core::|Core\.)?code_install_flow(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:Core::|Core\.)?code_intel_status(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:Core::|Core\.)?code_status(?:\(\))?[`*_]*|[`*_]*(?:Core::|Core\.)?code_install_flow(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:Core::|Core\.)?code_status(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:Core::|Core\.)?code_intel_status(?:\(\))?[`*_]*|[`*_]*(?:Core::|Core\.)?code_intel_status(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:Core::|Core\.)?code_install_flow(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:Core::|Core\.)?code_status(?:\(\))?[`*_]*|[`*_]*(?:Core::|Core\.)?code_intel_status(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:Core::|Core\.)?code_status(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:Core::|Core\.)?code_install_flow(?:\(\))?[`*_]*|[`*_]*(?:Core::|Core\.)?code_status(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:Core::|Core\.)?code_install_flow(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:Core::|Core\.)?code_intel_status(?:\(\))?[`*_]*|[`*_]*(?:Core::|Core\.)?code_status(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:Core::|Core\.)?code_intel_status(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:Core::|Core\.)?code_install_flow(?:\(\))?[`*_]*)[\s.*_`]*$'
+  timeout_s: 600
+
+- id: rust-reexport-sandbox-data-dir
+  repo: '.'
+  rev: 2a142d87e162ed38212e55a91704a9a90a5ab506
+  kind: answer
+  prompt: |
+    `theodore sandbox` without `--data-dir` falls back to
+    `theodore_runtime::sandbox_data_dir`. Which function is that really, in which file,
+    and what directory does it return?
+  check:
+    type: regex
+    value: '(?is)(runtime/src/sandbox\.rs.*\.theodore-sandbox|\.theodore-sandbox.*runtime/src/sandbox\.rs)'
+  timeout_s: 600
+
+- id: rust-rename-area-top-level-dir
+  repo: '.'
+  rev: 2a142d87e162ed38212e55a91704a9a90a5ab506
+  kind: edit
+  prompt: |
+    In the grouping crate, rename the `top_level_dir` helper defined in
+    `crates/grouping/src/area.rs` to `first_path_segment` and update everything that
+    uses it. Other functions that happen to be called `top_level_dir` stay as they are.
+  check:
+    type: command
+    run: 'bash docs/eval/agent-tools/checks/rust-rename-area-top-level-dir.sh'
+  timeout_s: 900
+
+- id: rust-host-github-parse-millis-fallback
+  repo: '.'
+  rev: 2a142d87e162ed38212e55a91704a9a90a5ab506
+  kind: edit
+  prompt: |
+    In crates/host-github, `time::parse_millis` silently returns 0 for a timestamp it
+    can't parse. Change it to `parse_millis(s: &str, fallback: i64) -> i64`, returning
+    `fallback` in that case, and update every caller in host-github to pass `0` so
+    behaviour stays the same. The GitLab and Bitbucket crates have their own copies;
+    leave those alone.
+  check:
+    type: command
+    run: 'bash docs/eval/agent-tools/checks/rust-host-github-parse-millis-fallback.sh'
+  timeout_s: 900
+
+- id: ts-impl-router
+  repo: https://github.com/honojs/hono
+  rev: 734755ace341607628219ea1dd8ca17f01bf1a5c
+  kind: answer
+  prompt: |
+    Which classes declare that they implement the `Router` interface from src/router.ts?
+    Finish your answer with one line `IMPLEMENTORS: <class names, comma-separated,
+    sorted alphabetically>`.
+  check:
+    type: regex
+    value: '(?im)^[\s>*_#-]*IMPLEMENTORS[*_`]*:[*_`]*[ \t]*[`*_]*LinearRouter(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*PatternRouter(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*PreparedRegExpRouter(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*RegExpRouter(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*SmartRouter(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*TrieRouter(?:\(\))?[`*_]*[\s.*_`]*$'
+  timeout_s: 600
+
+- id: ts-trace-jsx-runtime
+  repo: https://github.com/honojs/hono
+  rev: 734755ace341607628219ea1dd8ca17f01bf1a5c
+  kind: answer
+  prompt: |
+    With `jsxImportSource: "hono/jsx"`, TypeScript compiles `<div />` to a call of `jsx`
+    imported from `hono/jsx/jsx-runtime`. Which function actually runs for that call,
+    and which function does it hand off to to build the node? Give the files.
+  check:
+    type: regex
+    value: '(?is)((src/|hono/|[\s`''"(\[*])jsx/jsx-dev-runtime\.ts.*\bjsxFn\b|\bjsxFn\b.*(src/|hono/|[\s`''"(\[*])jsx/jsx-dev-runtime\.ts)'
+  timeout_s: 600
+
+- id: ts-callers-compose
+  repo: https://github.com/honojs/hono
+  rev: 734755ace341607628219ea1dd8ca17f01bf1a5c
+  kind: answer
+  prompt: |
+    Outside of tests, which functions or methods call `compose` from src/compose.ts?
+    Finish your answer with one line `CALLERS: <bare function or method names,
+    comma-separated>`.
+  check:
+    type: regex
+    value: '(?im)^[\s>*_#-]*CALLERS[*_`]*:[*_`]*[ \t]*(?:[`*_]*(?:(?:HonoBase|Hono)\.)?#?dispatch(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*every(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:(?:HonoBase|Hono)\.)?route(?:\(\))?[`*_]*|[`*_]*(?:(?:HonoBase|Hono)\.)?#?dispatch(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:(?:HonoBase|Hono)\.)?route(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*every(?:\(\))?[`*_]*|[`*_]*every(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:(?:HonoBase|Hono)\.)?#?dispatch(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:(?:HonoBase|Hono)\.)?route(?:\(\))?[`*_]*|[`*_]*every(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:(?:HonoBase|Hono)\.)?route(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:(?:HonoBase|Hono)\.)?#?dispatch(?:\(\))?[`*_]*|[`*_]*(?:(?:HonoBase|Hono)\.)?route(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:(?:HonoBase|Hono)\.)?#?dispatch(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*every(?:\(\))?[`*_]*|[`*_]*(?:(?:HonoBase|Hono)\.)?route(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*every(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:(?:HonoBase|Hono)\.)?#?dispatch(?:\(\))?[`*_]*)[\s.*_`]*$'
+  timeout_s: 600
+
+- id: ts-default-router
+  repo: https://github.com/honojs/hono
+  rev: 734755ace341607628219ea1dd8ca17f01bf1a5c
+  kind: answer
+  prompt: |
+    If I create an app with `new Hono()` from 'hono' and pass no router, which router
+    does the route matching?
+  check:
+    type: regex
+    value: '(?is)SmartRouter.*(RegExpRouter.*TrieRouter|TrieRouter.*RegExpRouter)'
+  timeout_s: 600
+
+- id: ts-rename-merge-path
+  repo: https://github.com/honojs/hono
+  rev: 734755ace341607628219ea1dd8ca17f01bf1a5c
+  kind: edit
+  prompt: |
+    Rename `mergePath` in src/utils/url.ts to `joinPaths` and update everything that
+    uses it, tests included. The client has its own `mergePath` in src/client/utils.ts;
+    that one stays.
+  check:
+    type: command
+    run: 'bash docs/eval/agent-tools/checks/ts-rename-merge-path.sh'
+  timeout_s: 900
+
+- id: py-trace-httpx-get
+  repo: https://github.com/encode/httpx
+  rev: 26d48e0634e6ee9cdc0533996db289ce4b430177
+  kind: answer
+  prompt: |
+    When I call `httpx.get(url)` without a custom transport, what is the call path from
+    that function down to the method that hands the request to httpcore? List each hop
+    as function and file.
+  check:
+    type: regex
+    value: '(?is)_send_single_request.*(\bHTTPTransport\b.*handle_request|handle_request.*\bHTTPTransport\b)'
+  timeout_s: 600
+
+- id: py-callers-rich-markup-render
+  repo: https://github.com/Textualize/rich
+  rev: 43d3b04725ab9731727fb1126e35980c62f32377
+  kind: answer
+  prompt: |
+    Inside the `rich` package (not tests), which functions call `render` from
+    rich/markup.py? Finish your answer with one line `CALLERS: <Class.method names,
+    comma-separated>`.
+  check:
+    type: regex
+    value: '(?im)^[\s>*_#-]*CALLERS[*_`]*:[*_`]*[ \t]*(?:[`*_]*(?:Console\.)?render_str(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:Text\.)?from_markup(?:\(\))?[`*_]*|[`*_]*(?:Text\.)?from_markup(?:\(\))?[`*_]*[ \t]*,[ \t]*[`*_]*(?:Console\.)?render_str(?:\(\))?[`*_]*)[\s.*_`]*$'
+  timeout_s: 600
+
+- id: py-type-rich-screen-context
+  repo: https://github.com/Textualize/rich
+  rev: 43d3b04725ab9731727fb1126e35980c62f32377
+  kind: answer
+  prompt: |
+    In `with console.screen() as ctx:`, what type is `ctx`, and what is the type of
+    `ctx.screen` (which module defines it)?
+  check:
+    type: regex
+    value: '(?is)ScreenContext.*(\bscreen\.py\b|\brich\.screen\.Screen\b)'
+  timeout_s: 600
+
+- id: py-rename-rich-markup-render
+  repo: https://github.com/Textualize/rich
+  rev: 43d3b04725ab9731727fb1126e35980c62f32377
+  kind: edit
+  prompt: |
+    Rename the `render` function in rich/markup.py to `render_markup` and update
+    everything that imports or calls it, tests included. Methods called `render` on
+    other classes are unrelated and stay.
+  check:
+    type: command
+    run: 'bash docs/eval/agent-tools/checks/py-rename-rich-markup-render.sh'
+  timeout_s: 900
+
+- id: py-httpx-primitive-none
+  repo: https://github.com/encode/httpx
+  rev: 26d48e0634e6ee9cdc0533996db289ce4b430177
+  kind: edit
+  prompt: |
+    Give `primitive_value_to_str` in httpx/_utils.py a required keyword-only argument
+    `none: str`, the string returned for `None` (it returns "" today). Update every call
+    site to pass `none=""` so behaviour doesn't change.
+  check:
+    type: command
+    run: 'bash docs/eval/agent-tools/checks/py-httpx-primitive-none.sh'
+  timeout_s: 900

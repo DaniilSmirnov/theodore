@@ -27,6 +27,10 @@ class FakeToaster implements Toaster {
   update(id: string, text: string, opts: { variant?: string }) {
     this.log.push({ id, text, variant: opts.variant });
   }
+  readonly closed: string[] = [];
+  close(id: string) {
+    this.closed.push(id);
+  }
   texts() {
     return this.log.map((t) => t.text);
   }
@@ -71,7 +75,7 @@ describe('checkForUpdates', () => {
     expect(new Set(toaster.log.map((t) => t.id)).size).toBe(1);
   });
 
-  it('says downloading while the shell downloads, then that it is ready', async () => {
+  it('says downloading while the shell downloads, then leaves it to the pill', async () => {
     transport.onCall('check_update', async () => {
       // The shell's `update` event before the download starts.
       store.ephemeral.setUpdate(update({ downloaded: false }));
@@ -82,8 +86,8 @@ describe('checkForUpdates', () => {
     expect(toaster.texts()).toEqual([
       'Checking for updates…',
       'Downloading Theodore 0.1.7…',
-      'Theodore 0.1.7 is ready — restart to update',
     ]);
+    expect(toaster.closed).toEqual(['t1']);
   });
 
   it('gives the reason a check failed, without a second raw toast', async () => {
@@ -119,12 +123,10 @@ describe('checkForUpdates', () => {
     expect(toaster.texts().at(-1)).toBe('You’re offline');
   });
 
-  it('points at the restart when an update is already installed', async () => {
+  it('adds no toast when an update is already installed: the pill says it', async () => {
     store.ephemeral.setUpdate(update());
     await checkForUpdates(store, toaster);
-    expect(toaster.texts()).toEqual([
-      'Theodore 0.1.7 is installed — restart to update',
-    ]);
+    expect(toaster.texts()).toEqual([]);
     expect(transport.calls).toEqual([]);
   });
 });

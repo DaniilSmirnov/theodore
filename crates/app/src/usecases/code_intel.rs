@@ -102,7 +102,7 @@ pub struct CodeEdits {
 }
 
 /// The system prompt's line about the code tools a run got, if any.
-pub(crate) fn code_prompt(code: CodeTools) -> Option<&'static str> {
+pub fn code_prompt(code: CodeTools) -> Option<&'static str> {
     match code {
         CodeTools::Off => None,
         CodeTools::Read => Some(
@@ -831,7 +831,7 @@ impl Core {
     // ── the MCP tools ───────────────────────────────────────────────────
 
     /// The worktree a run's code tools work on, opened if it isn't yet.
-    async fn code_root(&self, scope: &CodeScope) -> AppResult<(Arc<dyn CodeIntelPort>, PathBuf)> {
+    async fn code_root(&self, scope: &CodeScope) -> AppResult<CodeRoot> {
         let port = self.code_port().ok_or_else(off)?;
         match scope {
             CodeScope::Pr(pr) => {
@@ -842,14 +842,14 @@ impl Core {
                 if self.open_review_code(&entry).await == CodeTools::Off {
                     return Err(off());
                 }
-                Ok((port, entry.worktree_path.clone()))
+                Ok(CodeRoot::new(port, entry.worktree_path.clone()))
             }
             CodeScope::Space(id) => {
                 let (space, project) = self.code_space(id).await?;
                 if !self.open_space_code(&space, &project).await {
                     return Err(off());
                 }
-                Ok((port, PathBuf::from(&space.worktree)))
+                Ok(CodeRoot::new(port, PathBuf::from(&space.worktree)))
             }
         }
     }
@@ -869,8 +869,7 @@ impl Core {
         name: &str,
         kind: Option<CodeSymbolKind>,
     ) -> AppResult<Answer<CodeSymbol>> {
-        let (port, root) = self.code_root(scope).await?;
-        port.find_symbol(&root, name, kind).await.map_err(code_err)
+        self.code_root(scope).await?.find_symbol(name, kind).await
     }
 
     /// The symbol and its source text.
@@ -880,10 +879,7 @@ impl Core {
         path: &str,
         name: &str,
     ) -> AppResult<(CodeSymbol, String)> {
-        let (port, root) = self.code_root(scope).await?;
-        port.symbol_body(&root, relative(path)?, name)
-            .await
-            .map_err(code_err)
+        self.code_root(scope).await?.get_symbol(path, name).await
     }
 
     pub async fn code_definition(
@@ -892,10 +888,7 @@ impl Core {
         path: &str,
         at: Position,
     ) -> AppResult<Answer<CodeHit>> {
-        let (port, root) = self.code_root(scope).await?;
-        port.definition(&root, relative(path)?, at)
-            .await
-            .map_err(code_err)
+        self.code_root(scope).await?.definition(path, at).await
     }
 
     pub async fn code_references(
@@ -904,10 +897,7 @@ impl Core {
         path: &str,
         at: Position,
     ) -> AppResult<Answer<CodeHit>> {
-        let (port, root) = self.code_root(scope).await?;
-        port.references(&root, relative(path)?, at)
-            .await
-            .map_err(code_err)
+        self.code_root(scope).await?.references(path, at).await
     }
 
     pub async fn code_diagnostics(
@@ -915,19 +905,16 @@ impl Core {
         scope: &CodeScope,
         path: Option<&str>,
     ) -> AppResult<Answer<Diagnostic>> {
-        let (port, root) = self.code_root(scope).await?;
-        let path = path.map(relative).transpose()?;
-        port.diagnostics(&root, path).await.map_err(code_err)
+        self.code_root(scope).await?.diagnostics(path).await
     }
 
     pub async fn code_status(&self, scope: &CodeScope) -> AppResult<Vec<LanguageStatus>> {
-        let (port, root) = self.code_root(scope).await?;
-        port.status(&root).await.map_err(code_err)
+        self.code_root(scope).await?.status().await
     }
 
     /// The worktree of a space turn that may edit: refused in Ask and Plan mode
     /// (the space's `mode` is the current turn's) and on a review run.
-    async fn edit_root(&self, scope: &CodeScope) -> AppResult<(Arc<dyn CodeIntelPort>, PathBuf)> {
+    async fn edit_root(&self, scope: &CodeScope) -> AppResult<CodeRoot> {
         let CodeScope::Space(id) = scope else {
             return Err(AppError::Invalid(
                 "code edits are for a space's agent turn only; a review run is read-only".into(),
@@ -956,18 +943,10 @@ impl Core {
         name: &str,
         body: &str,
     ) -> AppResult<CodeEdits> {
-        let (port, root) = self.edit_root(scope).await?;
-        let path = relative(path)?;
-        let (symbol, text) = port
-            .symbol_body(&root, path, name)
+        self.edit_root(scope)
+            .await?
+            .replace_symbol(path, name, body)
             .await
-            .map_err(code_err)?;
-        let edit = TextEdit {
-            path: path.to_string(),
-            range: symbol.range,
-            new_text: body.to_string(),
-        };
-        apply_edits(&*port, &root, &[edit], Some(&text)).await
     }
 
     /// `insert_after_symbol`: `text` on the line after `name`'s definition.
@@ -978,10 +957,120 @@ impl Core {
         name: &str,
         text: &str,
     ) -> AppResult<CodeEdits> {
-        let (port, root) = self.edit_root(scope).await?;
+        self.edit_root(scope)
+            .await?
+            .insert_after_symbol(path, name, text)
+            .await
+    }
+
+    /// `rename_symbol`: the server's rename edits, in every file.
+    pub async fn code_rename_symbol(
+        &self,
+        scope: &CodeScope,
+        path: &str,
+        at: Position,
+        new_name: &str,
+    ) -> AppResult<CodeEdits> {
+        self.edit_root(scope)
+            .await?
+            .rename_symbol(path, at, new_name)
+            .await
+    }
+}
+
+/// One worktree's code tools over the port: the queries and the edits the
+/// MCP tools make, on a root the caller decided (a run's PR or space here;
+/// one fixed worktree in `theodore code-tools-mcp`). Paths are the
+/// agent's, checked to stay relative; whether the caller may edit is the
+/// caller's check.
+#[derive(Clone)]
+pub struct CodeRoot {
+    port: Arc<dyn CodeIntelPort>,
+    root: PathBuf,
+}
+
+impl CodeRoot {
+    /// `root` must be open on `port` already.
+    pub fn new(port: Arc<dyn CodeIntelPort>, root: PathBuf) -> Self {
+        Self { port, root }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub async fn find_symbol(
+        &self,
+        name: &str,
+        kind: Option<CodeSymbolKind>,
+    ) -> AppResult<Answer<CodeSymbol>> {
+        self.port
+            .find_symbol(&self.root, name, kind)
+            .await
+            .map_err(code_err)
+    }
+
+    /// The symbol and its source text.
+    pub async fn get_symbol(&self, path: &str, name: &str) -> AppResult<(CodeSymbol, String)> {
+        self.port
+            .symbol_body(&self.root, relative(path)?, name)
+            .await
+            .map_err(code_err)
+    }
+
+    pub async fn definition(&self, path: &str, at: Position) -> AppResult<Answer<CodeHit>> {
+        self.port
+            .definition(&self.root, relative(path)?, at)
+            .await
+            .map_err(code_err)
+    }
+
+    pub async fn references(&self, path: &str, at: Position) -> AppResult<Answer<CodeHit>> {
+        self.port
+            .references(&self.root, relative(path)?, at)
+            .await
+            .map_err(code_err)
+    }
+
+    pub async fn diagnostics(&self, path: Option<&str>) -> AppResult<Answer<Diagnostic>> {
+        let path = path.map(relative).transpose()?;
+        self.port
+            .diagnostics(&self.root, path)
+            .await
+            .map_err(code_err)
+    }
+
+    pub async fn status(&self) -> AppResult<Vec<LanguageStatus>> {
+        self.port.status(&self.root).await.map_err(code_err)
+    }
+
+    /// `name`'s whole definition in `path` becomes `body`.
+    pub async fn replace_symbol(&self, path: &str, name: &str, body: &str) -> AppResult<CodeEdits> {
         let path = relative(path)?;
-        let (symbol, body) = port
-            .symbol_body(&root, path, name)
+        let (symbol, text) = self
+            .port
+            .symbol_body(&self.root, path, name)
+            .await
+            .map_err(code_err)?;
+        let edit = TextEdit {
+            path: path.to_string(),
+            range: symbol.range,
+            new_text: body.to_string(),
+        };
+        apply_edits(&*self.port, &self.root, &[edit], Some(&text)).await
+    }
+
+    /// `text` on the line after `name`'s definition.
+    pub async fn insert_after_symbol(
+        &self,
+        path: &str,
+        name: &str,
+        text: &str,
+    ) -> AppResult<CodeEdits> {
+        let path = relative(path)?;
+        let (symbol, body) = self
+            .port
+            .symbol_body(&self.root, path, name)
             .await
             .map_err(code_err)?;
         let at = symbol.range.end;
@@ -994,24 +1083,23 @@ impl Core {
             range: symbol.range,
             text: body,
         };
-        apply_checked(&*port, &root, &[edit], Some(&check)).await
+        apply_checked(&*self.port, &self.root, &[edit], Some(&check)).await
     }
 
-    /// `rename_symbol`: the server's rename edits, in every file.
-    pub async fn code_rename_symbol(
+    /// The server's rename edits, in every file.
+    pub async fn rename_symbol(
         &self,
-        scope: &CodeScope,
         path: &str,
         at: Position,
         new_name: &str,
     ) -> AppResult<CodeEdits> {
-        let (port, root) = self.edit_root(scope).await?;
         let new_name = new_name.trim();
         if new_name.is_empty() {
             return Err(AppError::Invalid("the new name is empty".into()));
         }
-        let edits = port
-            .rename(&root, relative(path)?, at, new_name)
+        let edits = self
+            .port
+            .rename(&self.root, relative(path)?, at, new_name)
             .await
             .map_err(code_err)?;
         if edits.is_empty() {
@@ -1019,7 +1107,7 @@ impl Core {
                 "nothing to rename here (no language server answered)".into(),
             ));
         }
-        apply_edits(&*port, &root, &edits, None).await
+        apply_edits(&*self.port, &self.root, &edits, None).await
     }
 }
 

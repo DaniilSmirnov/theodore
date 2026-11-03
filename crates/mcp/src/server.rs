@@ -163,7 +163,7 @@ pub(crate) struct ReviewToolsServer {
 
 #[tool_router(router = review_router)]
 impl ReviewToolsServer {
-    fn new(
+    pub(crate) fn new(
         backend: Arc<dyn ReviewToolsBackend>,
         spaces: Arc<dyn SpaceToolsBackend>,
         code: Arc<dyn CodeToolsBackend>,

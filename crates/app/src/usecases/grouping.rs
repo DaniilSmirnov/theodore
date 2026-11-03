@@ -1,13 +1,20 @@
 //! `regroup` (plan §5.3): re-run the grouper against the cached revision,
 //! continuing from the previous grouping when there is one.
 
-use std::path::{Component, Path};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use theodore_contract::{Ephemeral, ToastLevel, models};
-use theodore_domain::grouping::{CO_CHANGE_MAX_COMMITS, CO_CHANGE_MAX_FILES, RepoContext};
+use theodore_domain::grouping::{
+    CO_CHANGE_MAX_COMMITS, CO_CHANGE_MAX_FILES, RepoContext, SymbolLink,
+};
 use theodore_domain::review_rules::ReviewRules;
-use theodore_domain::{AgentId, FileFlag, FileStatus, Grouping, PrId, Revision};
-use theodore_ports::{NewAction, SyncActionCode};
+use theodore_domain::{AgentId, FileFlag, FileStatus, Grouping, LineKind, PrId, Revision};
+use theodore_ports::{
+    CodeIntelError, CodeIntelPort, CodeSymbol, CodeSymbolKind, NewAction, SyncActionCode,
+};
 use tracing::Instrument as _;
 
 use crate::core::Core;
@@ -303,26 +310,17 @@ impl Core {
     }
 
     /// What the grouper can use beyond the diff: head contents of the
-    /// changed text files (imports outside the hunks) and which of them
+    /// changed text files (imports outside the hunks), which of them
     /// changed together before this PR (`GitPort::co_change_commits` from
-    /// the base). Best-effort: anything unreadable is simply left out.
+    /// the base) and, with code intelligence on the PR's worktree, which
+    /// changed hunks use a symbol another one defines ([`symbol_links`],
+    /// alongside the history scan, within its own time budget).
+    /// Best-effort: anything unreadable is simply left out.
     pub(crate) async fn grouping_context(&self, worktree: &Path, rev: &Revision) -> RepoContext {
         let mut ctx = RepoContext::default();
         let mut budget = HEAD_FILES_MAX_TOTAL_BYTES;
         for f in rev.files.iter().take(HEAD_FILES_MAX_COUNT) {
-            let readable = f.status != FileStatus::Deleted
-                && !f.hunks.is_empty()
-                && !f.flags.iter().any(|fl| {
-                    matches!(
-                        fl,
-                        FileFlag::Binary { .. }
-                            | FileFlag::Generated { .. }
-                            | FileFlag::Lfs
-                            | FileFlag::Submodule
-                    )
-                })
-                && is_plain_relative(&f.path);
-            if !readable {
+            if !is_linkable(f) {
                 continue;
             }
             let path = worktree.join(&f.path);
@@ -339,19 +337,29 @@ impl Core {
             }
         }
         let paths: Vec<String> = rev.files.iter().map(|f| f.path.clone()).collect();
-        ctx.co_change_commits = self
-            .0
-            .deps
-            .git
-            .co_change_commits(
-                worktree,
-                &rev.base,
-                &paths,
-                CO_CHANGE_MAX_COMMITS,
-                CO_CHANGE_MAX_FILES,
-            )
-            .await
-            .unwrap_or_default();
+        let history = self.0.deps.git.co_change_commits(
+            worktree,
+            &rev.base,
+            &paths,
+            CO_CHANGE_MAX_COMMITS,
+            CO_CHANGE_MAX_FILES,
+        );
+        let links = async {
+            let Some(port) = self.0.deps.code_intel.clone() else {
+                return Vec::new();
+            };
+            let started = std::time::Instant::now();
+            let links = symbol_links(port, worktree, rev, SymbolLinkLimits::default()).await;
+            tracing::debug!(
+                links = links.len(),
+                duration_ms = started.elapsed().as_millis() as u64,
+                "grouping symbol links"
+            );
+            links
+        };
+        let (history, links) = tokio::join!(history, links);
+        ctx.co_change_commits = history.unwrap_or_default();
+        ctx.symbol_links = links;
         ctx
     }
 }
@@ -603,7 +611,387 @@ impl PartialWriter {
     }
 }
 
-/// Caps on how much of the worktree `grouping_context` reads.
+/// Caps of [`symbol_links`]: grouping waits for it, so it stays well under
+/// a second or two whatever the PR's size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymbolLinkLimits {
+    /// Wall time for the whole computation; links found by then are kept.
+    pub budget: Duration,
+    /// Changed files asked for their symbols.
+    pub max_files: usize,
+    /// Symbols asked for their references.
+    pub max_symbols: usize,
+    /// Links kept per symbol (a name used in 40 hunks is a rollout, which
+    /// the graph sees on its own).
+    pub max_links_per_symbol: usize,
+    pub max_links: usize,
+    /// Port calls in flight at once.
+    pub concurrency: usize,
+}
+
+impl Default for SymbolLinkLimits {
+    fn default() -> Self {
+        Self {
+            budget: Duration::from_secs(2),
+            max_files: 60,
+            max_symbols: 40,
+            max_links_per_symbol: 8,
+            max_links: 200,
+            concurrency: 4,
+        }
+    }
+}
+
+/// How often, and how far apart, `symbol_links` asks again for a worktree
+/// that isn't open yet (the PR's open races the first grouping).
+const OPEN_RETRIES: u32 = 3;
+const OPEN_RETRY_EVERY: Duration = Duration::from_millis(100);
+
+/// Hunk-to-hunk links from code intelligence (docs/code-intel.md §7.1):
+/// the symbols defined in changed hunks, and which other changed hunks use
+/// them. No LLM call.
+///
+/// ```text
+/// changed files ─▶ file_symbols ─▶ symbols whose range covers an added line
+///                                  (innermost first; names on an added line first)
+///               ─▶ references(name) ─▶ hits on another hunk's added line
+///               ─▶ SymbolLink { from: defining hunk, to: using hunk, symbol }
+/// ```
+///
+/// Best effort: a worktree that isn't open, an error, or the time budget
+/// running out leaves links out, never fails grouping.
+pub async fn symbol_links(
+    port: Arc<dyn CodeIntelPort>,
+    root: &Path,
+    rev: &Revision,
+    limits: SymbolLinkLimits,
+) -> Vec<SymbolLink> {
+    let deadline = tokio::time::Instant::now() + limits.budget;
+    let lines = AddedLines::of(rev, limits.max_files);
+    if lines.by_file.is_empty() {
+        return Vec::new();
+    }
+    let root: Arc<PathBuf> = Arc::new(root.to_path_buf());
+
+    // 1. Symbols of each changed file. A worktree not open yet (the PR's
+    // open races its first grouping) is asked again shortly.
+    let paths: Vec<String> = lines.by_file.keys().cloned().collect();
+    let mut symbols: Vec<CodeSymbol> = Vec::new();
+    for attempt in 0..=OPEN_RETRIES {
+        let answers = bounded(paths.clone(), limits.concurrency, deadline, {
+            let (port, root) = (port.clone(), root.clone());
+            move |path: String| {
+                let (port, root) = (port.clone(), root.clone());
+                async move { port.file_symbols(&root, &path).await }
+            }
+        })
+        .await;
+        let not_open = !answers.is_empty()
+            && answers
+                .iter()
+                .all(|a| matches!(a, Err(CodeIntelError::NotOpen(_))));
+        let retry_at = tokio::time::Instant::now() + OPEN_RETRY_EVERY;
+        if not_open && attempt < OPEN_RETRIES && retry_at < deadline {
+            tokio::time::sleep_until(retry_at).await;
+            continue;
+        }
+        symbols = answers
+            .into_iter()
+            .filter_map(Result::ok)
+            .flat_map(|a| a.items)
+            .collect();
+        break;
+    }
+    let picked = lines.defining(symbols, limits.max_symbols);
+    if picked.is_empty() {
+        return Vec::new();
+    }
+
+    // 2. Where each is used.
+    let hits = bounded(picked, limits.concurrency, deadline, {
+        let (port, root) = (port.clone(), root.clone());
+        move |(hunk, sym): (usize, CodeSymbol)| {
+            let (port, root) = (port.clone(), root.clone());
+            async move {
+                let hits = port
+                    .references(&root, &sym.path, sym.name_range.start)
+                    .await
+                    .map(|a| a.items)
+                    .unwrap_or_default();
+                (hunk, sym.name, hits)
+            }
+        }
+    })
+    .await;
+
+    let mut seen: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut found: Vec<(usize, usize, String)> = Vec::new();
+    for (from, name, hits) in hits {
+        let mut kept = 0;
+        for h in hits.iter().filter(|h| !h.is_definition) {
+            if kept >= limits.max_links_per_symbol {
+                break;
+            }
+            let Some(to) = lines.hunk_at(&h.location.path, h.location.range.start.line) else {
+                continue;
+            };
+            if to != from && seen.insert((from, to)) {
+                found.push((from, to, name.clone()));
+                kept += 1;
+            }
+        }
+    }
+    found.sort();
+    found.truncate(limits.max_links);
+    found
+        .into_iter()
+        .map(|(from, to, symbol)| SymbolLink {
+            from: lines.hunks[from].clone(),
+            to: lines.hunks[to].clone(),
+            symbol,
+        })
+        .collect()
+}
+
+/// Runs `call` over `items`, at most `concurrency` at once, until
+/// `deadline`: the results in by then (in completion order); the calls
+/// still running are aborted.
+async fn bounded<I, O, F, Fut>(
+    items: Vec<I>,
+    concurrency: usize,
+    deadline: tokio::time::Instant,
+    call: F,
+) -> Vec<O>
+where
+    I: Send + 'static,
+    O: Send + 'static,
+    F: Fn(I) -> Fut,
+    Fut: std::future::Future<Output = O> + Send + 'static,
+{
+    let mut queue = items.into_iter();
+    let mut set = tokio::task::JoinSet::new();
+    let mut out = Vec::new();
+    loop {
+        while set.len() < concurrency.max(1) {
+            match queue.next() {
+                Some(item) => {
+                    set.spawn(call(item));
+                }
+                None => break,
+            }
+        }
+        match tokio::time::timeout_at(deadline, set.join_next()).await {
+            Ok(Some(Ok(o))) => out.push(o),
+            Ok(Some(Err(_))) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+    out
+}
+
+/// The added (new-side) lines of a revision's linkable files, by hunk.
+struct AddedLines {
+    /// Hunks in revision order.
+    hunks: Vec<theodore_domain::HunkId>,
+    /// path → new line number → index into `hunks`.
+    by_file: BTreeMap<String, BTreeMap<u32, usize>>,
+}
+
+impl AddedLines {
+    fn of(rev: &Revision, max_files: usize) -> Self {
+        let mut out = Self {
+            hunks: Vec::new(),
+            by_file: BTreeMap::new(),
+        };
+        for f in rev.files.iter().filter(|f| is_linkable(f)).take(max_files) {
+            let mut lines = BTreeMap::new();
+            for h in &f.hunks {
+                let i = out.hunks.len();
+                out.hunks.push(h.id.clone());
+                for l in &h.lines {
+                    if let (LineKind::Add, Some(n)) = (l.kind, l.new_no) {
+                        lines.insert(n, i);
+                    }
+                }
+            }
+            if !lines.is_empty() {
+                out.by_file.insert(f.path.clone(), lines);
+            }
+        }
+        out
+    }
+
+    fn hunk_at(&self, path: &str, line: u32) -> Option<usize> {
+        self.by_file.get(path)?.get(&line).copied()
+    }
+
+    /// The hunks `s`'s definition covers an added line of.
+    fn covered(&self, s: &CodeSymbol) -> BTreeSet<usize> {
+        self.by_file
+            .get(&s.path)
+            .map(|lines| {
+                lines
+                    .range(s.range.start.line..=s.range.end.line)
+                    .map(|(_, &h)| h)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Up to `max` symbols worth asking about, each with the hunk that
+    /// defines it, taken round-robin across hunks so one big new file
+    /// doesn't use them all. Per hunk: a symbol whose name is on an added
+    /// line (new, renamed, re-signed) first, then the innermost; a
+    /// container whose own line didn't change gives way to the changed
+    /// symbol inside it (a method's callers, not its class's).
+    fn defining(&self, symbols: Vec<CodeSymbol>, max: usize) -> Vec<(usize, CodeSymbol)> {
+        let mut by_hunk: BTreeMap<usize, Vec<(bool, u32, CodeSymbol)>> = BTreeMap::new();
+        for s in symbols {
+            if !worth_linking(&s) {
+                continue;
+            }
+            let named_here = self.hunk_at(&s.path, s.name_range.start.line);
+            let covered = self.covered(&s);
+            let Some(hunk) = named_here.or_else(|| covered.first().copied()) else {
+                continue;
+            };
+            let span = s.range.end.line.saturating_sub(s.range.start.line);
+            by_hunk
+                .entry(hunk)
+                .or_default()
+                .push((named_here.is_none(), span, s));
+        }
+        let lists: Vec<(usize, Vec<CodeSymbol>)> = by_hunk
+            .into_iter()
+            .map(|(hunk, cands)| {
+                let container = |(unnamed, _, outer): &(bool, u32, CodeSymbol)| {
+                    *unnamed
+                        && cands
+                            .iter()
+                            .any(|(_, _, s)| s != outer && contains(outer.range, s.range))
+                };
+                let mut kept: Vec<&(bool, u32, CodeSymbol)> =
+                    cands.iter().filter(|c| !container(c)).collect();
+                kept.sort_by(|a, b| (a.0, a.1, &a.2.name).cmp(&(b.0, b.1, &b.2.name)));
+                let mut names = BTreeSet::new();
+                let syms = kept
+                    .into_iter()
+                    .map(|(_, _, s)| s.clone())
+                    .filter(|s| names.insert(s.name.clone()))
+                    .collect();
+                (hunk, syms)
+            })
+            .collect();
+        let mut out = Vec::new();
+        for round in 0.. {
+            let before = out.len();
+            for (hunk, syms) in &lists {
+                if out.len() >= max {
+                    return out;
+                }
+                if let Some(s) = syms.get(round) {
+                    out.push((*hunk, s.clone()));
+                }
+            }
+            if out.len() == before {
+                break;
+            }
+        }
+        out
+    }
+}
+
+/// `outer` contains `inner` and is larger.
+fn contains(outer: theodore_ports::Range, inner: theodore_ports::Range) -> bool {
+    outer != inner && outer.start <= inner.start && inner.end <= outer.end
+}
+
+/// A file whose head text code intelligence can answer about.
+fn is_linkable(f: &theodore_domain::FileDiff) -> bool {
+    f.status != FileStatus::Deleted
+        && !f.hunks.is_empty()
+        && !f.flags.iter().any(|fl| {
+            matches!(
+                fl,
+                FileFlag::Binary { .. }
+                    | FileFlag::Generated { .. }
+                    | FileFlag::Lfs
+                    | FileFlag::Submodule
+            )
+        })
+        && is_plain_relative(&f.path)
+}
+
+/// Names common enough that a by-name match (the syntax layer) links
+/// unrelated code.
+const COMMON_NAMES: &[&str] = &[
+    "new",
+    "default",
+    "from",
+    "into",
+    "init",
+    "main",
+    "test",
+    "tests",
+    "run",
+    "get",
+    "set",
+    "len",
+    "drop",
+    "clone",
+    "fmt",
+    "eq",
+    "hash",
+    "next",
+    "call",
+    "apply",
+    "build",
+    "render",
+    "update",
+    "handle",
+    "parse",
+    "load",
+    "save",
+    "open",
+    "close",
+    "start",
+    "stop",
+    "read",
+    "write",
+    "send",
+    "value",
+    "data",
+    "name",
+    "id",
+    "key",
+    "type",
+    "self",
+    "this",
+    "constructor",
+    "toString",
+    "__init__",
+    "__str__",
+    "__repr__",
+    "setUp",
+    "tearDown",
+];
+
+/// A symbol whose uses are worth linking: a definition kind, not a local
+/// or a common method name; a field or variable only with a compound name
+/// (`retry_after_ms`, `maxRetries`).
+fn worth_linking(s: &CodeSymbol) -> bool {
+    let n = s.name.as_str();
+    if n.chars().count() < 3 || COMMON_NAMES.contains(&n) {
+        return false;
+    }
+    let camel = n.chars().skip(1).any(char::is_uppercase) && n.chars().any(char::is_lowercase);
+    let compound = n.contains('_') || camel;
+    match s.kind {
+        CodeSymbolKind::Module | CodeSymbolKind::Other => false,
+        CodeSymbolKind::Variable | CodeSymbolKind::Field => compound,
+        _ => true,
+    }
+}
 const HEAD_FILE_MAX_BYTES: usize = 512 * 1024;
 const HEAD_FILES_MAX_TOTAL_BYTES: usize = 24 * 1024 * 1024;
 const HEAD_FILES_MAX_COUNT: usize = 3000;
@@ -613,4 +1001,447 @@ fn is_plain_relative(path: &str) -> bool {
     Path::new(path)
         .components()
         .all(|c| matches!(c, Component::Normal(_)))
+}
+
+#[cfg(test)]
+mod link_tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use theodore_domain::{FileDiff, HunkId, Sha};
+    use theodore_ports::{
+        Answer, CodeHit, CodeIntelLimits, CodeIntelResult, Diagnostic, Hover, InstallProgressFn,
+        LanguageId, LanguageStatus, Location, Position, Range, Source, TextEdit, Workspace,
+    };
+
+    use super::*;
+    use crate::testkit::{self, line_add, line_ctx, make_hunk};
+
+    /// A port answering `file_symbols` and `references` (per asked
+    /// position), nothing else.
+    #[derive(Default)]
+    struct Port {
+        symbols: Vec<CodeSymbol>,
+        /// (path, line of the name) → hits.
+        refs: HashMap<(String, u32), Vec<CodeHit>>,
+        /// `file_symbols` says "not open" this many times first.
+        not_open: Mutex<u32>,
+        /// `references` of these names never answers in time.
+        slow: Vec<String>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    fn unsupported<T>() -> CodeIntelResult<T> {
+        Err(CodeIntelError::Unsupported("test".into()))
+    }
+
+    fn answer<T>(items: Vec<T>) -> Answer<T> {
+        Answer {
+            items,
+            source: Source::Syntax,
+            index_percent: 100,
+            note: None,
+        }
+    }
+
+    #[async_trait]
+    impl CodeIntelPort for Port {
+        async fn open(&self, _ws: Workspace) -> CodeIntelResult<()> {
+            Ok(())
+        }
+        async fn close(&self, _root: &Path) {}
+        async fn find_symbol(
+            &self,
+            _root: &Path,
+            _name: &str,
+            _kind: Option<CodeSymbolKind>,
+        ) -> CodeIntelResult<Answer<CodeSymbol>> {
+            unsupported()
+        }
+        async fn file_symbols(
+            &self,
+            root: &Path,
+            path: &str,
+        ) -> CodeIntelResult<Answer<CodeSymbol>> {
+            {
+                let mut left = self.not_open.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err(CodeIntelError::NotOpen(root.to_path_buf()));
+                }
+            }
+            Ok(answer(
+                self.symbols
+                    .iter()
+                    .filter(|s| s.path == path)
+                    .cloned()
+                    .collect(),
+            ))
+        }
+        async fn symbol_body(
+            &self,
+            _root: &Path,
+            _path: &str,
+            _name: &str,
+        ) -> CodeIntelResult<(CodeSymbol, String)> {
+            unsupported()
+        }
+        async fn definition(
+            &self,
+            _root: &Path,
+            _path: &str,
+            _at: Position,
+        ) -> CodeIntelResult<Answer<CodeHit>> {
+            unsupported()
+        }
+        async fn references(
+            &self,
+            _root: &Path,
+            path: &str,
+            at: Position,
+        ) -> CodeIntelResult<Answer<CodeHit>> {
+            let name = self
+                .symbols
+                .iter()
+                .find(|s| s.path == path && s.name_range.start == at)
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
+            self.asked.lock().unwrap().push(name.clone());
+            if self.slow.contains(&name) {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            Ok(answer(
+                self.refs
+                    .get(&(path.to_string(), at.line))
+                    .cloned()
+                    .unwrap_or_default(),
+            ))
+        }
+        async fn diagnostics(
+            &self,
+            _root: &Path,
+            _path: Option<&str>,
+        ) -> CodeIntelResult<Answer<Diagnostic>> {
+            unsupported()
+        }
+        async fn rename(
+            &self,
+            _root: &Path,
+            _path: &str,
+            _at: Position,
+            _new_name: &str,
+        ) -> CodeIntelResult<Vec<TextEdit>> {
+            unsupported()
+        }
+        async fn hover(
+            &self,
+            _root: &Path,
+            _path: &str,
+            _at: Position,
+        ) -> CodeIntelResult<Option<Hover>> {
+            Ok(None)
+        }
+        async fn install(
+            &self,
+            _language: &LanguageId,
+            _progress: Option<InstallProgressFn>,
+        ) -> CodeIntelResult<()> {
+            Ok(())
+        }
+        async fn remove(&self, _language: &LanguageId) -> CodeIntelResult<()> {
+            Ok(())
+        }
+        async fn set_limits(&self, _limits: CodeIntelLimits) {}
+        async fn file_changed(&self, _root: &Path, _path: &str) {}
+        async fn status(&self, _root: &Path) -> CodeIntelResult<Vec<LanguageStatus>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn range(start: u32, end: u32) -> Range {
+        Range {
+            start: Position {
+                line: start,
+                col: 1,
+            },
+            end: Position { line: end, col: 1 },
+        }
+    }
+
+    fn sym(path: &str, name: &str, kind: CodeSymbolKind, lines: (u32, u32), at: u32) -> CodeSymbol {
+        CodeSymbol {
+            name: name.into(),
+            kind,
+            range: range(lines.0, lines.1),
+            name_range: Range {
+                start: Position { line: at, col: 5 },
+                end: Position {
+                    line: at,
+                    col: 5 + name.len() as u32,
+                },
+            },
+            path: path.into(),
+            container: None,
+            source: Source::Syntax,
+        }
+    }
+
+    fn hit(path: &str, line: u32, is_definition: bool) -> CodeHit {
+        CodeHit {
+            location: Location {
+                path: path.into(),
+                range: range(line, line),
+            },
+            preview: String::new(),
+            is_definition,
+            source: Source::Syntax,
+        }
+    }
+
+    fn file(path: &str, hunks: Vec<theodore_domain::Hunk>) -> FileDiff {
+        FileDiff {
+            path: path.into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            similarity: None,
+            old_mode: None,
+            new_mode: None,
+            flags: vec![],
+            additions: 0,
+            deletions: 0,
+            hunks,
+        }
+    }
+
+    /// `config.rs`: a hunk adding lines 10-12 (`parse_config`), one adding
+    /// line 40. `main.rs`: a hunk adding line 5, with context line 6.
+    fn rev() -> (Revision, [HunkId; 3]) {
+        let def = make_hunk(
+            "src/config.rs",
+            9,
+            1,
+            9,
+            4,
+            vec![
+                line_ctx(9, 9, "impl Config {"),
+                line_add(10, "fn parse_config() {"),
+                line_add(11, "  read()"),
+                line_add(12, "}"),
+            ],
+        );
+        let other = make_hunk(
+            "src/config.rs",
+            37,
+            0,
+            40,
+            1,
+            vec![line_add(40, "const NOTE_MARKER: u8 = 1;")],
+        );
+        let user = make_hunk(
+            "src/main.rs",
+            4,
+            1,
+            5,
+            2,
+            vec![
+                line_add(5, "parse_config();"),
+                line_ctx(5, 6, "parse_config();"),
+            ],
+        );
+        let ids = [def.id.clone(), other.id.clone(), user.id.clone()];
+        let rev = Revision {
+            base: Sha::new("b"),
+            head: Sha::new("h"),
+            files: vec![
+                file("src/config.rs", vec![def, other]),
+                file("src/main.rs", vec![user]),
+            ],
+        };
+        (rev, ids)
+    }
+
+    fn parse_config() -> CodeSymbol {
+        sym(
+            "src/config.rs",
+            "parse_config",
+            CodeSymbolKind::Function,
+            (10, 12),
+            10,
+        )
+    }
+
+    async fn links(port: Port, rev: &Revision) -> Vec<SymbolLink> {
+        symbol_links(
+            Arc::new(port),
+            Path::new("/wt"),
+            rev,
+            SymbolLinkLimits::default(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_changed_definition_links_to_its_use_in_another_changed_hunk() {
+        let (rev, [def, _, user]) = rev();
+        let mut port = Port {
+            symbols: vec![parse_config()],
+            ..Port::default()
+        };
+        port.refs.insert(
+            ("src/config.rs".into(), 10),
+            vec![
+                hit("src/config.rs", 10, true),
+                // A use on an added line of another hunk: the link.
+                hit("src/main.rs", 5, false),
+                // On a context line, outside any hunk, in its own hunk:
+                // none of them a use this PR changed.
+                hit("src/main.rs", 6, false),
+                hit("src/main.rs", 90, false),
+                hit("src/config.rs", 11, false),
+            ],
+        );
+        assert_eq!(
+            links(port, &rev).await,
+            vec![SymbolLink {
+                from: def,
+                to: user,
+                symbol: "parse_config".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_container_gives_way_and_common_names_are_not_asked() {
+        let (rev, _) = rev();
+        let port = Arc::new(Port {
+            symbols: vec![
+                // The impl's own line (9) is context: its users aren't
+                // what changed.
+                sym(
+                    "src/config.rs",
+                    "Config",
+                    CodeSymbolKind::Struct,
+                    (9, 30),
+                    9,
+                ),
+                parse_config(),
+                sym(
+                    "src/config.rs",
+                    "new",
+                    CodeSymbolKind::Function,
+                    (11, 12),
+                    11,
+                ),
+                // Covers no added line.
+                sym(
+                    "src/config.rs",
+                    "untouched_fn",
+                    CodeSymbolKind::Function,
+                    (20, 30),
+                    20,
+                ),
+                // A plain, local-looking variable.
+                sym("src/main.rs", "cfg", CodeSymbolKind::Variable, (5, 5), 5),
+            ],
+            ..Port::default()
+        });
+        symbol_links(
+            port.clone(),
+            Path::new("/wt"),
+            &rev,
+            SymbolLinkLimits::default(),
+        )
+        .await;
+        assert_eq!(
+            *port.asked.lock().unwrap(),
+            vec!["parse_config".to_string()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_worktree_opening_meanwhile_is_asked_again() {
+        let (rev, [def, _, user]) = rev();
+        let mut port = Port {
+            symbols: vec![parse_config()],
+            // Both files' first answers.
+            not_open: Mutex::new(2),
+            ..Port::default()
+        };
+        port.refs.insert(
+            ("src/config.rs".into(), 10),
+            vec![hit("src/main.rs", 5, false)],
+        );
+        let found = links(port, &rev).await;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!((&found[0].from, &found[0].to), (&def, &user));
+    }
+
+    #[tokio::test]
+    async fn a_worktree_never_open_gives_no_links() {
+        let (rev, _) = rev();
+        let port = Port {
+            symbols: vec![parse_config()],
+            not_open: Mutex::new(u32::MAX),
+            ..Port::default()
+        };
+        assert!(links(port, &rev).await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_time_budget_keeps_what_was_found_by_then() {
+        let (rev, _) = rev();
+        let mut port = Port {
+            symbols: vec![
+                parse_config(),
+                sym(
+                    "src/config.rs",
+                    "NOTE_MARKER",
+                    CodeSymbolKind::Constant,
+                    (40, 40),
+                    40,
+                ),
+            ],
+            slow: vec!["NOTE_MARKER".into()],
+            ..Port::default()
+        };
+        port.refs.insert(
+            ("src/config.rs".into(), 10),
+            vec![hit("src/main.rs", 5, false)],
+        );
+        let started = tokio::time::Instant::now();
+        let found = links(port, &rev).await;
+        assert!(started.elapsed() <= SymbolLinkLimits::default().budget);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].symbol, "parse_config");
+    }
+
+    /// With code intelligence the app's grouping context carries the links
+    /// (without it: `grouping_context_reads_head_files_and_co_change_history`).
+    #[tokio::test]
+    async fn the_grouping_context_carries_links_from_code_intelligence() {
+        let f = testkit::fixtures();
+        *f.code_intel.symbols.lock().unwrap() = vec![sym(
+            "src/lib.rs",
+            "build_widget",
+            CodeSymbolKind::Function,
+            (2, 2),
+            2,
+        )];
+        *f.code_intel.hits.lock().unwrap() = vec![hit("src/lib.rs", 12, false)];
+        let (core, _recv) = crate::Core::start(f.deps_with_code());
+        let rev =
+            testkit::two_hunk_revision(&Sha::new("base000"), &Sha::new("head111"), "src/lib.rs");
+        let wt = tempfile::tempdir().expect("tempdir");
+        let ctx = core.grouping_context(wt.path(), &rev).await;
+        let ids = testkit::hunk_ids(&rev);
+        assert_eq!(
+            ctx.symbol_links,
+            vec![SymbolLink {
+                from: ids[0].clone(),
+                to: ids[1].clone(),
+                symbol: "build_widget".into(),
+            }]
+        );
+    }
 }

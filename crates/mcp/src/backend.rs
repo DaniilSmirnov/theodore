@@ -21,6 +21,10 @@ pub enum ToolSet {
     Review,
     /// `space-tools`: a space's agent turn.
     Space,
+    /// `code-tools`: the code tools and nothing else, on one worktree
+    /// (`theodore code-tools-mcp`, the agent-tools eval). Edits with
+    /// [`CodeTools::Edit`].
+    Code,
 }
 
 /// The `review-tools` tools.
@@ -114,14 +118,16 @@ impl RunContext {
         match self.tools {
             ToolSet::Review => theodore_ports::REVIEW_TOOLS,
             ToolSet::Space => theodore_ports::SPACE_TOOLS,
+            ToolSet::Code => theodore_ports::CODE_TOOLS,
         }
     }
 
     /// Whether this run may list and call `tool`.
     pub fn allows(&self, tool: &str) -> bool {
-        // The CLI's permission prompts, on every server (`crate::approve`).
+        // The CLI's permission prompts, on every app server
+        // (`crate::approve`); `code-tools` is never the prompt tool.
         if tool == theodore_ports::APPROVE_TOOL {
-            return true;
+            return self.tools != ToolSet::Code;
         }
         if CODE_TOOL_NAMES.contains(&tool) {
             return self.code != CodeTools::Off;
@@ -135,12 +141,19 @@ impl RunContext {
                     || (self.space.is_some() && REVIEW_SPACE_TOOL_NAMES.contains(&tool))
             }
             ToolSet::Space => self.space.is_some() && SPACE_TOOL_NAMES.contains(&tool),
+            ToolSet::Code => false,
         }
     }
 
-    /// The code edits: a space turn with [`CodeTools::Edit`].
+    /// The code edits: a space turn, or a `code-tools` run, with
+    /// [`CodeTools::Edit`].
     pub fn code_edits(&self) -> bool {
-        self.tools == ToolSet::Space && self.space.is_some() && self.code == CodeTools::Edit
+        let writer = match self.tools {
+            ToolSet::Review => false,
+            ToolSet::Space => self.space.is_some(),
+            ToolSet::Code => true,
+        };
+        writer && self.code == CodeTools::Edit
     }
 }
 
@@ -233,6 +246,33 @@ pub trait ReviewToolsBackend: Send + Sync {
         finding: NewFinding,
     ) -> Result<FindingId, BackendError>;
     async fn propose_patch(&self, run: &RunContext, patch: NewPatch) -> Result<(), BackendError>;
+}
+
+/// For a server without PRs (`code-tools`): every call fails, and no
+/// `code-tools` run lists the tools.
+pub struct NoReviewTools;
+
+fn no_pr() -> BackendError {
+    BackendError::Invalid("no PR here".into())
+}
+
+#[async_trait]
+impl ReviewToolsBackend for NoReviewTools {
+    async fn get_pr_context(&self, _: &RunContext) -> Result<PrContext, BackendError> {
+        Err(no_pr())
+    }
+    async fn get_group(&self, _: &RunContext, _: &str) -> Result<GroupWithHunks, BackendError> {
+        Err(no_pr())
+    }
+    async fn get_base_file(&self, _: &RunContext, _: &str) -> Result<Option<String>, BackendError> {
+        Err(no_pr())
+    }
+    async fn add_finding(&self, _: &RunContext, _: NewFinding) -> Result<FindingId, BackendError> {
+        Err(no_pr())
+    }
+    async fn propose_patch(&self, _: &RunContext, _: NewPatch) -> Result<(), BackendError> {
+        Err(no_pr())
+    }
 }
 
 /// What the `space-tools` server (and the read-only part of

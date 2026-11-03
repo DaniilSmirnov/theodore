@@ -36,6 +36,10 @@ pub struct Fixture {
     #[serde(default)]
     pub pr: FixturePr,
     pub revision: Revision,
+    /// Code-intelligence links between its hunks, when the fixture carries
+    /// them or `--symbol-links` computed them (`links::fill`).
+    #[serde(default)]
+    pub symbol_links: Vec<grouping::SymbolLink>,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -86,6 +90,15 @@ pub struct EvalArgs {
     /// With `--graph-only`: also print every community, rollout and chunk.
     #[arg(long, requires = "graph_only")]
     pub show: bool,
+    /// Give the grouper code-intelligence symbol links between hunks
+    /// (`RepoContext::symbol_links`), computed with the syntax layer over a
+    /// sparse checkout of each fixture's hunks (docs/eval/symbol-links.md).
+    #[arg(long)]
+    pub symbol_links: bool,
+    /// With `--symbol-links`: where the checkouts and the code-intelligence
+    /// data (grammars, index) go. Default: `<tmp>/theodore-eval-links`.
+    #[arg(long, requires = "symbol_links")]
+    pub links_dir: Option<PathBuf>,
 }
 
 /// Load every `*.json` fixture in `dir`, sorted by file name.
@@ -171,7 +184,10 @@ pub async fn run_eval_with_options(
         let pr: PrMeta = fx.pr.clone().into();
         let seen = Previews::default();
         let on = |p: Progress<'_>| seen.record(p);
-        let ctx = theodore_domain::grouping::RepoContext::default();
+        let ctx = grouping::RepoContext {
+            symbol_links: fx.symbol_links.clone(),
+            ..Default::default()
+        };
         match group_revision_progress(agent, &pr, &fx.revision, &ctx, cwd, opts, &on).await {
             Ok(report) => {
                 let previews = seen.against(&report.grouping);

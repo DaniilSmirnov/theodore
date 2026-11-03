@@ -28,6 +28,19 @@ pub struct RepoContext {
     /// The project config's `review:` rules (`hide`, `skim`, the system
     /// note from `instructions` and `context`).
     pub review: crate::review_rules::ReviewRules,
+    /// Hunk-to-hunk links found by code intelligence: a symbol defined in
+    /// one changed hunk and used in another. Empty without code
+    /// intelligence (or when it ran out of time).
+    pub symbol_links: Vec<SymbolLink>,
+}
+
+/// `from` changes the definition of `symbol`; `to`, another changed hunk,
+/// uses it ("changed here" ↔ "called there").
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct SymbolLink {
+    pub from: HunkId,
+    pub to: HunkId,
+    pub symbol: String,
 }
 
 /// Commits touching more files than this are ignored for co-change.

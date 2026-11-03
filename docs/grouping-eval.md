@@ -310,3 +310,10 @@ suite is too noisy to credit cleanly to the prompt trimming.
   the small-PR target with no extra agent call.
 - `prompt::tests::system_prompt_states_the_scaled_target_and_logical_step_rule`,
   `prompt::tests::skim_candidate_hunks_get_a_shorter_excerpt`.
+
+## Later evals
+
+- [Grouping by relatedness](eval/graph-grouping.md)
+- [Symbol links from code intelligence](eval/symbol-links.md):
+  `theodore eval --symbol-links` gives fixtures hunk-to-hunk links computed
+  over a sparse checkout of their hunks.

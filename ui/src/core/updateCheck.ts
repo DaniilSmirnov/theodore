@@ -2,7 +2,8 @@
  *  checking, downloading, up to date, or why the check failed. The shell's
  *  `check_update` downloads and installs before it answers; the `update`
  *  event it sends first (`downloaded: false`) is what flips the toast to
- *  "Downloading…". */
+ *  "Downloading…". Once an update is installed the toast goes away: the
+ *  "Restart to update" pill (`UpdateReady`) says it, once. */
 import { toast as heroToast } from '@heroui/react';
 import { reaction } from 'mobx';
 import type { RootStore } from '../stores/RootStore';
@@ -12,6 +13,7 @@ import { api, CommandFailure } from './api';
 export interface Toaster {
   show(text: string, opts: ToastOpts): string;
   update(id: string, text: string, opts: ToastOpts): void;
+  close(id: string): void;
 }
 
 interface ToastOpts {
@@ -24,6 +26,7 @@ interface ToastOpts {
 const heroToaster: Toaster = {
   show: (text, opts) => heroToast(text, opts),
   update: (id, text, opts) => void heroToast.update(id, text, opts),
+  close: (id) => heroToast.close(id),
 };
 
 const DONE_MS = 4000;
@@ -70,13 +73,8 @@ export function checkForUpdates(
 }
 
 async function run(store: RootStore, toaster: Toaster): Promise<void> {
-  const ready = store.ephemeral.readyUpdate;
-  if (ready) {
-    toaster.show(`Theodore ${ready.version} is installed — restart to update`, {
-      timeout: DONE_MS,
-    });
-    return;
-  }
+  // Already installed: the pill is on screen, nothing to add.
+  if (store.ephemeral.readyUpdate) return;
   const id = toaster.show('Checking for updates…', {
     isLoading: true,
     timeout: 0,
@@ -96,11 +94,8 @@ async function run(store: RootStore, toaster: Toaster): Promise<void> {
   try {
     const info = await api.checkUpdate(true);
     if (info) {
-      toaster.update(
-        id,
-        `Theodore ${info.version} is ready — restart to update`,
-        { variant: 'success', timeout: DONE_MS },
-      );
+      // The pill takes over from here.
+      toaster.close(id);
     } else {
       const v = store.ephemeral.appInfo?.version;
       toaster.update(
