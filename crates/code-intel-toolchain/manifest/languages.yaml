@@ -101,24 +101,16 @@ servers:
     workspace_folders: true
 
   - name: gopls
-    # No macOS binary upstream; built by us (docs/code-intel.md §4.2),
-    # scripts/build-servers.sh + .github/workflows/servers.yml. The url and
-    # sha256 below are from a local `sh scripts/build-servers.sh` run
-    # (go1.27.2, go install -trimpath golang.org/x/tools/gopls@v0.24.0),
-    # just to prove the pin builds — NOT the published asset. Once
-    # servers.yml runs on staging it publishes its own build under this
-    # release tag; a human must paste that run's sha256
-    # (target/servers/gopls-manifest-snippet.yaml in its job log/artifact)
-    # over this placeholder before relying on it (CI's build is not
-    # guaranteed byte-identical to this one even with -trimpath: Go
-    # toolchain version, embedded build id).
+    # No macOS binary upstream; built by us (docs/code-intel.md §4.2):
+    # scripts/build-servers.sh + .github/workflows/servers.yml, pinned to
+    # that workflow's published build.
     version: "0.24.0"
     detect: [["gopls", "version"]]
     download:
       darwin-arm64:
         url: https://github.com/JeanIsahakyan/theodore/releases/download/servers-68915d68b083/gopls-0.24.0-darwin-arm64.tar.gz
-        sha256: 82428507402863944e8a0bfec16e458b55f392800221b4c432a052b9db451b0e
-        size: 21604981
+        sha256: 56c92b7c0835b512cd94f532c5a494345d4666fefc49cb174a469910e23e776d
+        size: 21605310
         format: tar.gz
         bin: gopls
         redirect_hosts: [release-assets.githubusercontent.com, objects.githubusercontent.com]
