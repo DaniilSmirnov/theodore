@@ -5685,6 +5685,7 @@ dependencies = [
  "tempfile",
  "theodore-agents",
  "theodore-app",
+ "theodore-code-intel",
  "theodore-contract",
  "theodore-domain",
  "theodore-git",

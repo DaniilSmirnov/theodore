@@ -338,6 +338,53 @@ fn head_file_contents_add_imports_outside_the_hunks() {
 }
 
 #[test]
+fn symbol_links_from_code_intelligence_link_files_and_hunks() {
+    let files = vec![
+        file("src/store/cache.rs", &["+    self.evict(n)"]),
+        file("src/http/handler.rs", &["+    let v = 2;"]),
+        file("src/net/socket.rs", &["+    fd += 1;"]),
+    ];
+    let link = |from: &str, to: &str| SymbolLink {
+        from: HunkId::new(format!("h-{from}")),
+        to: HunkId::new(format!("h-{to}")),
+        symbol: "evict_older".into(),
+    };
+    let ctx = RepoContext {
+        symbol_links: vec![
+            link("src/store/cache.rs", "src/http/handler.rs"),
+            // The same pair again, and a hunk that isn't in the PR.
+            link("src/http/handler.rs", "src/store/cache.rs"),
+            link("src/store/cache.rs", "gone.rs"),
+        ],
+        ..RepoContext::default()
+    };
+    let without = graph(files.clone());
+    assert_eq!(without.connection(0, 1), 0.0);
+    let g = RelGraph::build(&rev(files), &PrePass::default(), &ctx);
+    let (cache, handler) = (
+        idx(&g, "src/store/cache.rs"),
+        idx(&g, "src/http/handler.rs"),
+    );
+    assert!(g.connection(cache, handler) >= 1.0);
+    assert_eq!(g.connection(cache, idx(&g, "src/net/socket.rs")), 0.0);
+    assert_eq!(
+        g.edge_between(cache, handler).unwrap().reasons()[0],
+        "uses `evict_older`"
+    );
+    assert_eq!(g.hunk_links().len(), 1);
+    let ids = |p: &str| vec![HunkId::new(format!("h-{p}"))];
+    assert_eq!(
+        g.hunk_links_between(&ids("src/http/handler.rs"), &ids("src/store/cache.rs")),
+        1
+    );
+    assert_eq!(
+        g.hunk_links_between(&ids("src/net/socket.rs"), &ids("src/store/cache.rs")),
+        0
+    );
+    assert!(together(&g, "src/store/cache.rs", "src/http/handler.rs"));
+}
+
+#[test]
 fn hidden_files_are_not_nodes() {
     let mut prepass = PrePass::default();
     prepass.hidden.insert(

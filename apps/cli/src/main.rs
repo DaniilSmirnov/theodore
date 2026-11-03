@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use theodore_cli::{deps, endpoint, eval, graph_check, group, mcp_bridge, sandbox};
+use theodore_cli::{deps, endpoint, eval, graph_check, group, links, mcp_bridge, sandbox};
 use theodore_domain::AgentId;
 use theodore_grouping::GroupingOptions;
 use theodore_ports::AgentPort;
@@ -70,7 +70,11 @@ async fn run_group(args: group::GroupArgs) -> anyhow::Result<()> {
 }
 
 async fn run_eval(args: eval::EvalArgs) -> anyhow::Result<()> {
-    let fixtures = eval::load_fixtures(&args.fixtures_dir)?;
+    let mut fixtures = eval::load_fixtures(&args.fixtures_dir)?;
+    if args.symbol_links {
+        let dir = args.links_dir.clone().unwrap_or_else(links::default_dir);
+        links::fill(&mut fixtures, &dir).await?;
+    }
     if args.graph_only {
         let mut budget = theodore_grouping::PromptBudget::default();
         if let Some(max_chars) = args.max_chars {

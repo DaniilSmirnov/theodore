@@ -110,10 +110,15 @@ pub fn run(
     let mut totals = [PairScore::default(); 4];
     let mut compared = 0;
     let mut replays: Vec<(String, [Replay; 2])> = Vec::new();
+    // (fixture, links, same group in the compared run, across files)
+    let mut links: Vec<(String, usize, usize, usize)> = Vec::new();
     for (name, fx) in fixtures {
         let rev = &fx.revision;
         let pre = prepass::run(rev);
-        let ctx = RepoContext::default();
+        let ctx = RepoContext {
+            symbol_links: fx.symbol_links.clone(),
+            ..RepoContext::default()
+        };
         let graph = RelGraph::build(rev, &pre, &ctx);
         let pr: PrMeta = fx.pr.clone().into();
         let new_chunks = build_prompts_with(&pr, rev, &pre, &graph, &ctx, budget);
@@ -174,6 +179,10 @@ pub fn run(
             for (t, s) in totals.iter_mut().zip(&scores) {
                 *t += *s;
             }
+            if !graph.hunk_links().is_empty() {
+                let (together, cross) = link_agreement(&graph, &group_of);
+                links.push((name.clone(), graph.hunk_links().len(), together, cross));
+            }
             compared += 1;
             replays.push((name.clone(), replay_push(rev, &reference, &graph)));
             cols = scores.iter().map(fmt).collect();
@@ -222,6 +231,23 @@ pub fn run(
 x = only pairs across different files; chunk R = share of the compared run's same-group \
 pairs that the new chunking keeps in one prompt."
     );
+    if !links.is_empty() {
+        println!(
+            "\nSymbol links (code intelligence) against the compared run:\n{:<20} {:>6} {:>12} {:>12}",
+            "fixture", "links", "same group", "cross-file"
+        );
+        let (mut n, mut t) = (0, 0);
+        for (name, count, together, cross) in &links {
+            n += count;
+            t += together;
+            println!("{name:<20} {count:>6} {together:>12} {cross:>12}");
+        }
+        println!(
+            "{:<20} {n:>6} {:>11.0}%",
+            "(all)",
+            100.0 * t as f64 / n.max(1) as f64
+        );
+    }
     if !replays.is_empty() {
         println!(
             "\nPush replay (incremental regroup suggestions against the compared run):\n\
@@ -238,6 +264,24 @@ the compared run's group."
         );
     }
     Ok(())
+}
+
+/// Of the graph's hunk links between hunks the reference grouping shows:
+/// how many it put in one group, and how many join two different files.
+fn link_agreement(graph: &RelGraph, group_of: &BTreeMap<&HunkId, usize>) -> (usize, usize) {
+    let mut together = 0;
+    let mut cross = 0;
+    for l in graph.hunk_links() {
+        if let (Some(a), Some(b)) = (group_of.get(&l.from), group_of.get(&l.to))
+            && a == b
+        {
+            together += 1;
+        }
+        if graph.file_of(&l.from) != graph.file_of(&l.to) {
+            cross += 1;
+        }
+    }
+    (together, cross)
 }
 
 /// Hunks replayed as new, how many got a suggestion, how many of those

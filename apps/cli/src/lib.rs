@@ -8,5 +8,6 @@ pub mod endpoint;
 pub mod eval;
 pub mod graph_check;
 pub mod group;
+pub mod links;
 pub mod mcp_bridge;
 pub mod sandbox;

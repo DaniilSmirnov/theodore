@@ -33,6 +33,10 @@ const RELATED_MAX_EDGES: usize = 24;
 const RELATED_MAX_CHARS: usize = 2_400;
 const RELATED_MIN_WEIGHT: f64 = 0.3;
 const ROLLOUT_SHOWN_FILES: usize = 6;
+/// Caps on the "Symbol links" section (code intelligence, hunk to hunk).
+const SYMBOL_LINK_MAX_LINES: usize = 30;
+const SYMBOL_LINK_MAX_CHARS: usize = 1_600;
+const SYMBOL_LINK_MAX_USERS: usize = 6;
 /// A chunk's "rest of this PR" skeleton section fills the room its chunk
 /// leaves under the budget, within these bounds. It is not reserved when
 /// packing: the floor may take a full chunk this far over the soft budget,
@@ -305,6 +309,53 @@ syntax cleanup) in a linked file can still go to its own skim group."
     }
 }
 
+/// Code-intelligence links among the hunks of `files`, one line per
+/// defining hunk and symbol: `- <hunk> `name` → <hunk>, <hunk>`. Nothing
+/// when there are none.
+fn write_symbol_links(out: &mut String, files: &[&theodore_domain::FileDiff], graph: &RelGraph) {
+    if graph.hunk_links().is_empty() {
+        return;
+    }
+    let here: BTreeSet<&HunkId> = files
+        .iter()
+        .flat_map(|f| f.hunks.iter().map(|h| &h.id))
+        .collect();
+    let mut lines: Vec<((&HunkId, &str), Vec<&HunkId>)> = Vec::new();
+    for l in graph.hunk_links() {
+        if !here.contains(&l.from) || !here.contains(&l.to) {
+            continue;
+        }
+        let key = (&l.from, l.symbol.as_str());
+        match lines.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, users)) => {
+                if users.len() < SYMBOL_LINK_MAX_USERS {
+                    users.push(&l.to);
+                }
+            }
+            None => lines.push((key, vec![&l.to])),
+        }
+    }
+    if lines.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "\n# Symbol links\nFound by code intelligence: the first hunk defines or changes `name`, \
+the hunks after → use it. Put them in one group, or the defining hunk in an earlier group \
+than its uses."
+    );
+    let mut used = 0;
+    for ((from, name), users) in lines.into_iter().take(SYMBOL_LINK_MAX_LINES) {
+        let users: Vec<&str> = users.iter().map(|h| h.as_str()).collect();
+        let line = format!("- {from} `{name}` → {}", users.join(", "));
+        used += line.len() + 1;
+        if used > SYMBOL_LINK_MAX_CHARS {
+            break;
+        }
+        let _ = writeln!(out, "{line}");
+    }
+}
+
 fn user_prompt(
     pr: &PrMeta,
     files: &[&theodore_domain::FileDiff],
@@ -317,6 +368,7 @@ fn user_prompt(
     write_pr_meta(&mut out, pr);
     write_hidden_summary(&mut out, prepass);
     write_related(&mut out, files, graph);
+    write_symbol_links(&mut out, files, graph);
     out.push_str(rest_of_pr);
     write_files_and_hunks(&mut out, files, prepass, budget);
     out
@@ -720,6 +772,7 @@ impl RawOrder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use theodore_domain::grouping::SymbolLink;
     use theodore_domain::{DiffLine, FileDiff, FileStatus, Hunk, HunkId, LineKind, Sha};
 
     fn line(kind: LineKind, text: &str) -> DiffLine {
@@ -1224,5 +1277,53 @@ mod tests {
             "{user}"
         );
         assert!(!user.contains("al_audio.php ~ al_fans.php"), "{user}");
+    }
+
+    /// Code-intelligence links show hunk to hunk, one line per defining
+    /// hunk and symbol; a link to a hunk outside the prompt is left out,
+    /// and without links there is no section at all.
+    #[test]
+    fn symbol_links_are_listed_per_defining_hunk() {
+        let rev = Revision {
+            base: Sha::new("b"),
+            head: Sha::new("h"),
+            files: vec![
+                mk_file("src/cache.rs", vec![mk_hunk("c1", 2), mk_hunk("c2", 2)]),
+                mk_file("src/api.rs", vec![mk_hunk("a1", 2)]),
+            ],
+        };
+        let link = |from: &str, to: &str, symbol: &str| SymbolLink {
+            from: HunkId::new(from),
+            to: HunkId::new(to),
+            symbol: symbol.into(),
+        };
+        let ctx = RepoContext {
+            symbol_links: vec![
+                link("c1", "a1", "evict_older"),
+                link("c1", "c2", "evict_older"),
+                link("c2", "a1", "CacheKey"),
+                link("c2", "gone", "CacheKey"),
+            ],
+            ..RepoContext::default()
+        };
+        let prepass = crate::prepass::run(&rev);
+        let graph = RelGraph::build(&rev, &prepass, &ctx);
+        let chunks = build_prompts_with(
+            &PrMeta::default(),
+            &rev,
+            &prepass,
+            &graph,
+            &ctx,
+            &PromptBudget::default(),
+        );
+        let user = &chunks[0].prompt.user;
+        assert!(user.contains("\n# Symbol links\n"), "{user}");
+        assert!(user.contains("\n- c1 `evict_older` → a1, c2\n"), "{user}");
+        assert!(user.contains("\n- c2 `CacheKey` → a1\n"), "{user}");
+        assert!(!user.contains("gone"), "{user}");
+        assert!(user.find("# Symbol links") < user.find("# Files and hunks"));
+
+        let plain = build_prompts(&PrMeta::default(), &rev, &prepass, &PromptBudget::default());
+        assert!(!plain[0].prompt.user.contains("# Symbol links"));
     }
 }

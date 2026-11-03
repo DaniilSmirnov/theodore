@@ -20,6 +20,7 @@ theodore-grouping.workspace = true
 theodore-mcp.workspace = true
 theodore-git.workspace = true
 theodore-app.workspace = true
+theodore-code-intel.workspace = true
 theodore-host-github.workspace = true
 theodore-agents.workspace = true
 theodore-secrets.workspace = true

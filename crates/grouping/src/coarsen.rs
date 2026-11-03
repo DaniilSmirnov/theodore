@@ -23,6 +23,8 @@ use crate::graph::RelGraph;
 
 /// A group touching the tiny group's own file is related at least this much.
 pub(crate) const SAME_FILE: f64 = 2.0;
+/// Per code-intelligence link between the tiny group's hunk and a group's.
+pub(crate) const HUNK_LINK: f64 = 1.0;
 
 /// Merge tiny (<= 1 hunk) groups into their most related same-kind group
 /// (falling back to the nearest same-area one) until
@@ -121,12 +123,14 @@ fn tiny_group_indices(groups: &[Group]) -> Vec<usize> {
 /// How related group `g` is to the files of `victim`'s hunks: summed graph
 /// weight to each distinct file `g` touches (`SAME_FILE` for a shared one),
 /// so a big group isn't preferred just for having many hunks of one file.
+/// A code-intelligence link between a hunk of each adds `HUNK_LINK`: it
+/// tells apart two groups touching the same files.
 pub(crate) fn relatedness(graph: &RelGraph, victim: &Group, g: &Group) -> f64 {
     let files = |grp: &Group| -> std::collections::BTreeSet<usize> {
         grp.hunks.iter().filter_map(|h| graph.file_of(h)).collect()
     };
     let theirs = files(g);
-    files(victim)
+    let by_file: f64 = files(victim)
         .iter()
         .flat_map(|&v| {
             theirs.iter().map(move |&f| {
@@ -137,7 +141,8 @@ pub(crate) fn relatedness(graph: &RelGraph, victim: &Group, g: &Group) -> f64 {
                 }
             })
         })
-        .sum()
+        .sum();
+    by_file + graph.hunk_links_between(&victim.hunks, &g.hunks) as f64 * HUNK_LINK
 }
 
 /// The same-kind group most related to `victim` in the graph (ties: the
@@ -470,6 +475,39 @@ mod tests {
             .find(|g| g.id == GroupId::new("search"))
             .unwrap();
         assert_eq!(search.hunks.len(), 3);
+    }
+
+    /// Two groups touch the tiny group's file equally; a code-intelligence
+    /// link from its hunk to one of them decides, over reading order.
+    #[test]
+    fn a_symbol_link_breaks_a_tie_between_groups_of_the_same_file() {
+        let r = Revision {
+            base: Sha::new("b"),
+            head: Sha::new("h"),
+            files: vec![mk_file("src/cache.rs", &["c1", "c2", "c3", "c4"])],
+        };
+        let groups = vec![
+            mk_group("evict", GroupKind::Normal, &["c1"]),
+            mk_group("near", GroupKind::Normal, &["c2", "c3"]),
+            mk_group("far", GroupKind::Normal, &["c4"]),
+        ];
+        let plain = RelGraph::build(&r, &crate::prepass::run(&r), &Default::default());
+        let after = merge_tiny_groups(&r, groups.clone(), 2, &plain);
+        assert_eq!(after[0].id, GroupId::new("near"));
+
+        let ctx = theodore_domain::grouping::RepoContext {
+            symbol_links: vec![theodore_domain::grouping::SymbolLink {
+                from: HunkId::new("c4"),
+                to: HunkId::new("c1"),
+                symbol: "evict_older".into(),
+            }],
+            ..Default::default()
+        };
+        let linked = RelGraph::build(&r, &crate::prepass::run(&r), &ctx);
+        let after = merge_tiny_groups(&r, groups, 2, &linked);
+        let far = after.iter().find(|g| g.id.0 == "far").expect("far kept");
+        assert_eq!(far.hunks, vec![HunkId::new("c4"), HunkId::new("c1")]);
+        assert!(grouping::validate(&r, &groups_for(&r, after)).is_ok());
     }
 
     #[test]

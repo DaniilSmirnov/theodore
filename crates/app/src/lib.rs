@@ -84,6 +84,7 @@ pub use error::{AppError, AppResult, GrouperError};
 pub use snapshot::PrSnapshot;
 pub use usecases::account::{AccountGate, resolve_client_id};
 pub use usecases::code_intel::{CodeEdits, CodeScope, LspPolicy};
+pub use usecases::grouping::{SymbolLinkLimits, symbol_links};
 pub use usecases::open_pr::parse_pr_ref;
 pub use usecases::spaces::space_chat_key;
 pub use usecases::telemetry::TelemetrySettings;

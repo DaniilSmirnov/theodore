@@ -47,6 +47,7 @@ after    diff (+ head files, + git history when a worktree exists)
 | name root after stripping role suffixes; folder name for index files | paths | `0.8 / (files − 1)`, groups of 2–8 |
 | test ↔ source with the same root | paths | `+0.5` |
 | co-change: Jaccard over the last 1000 commits before the base, ≥ 2 shared, commits touching > 12 files ignored | git (app only) | `1.5 × Jaccard` |
+| symbol link: a hunk defines `X`, another changed hunk uses it (code intelligence, [symbol-links.md](symbol-links.md)) | code intelligence (app; eval with `--symbol-links`) | `1` per distinct symbol, capped at 2; also hunk-level, in prompts and coarsening |
 
 Hubs are files linked by import, file-name mention or shared symbol to more than
 `max(10, 2·√n)` others. Examples from the fixtures: `lib/al.lib.php` defines
