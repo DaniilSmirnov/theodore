@@ -1199,12 +1199,23 @@ function FileBlockInner({
   }
   const foldTo = (closed: boolean) =>
     setFold({ closed, viewed: isViewed, arrival });
+  // Where focus was when Viewed last flipped: a file marked Viewed while
+  // one of its hunks has focus (a click in it, J/K, `V`) still folds; only
+  // a jump after that opens it. On mount nothing is "seen" yet, so a jump
+  // that brings a Viewed file into view opens it.
+  const [seen, setSeen] = useState<{
+    viewed: boolean;
+    arrival: string | null;
+  }>({ viewed: isViewed, arrival: null });
+  if (seen.viewed !== isViewed) setSeen({ viewed: isViewed, arrival });
+  const jumpedIn = arrival !== null && arrival !== seen.arrival;
   const md = isMarkdown(file.path) && file.status !== 'deleted';
   const [preview, setPreview] = useState(false);
   const generatedFlag = file.flags.find((f) => f.kind === 'generated');
   const collapsedFile = fold
     ? fold.closed
-    : (!!generatedFlag || file.status === 'deleted' || isViewed) && !arrival;
+    : ((!!generatedFlag || file.status === 'deleted') && !arrival) ||
+      (isViewed && !jumpedIn);
   // Built when the menu opens, not on every render.
   const fileMenu = (e: React.MouseEvent) =>
     contextMenuHandler(store.ui, (): ContextMenuItem[] => {
