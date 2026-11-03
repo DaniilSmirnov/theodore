@@ -39,6 +39,7 @@ import {
 import { observer } from 'mobx-react-lite';
 import type {
   AgentId,
+  FileDiff,
   HunkId,
   ShipAction,
   SkillInfo,
@@ -81,6 +82,7 @@ import { GlobalConfigSection, SpaceSetupAssistHint } from './ConfigSection';
 import { SpaceProgress } from './SpaceProgress';
 import { BaseMoved, UpdatingBanner } from './BaseUpdate';
 import { MergedBanner, SpaceMergeButton, SpacePrPane } from './SpacePr';
+import { BackToHere, revertItems } from './SpaceRewind';
 import {
   CheckChip,
   LogsDrawer,
@@ -1012,13 +1014,14 @@ export const SpaceChat = observer(function SpaceChat({
           const undoHere =
             undo.turn?.reply === m.id && space.status !== 'archived';
           const plan = agent && plans.has(m.id) && !undoneReply;
+          const backHere = agent && !undoneReply && !undoHere;
           return (
             <ChatMessage
               key={m.id}
               m={m}
               className={undone.has(m.id) ? 'space-undone opacity-50' : ''}
               badges={
-                undoneReply || undoHere || plan ? (
+                undoneReply || undoHere || backHere || plan ? (
                   <>
                     {plan && (
                       <span className="space-plan-badge rounded-full bg-default px-1.5 text-[10px] text-accent">
@@ -1036,6 +1039,7 @@ export const SpaceChat = observer(function SpaceChat({
                         reason={undo.ok ? null : undo.reason}
                       />
                     )}
+                    {backHere && <BackToHere space={space} reply={m.id} />}
                   </>
                 ) : undefined
               }
@@ -1184,6 +1188,11 @@ const SpaceChanges = observer(function SpaceChanges({
   const [focusHunk, setFocusHunk] = useState<HunkId | null>(null);
   const [composer, setComposer] = useState<ComposerState | null>(null);
   const setMode = useMemo(() => () => {}, []);
+  // Read when a file's menu opens, so the space's state is current then.
+  const fileItems = useMemo(
+    () => (file: FileDiff) => revertItems(space, file),
+    [space],
+  );
   const rev = revision?.status === 'ready' ? revision.data : null;
   return (
     <>
@@ -1196,7 +1205,7 @@ const SpaceChanges = observer(function SpaceChanges({
           {space.turns ? `after turn ${space.turns}` : 'no turns yet'}
         </span>
         {space.status === 'running' && (
-          <span>· refreshes when the turn ends</span>
+          <span>· live, follows the agent's edits</span>
         )}
       </div>
       {!review || !summary || !revision ? (
@@ -1231,6 +1240,7 @@ const SpaceChanges = observer(function SpaceChanges({
           setComposer={setComposer}
           nextGroup={false}
           askAi={false}
+          fileItems={fileItems}
         />
       )}
     </>

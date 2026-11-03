@@ -354,21 +354,42 @@ export type UndoState =
   | { ok: false; turn: SpaceTurn | null; reason: string };
 
 /** What "Undo last turn" would undo — the last turn not undone yet — or
- *  why it can't. Mirrors the core's rules (`undoable_turn`): not while
+ *  why it can't. Mirrors the core's rules (`rewindable`): not while
  *  running, not archived, not once the turn shipped. */
-export function undoState(
-  s: Pick<Space, 'status' | 'turn_log' | 'head_sha' | 'shipped' | 'base_sha'>,
-): UndoState {
+export function undoState(s: RewindFields): UndoState {
   const log = s.turn_log ?? [];
+  const i = lastLive(log);
+  const turn = i >= 0 ? log[i]! : null;
+  const reason = rewindReason(s, i);
+  return reason == null && turn
+    ? { ok: true, turn }
+    : { ok: false, turn, reason: reason ?? 'No turn to undo' };
+}
+
+type RewindFields = Pick<
+  Space,
+  'status' | 'turn_log' | 'head_sha' | 'shipped' | 'base_sha'
+> &
+  Partial<Pick<Space, 'updating'>>;
+
+function lastLive(log: SpaceTurn[]): number {
   let i = log.length - 1;
   while (i >= 0 && log[i]!.undone) i--;
-  const turn = i >= 0 ? log[i]! : null;
-  const no = (reason: string): UndoState => ({ ok: false, turn, reason });
-  if (s.status === 'running') return no('The agent is still working');
-  if (s.status === 'archived') return no('Archived');
-  if (!turn) return no('No turn to undo');
-  if (turn.after !== s.head_sha) {
-    return no('The space moved since its last turn');
+  return i;
+}
+
+/** Why the space can't go back to where `turn_log[i]` started (it and
+ *  every later turn undone), or `null` when it can — the core's
+ *  `rewindable`. */
+function rewindReason(s: RewindFields, i: number): string | null {
+  const log = s.turn_log ?? [];
+  if (s.status === 'running') return 'The agent is still working';
+  if (s.status === 'archived') return 'Archived';
+  if (s.updating) return 'Finish or abort the update from base first';
+  const last = lastLive(log);
+  if (i < 0 || last < 0) return 'No turn to undo';
+  if (log[last]!.after !== s.head_sha) {
+    return 'The space moved since its last turn';
   }
   const shipped = s.shipped;
   if (shipped) {
@@ -377,7 +398,7 @@ export function undoState(
       .filter((t) => !t.undone)
       .flatMap((t) => [t.before, t.after]);
     const beforeTurn =
-      shipped.head === turn.before ||
+      shipped.head === log[i]!.before ||
       shipped.head === s.base_sha ||
       earlier.includes(shipped.head);
     if (!beforeTurn) {
@@ -387,10 +408,37 @@ export function undoState(
           : shipped.how === 'merged_locally'
             ? 'Already merged'
             : 'Already written as a branch';
-      return no(`${what} — ask the agent to revert it instead`);
+      return `${what} — ask the agent to revert it instead`;
     }
   }
-  return { ok: true, turn };
+  return null;
+}
+
+/** "Back to here" on the reply of a live turn that isn't the last one:
+ *  `null` when there is nothing after it to undo; else whether it can go
+ *  back (`reason` says why not). */
+export function rewindState(
+  s: RewindFields,
+  reply: string,
+): { ok: boolean; reason: string | null } | null {
+  const log = s.turn_log ?? [];
+  const k = log.findIndex((t) => t.reply === reply && !t.undone);
+  if (k < 0) return null;
+  const i = log.findIndex((t, j) => j > k && !t.undone);
+  if (i < 0) return null;
+  const reason = rewindReason(s, i);
+  return { ok: reason == null, reason };
+}
+
+/** The last agent turn not undone, which "Revert the last turn's change"
+ *  restores a file from; `null` when there is none. */
+export function lastAgentTurn(s: Pick<Space, 'turn_log'>): SpaceTurn | null {
+  const log = s.turn_log ?? [];
+  for (let i = log.length - 1; i >= 0; i--) {
+    const t = log[i]!;
+    if (!t.undone && !(t.reverted ?? []).length) return t;
+  }
+  return null;
 }
 
 /** Message ids (yours and the agent's) of the space's undone turns. */

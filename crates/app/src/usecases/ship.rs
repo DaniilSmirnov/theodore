@@ -118,6 +118,9 @@ impl Core {
 
         let repo_path = self.ensure_project_cache(&project).await?;
         // Edits made by hand in the worktree since the last turn ship too.
+        // A checkpoint is a snapshot (docs/spaces.md §6): its tree is what
+        // ships, whatever the agent committed itself or left uncommitted.
+        let mut worktree_head = space.worktree_head.clone();
         let head = if Path::new(&space.worktree).exists() {
             let saved = self
                 .0
@@ -130,7 +133,10 @@ impl Core {
                 )
                 .await;
             match saved {
-                Ok(head) => head,
+                Ok(cp) => {
+                    worktree_head = Some(cp.head);
+                    cp.sha
+                }
                 // Its `.git` is gone: the last checkpoint is what ships.
                 Err(GitError::NotAWorktree(_)) => space.head_sha.clone(),
                 // A rebase or conflict mid-way: nothing half-done ships.
@@ -140,9 +146,10 @@ impl Core {
             space.head_sha.clone()
         };
         if head != space.head_sha {
-            self.apply(vec![
-                self.patch(&space.id, serde_json::json!({ "head_sha": head })),
-            ])
+            self.apply(vec![self.patch(
+                &space.id,
+                serde_json::json!({ "head_sha": head, "worktree_head": worktree_head }),
+            )])
             .await?;
         }
         if head == space.base_sha {

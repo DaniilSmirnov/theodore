@@ -107,6 +107,7 @@ async fn checkpoint(e: &Env, space: &str, base: &Sha, edit: impl FnOnce(&Path)) 
         .space_checkpoint(&wt.path, space, "turn")
         .await
         .unwrap()
+        .sha
 }
 
 /// `mirror_sync`, folding its result into the running set of touched

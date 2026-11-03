@@ -7,6 +7,8 @@ import {
   nativeNotice,
   notifyOn,
   spaceOfReview,
+  lastAgentTurn,
+  rewindState,
   undoState,
   undoneMessages,
   waitingSpaces,
@@ -149,6 +151,55 @@ describe('undo last turn', () => {
     });
     expect([...undoneMessages(s)].sort()).toEqual(['m2', 'r2']);
     expect(undoneMessages(space({ id: 'x' })).size).toBe(0);
+  });
+});
+
+describe('back to here', () => {
+  const three = [...twoTurns, turn(3, 't2', 't3')];
+
+  it('offers every live reply but the last, with the core’s refusals', () => {
+    const s = space({ id: 's', head_sha: 't3', turn_log: three });
+    expect(rewindState(s, 'r1')).toEqual({ ok: true, reason: null });
+    expect(rewindState(s, 'r2')).toEqual({ ok: true, reason: null });
+    expect(rewindState(s, 'r3')).toBeNull();
+    expect(rewindState(s, 'nope')).toBeNull();
+    const running = space({ ...s, status: 'running' });
+    expect(rewindState(running, 'r1')).toMatchObject({
+      ok: false,
+      reason: /still working/,
+    });
+    // Shipped at turn 2: back to turn 2 is fine, back to turn 1 isn't.
+    const shipped = space({
+      ...s,
+      shipped: {
+        how: 'pr',
+        branch: 'space/s',
+        sha: 'squash',
+        head: 't2',
+        pushes: 1,
+        at: 0,
+      },
+    });
+    expect(rewindState(shipped, 'r2')?.ok).toBe(true);
+    expect(rewindState(shipped, 'r1')).toMatchObject({
+      ok: false,
+      reason: /Already pushed/,
+    });
+  });
+
+  it('skips undone turns', () => {
+    const log = [three[0]!, three[1]!, { ...three[2]!, undone: true }];
+    const s = space({ id: 's', head_sha: 't2', turn_log: log });
+    expect(rewindState(s, 'r2')).toBeNull();
+    expect(rewindState(s, 'r3')).toBeNull();
+    expect(rewindState(s, 'r1')?.ok).toBe(true);
+  });
+
+  it('reverts a file from the last agent turn, not from a revert', () => {
+    const revert = { ...turn(3, 't2', 'rev'), reply: 'm3', reverted: ['a'] };
+    const s = space({ id: 's', turn_log: [...twoTurns, revert] });
+    expect(lastAgentTurn(s)).toEqual(twoTurns[1]);
+    expect(lastAgentTurn(space({ id: 'x' }))).toBeNull();
   });
 });
 

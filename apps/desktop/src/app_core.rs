@@ -1000,6 +1000,18 @@ impl CoreApi for AppCore {
     ) -> Result<theodore_contract::Space, CommandError> {
         self.core.undo_space_turn(&space).await.map_err(err)
     }
+    async fn rewind_space(
+        &self,
+        req: theodore_contract::RewindSpaceRequest,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        self.core.rewind_space(req).await.map_err(err)
+    }
+    async fn revert_space_file(
+        &self,
+        req: theodore_contract::RevertSpaceFileRequest,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        self.core.revert_space_file(req).await.map_err(err)
+    }
     async fn unarchive_space(
         &self,
         space: String,

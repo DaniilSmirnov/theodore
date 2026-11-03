@@ -31,6 +31,8 @@ mod project_state;
 pub use project_state::*;
 mod space_progress;
 pub use space_progress::*;
+mod space_checkpoints;
+pub use space_checkpoints::*;
 mod spaces;
 pub use spaces::*;
 mod space_queue;
@@ -852,6 +854,9 @@ pub fn types() -> specta::Types {
         .register::<MergeSpaceResult>()
         .register::<SpaceRound>()
         .register::<SpaceTurn>()
+        .register::<RewindSpaceRequest>()
+        .register::<SpaceRevertFrom>()
+        .register::<RevertSpaceFileRequest>()
         .register::<AgentSession>()
         .register::<SpaceFeedback>()
         .register::<SpaceFeedbackRequest>()

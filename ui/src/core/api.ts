@@ -68,6 +68,8 @@ import type {
   CreateSpaceRequest,
   MergeSpaceRequest,
   MergeSpaceResult,
+  RevertSpaceFileRequest,
+  RewindSpaceRequest,
   ShipSpaceRequest,
   Space,
   SpaceBaseStatus,
@@ -315,6 +317,12 @@ export const api = {
     call<MergeSpaceResult>('merge_space', { req }),
   /** Continue after merge: a new branch on the base's fresh tip (§7). */
   continueSpace: (space: string) => call<Space>('continue_space', { space }),
+  /** "Back to here": later turns undone (docs/spaces.md §3). */
+  rewindSpace: (req: RewindSpaceRequest) =>
+    call<Space>('rewind_space', { req }),
+  /** Revert a file of the space's diff, as an undoable entry. */
+  revertSpaceFile: (req: RevertSpaceFileRequest) =>
+    call<Space>('revert_space_file', { req }),
   unarchiveSpace: (space: string) => call<Space>('unarchive_space', { space }),
   /** Pin/unpin a space: pinned ones sort first (docs/spaces.md §3). */
   setSpacePinned: (req: SetSpacePinnedRequest) =>

@@ -48,16 +48,18 @@ you                         Theodore core                              agent CLI
 New space "fix-login"  ──▶  worktree ~/.theodore/spaces/<id> @ main
 "make the redirect…"   ──▶  chat_message(me) · status=running ──spawn─▶ edits in cwd
    ◀── streaming text ────  Ephemeral AgentDelta ◀────────────────────── stream
-                            turn ends: git add -A · commit "turn 1"
+   ◀── live diff ─────────  every 3 s, if files changed: snapshot ─▶ review head (no ref)
+                            turn ends: snapshot "turn 1" on HEAD (temp index)
                             refs/theodore/spaces/<id> ─▶ checkpoint
-   ◀── live diff ─────────  branch review row (base...checkpoint), no grouping
+   ◀── diff ──────────────  branch review row (base...checkpoint), no grouping
 Review ▸               ──▶  same review, grouped by meaning (existing pipeline)
 comment on a line      ──▶  draft ─▶ "Send to agent" ─▶ next turn ─▶ checkpoint 2
 Open PR                ──▶  squash checkpoints ─▶ one commit by you
                             push it to <login>/fix-login ─▶ outbox create_space_pr
                             space.pr = github:o/r#123 ─▶ PR row, inbox, polling
 reviewer comments      ──▶  thread ─▶ "Send to agent" ─▶ turn ─▶ Push ─▶ PR updated
-not what you wanted    ──▶  "Undo" ─▶ worktree + ref back to the previous checkpoint
+not what you wanted    ──▶  "Undo" / "Back to here" ─▶ HEAD + changed files + ref back
+one file wrong         ──▶  "Revert to base" ─▶ that file restored ─▶ checkpoint
 Merge                  ──▶  merge_space ─▶ outbox merge_pr (now · auto-merge · queue)
 merged                 ──▶  space.done_at ─▶ archive after spaces.auto_archive_days
 Continue               ──▶  fetch base ─▶ <login>/fix-login-2 on its tip ─▶ drafting again
@@ -222,7 +224,20 @@ optional note on top of what's picked or typed, rather than required.
 ### Space page — drafting
 
 Chat left, changes right. The diff is the whole branch vs its base, the same
-`DiffPane` the review uses, refreshed after every turn.
+`DiffPane` the review uses. While a turn runs it follows the agent's edits
+(below); when the turn ends, its checkpoint replaces that.
+
+```
+turn runs ─▶ every 3 s: space_fingerprint (HEAD + `status` + size/mtime)
+               ├─ same ─▶ nothing
+               └─ changed ─▶ space_snapshot (temp index, no ref)
+                               ├─ same commit ─▶ nothing
+                               └─ new ─▶ review head = snapshot ─▶ diff refreshes
+turn ends ─▶ live diff stopped ─▶ checkpoint ─▶ review head = checkpoint
+```
+
+A live snapshot is never a checkpoint: no ref, no `turn_log` entry; the
+worktree's index isn't written (`status --no-optional-locks`).
 
 ```
 ┌ ◐ fix-login-redirect ── ada/fix-login-redirect ← main ── Drafting ── $0.42 / $5.00 ┐
@@ -275,19 +290,38 @@ save_attachment ──▶ id ──▶ space_send { attachments: [id] }
 Later turns name an earlier message's files — `(attached: shot.png)` — but
 don't send them again.
 
-**Undo last turn**: the Undo button on the agent's last reply (and ⌘K "Undo
-last turn") moves the worktree and the checkpoint ref back to where that
-turn started. The turn stays in the chat, dimmed and marked *undone*, and the
-next turns' prompts leave it out. Pressing it again walks back one more turn.
-Refused while a turn runs, on an archived space, and once the turn shipped
-(pushed, merged locally, or kept as a branch) — then ask the agent to revert
-it instead.
+**Undo, rewind, revert**
+
+| Where | Does |
+| --- | --- |
+| Undo on the last reply (⌘K "Undo last turn") | back to where that turn started; again walks back one more |
+| "Back to here" on an earlier reply | back to right after that turn: every later one at once |
+| a file's menu in the diff → "Revert to base" | that file as in the base |
+| a file's menu → "Revert the last turn's change" | that file as before the last agent turn |
 
 ```
-turn 1 ─▶ ckpt A ─▶ turn 2 ─▶ ckpt B          Undo: worktree + ref → A
-                                │              turn 2 kept, marked undone
-                                └─ shipped? ── refused
+turn 1 ─▶ ckpt A ─▶ turn 2 ─▶ ckpt B ─▶ turn 3 ─▶ ckpt C
+Undo                                     turn 3 undone       ─▶ space at B
+Back to here on turn 1      turn 2, 3 undone                 ─▶ space at A
+any of them over a shipped turn ─▶ refused
+Revert a.ts ─▶ a.ts restored ─▶ ckpt D, a turn_log entry of its own (Undo brings a.ts back)
+             └▶ next prompt: "The user reverted `a.ts` since your last turn; don't redo
+                that change unless asked."
 ```
+
+- Undone turns stay in the chat, dimmed and marked *undone*; the next
+  turns' prompts leave them out.
+- Going back restores `HEAD` (as the agent left it then) and rewrites only
+  the files whose content differs; untracked files that weren't there go,
+  ignored ones (deps, build output) stay. A dev server watching the
+  worktree sees only what changed (§6).
+- A revert shows in the chat as your message ("Reverted `a.ts` to the
+  base."); Undo sits on it like on a turn.
+- Refused while a turn runs, on an archived space, with a rebase or merge
+  unfinished in the worktree, and once the turn shipped (pushed, merged
+  locally, or kept as a branch) — then ask the agent to revert it instead.
+  A revert is refused while a turn runs, on an archived space, and when the
+  file already is as asked.
 
 **Update from base**: when the base branch has commits the space doesn't,
 the header shows *Base moved: 3 commits behind · Update* (counted from the
@@ -310,7 +344,7 @@ a.ts, b.ts* replaces the button and the agent gets a turn to resolve them.
 | Complete merge | the same check now, for files fixed by hand; says which files still have markers |
 | Abort | `merge --abort`, worktree and ref back to where the update started, old base |
 
-While it resolves: Ship and Undo are refused ("finish or abort the update
+While it resolves: Ship, Undo, Back to here and Revert are refused ("finish or abort the update
 from base first"), a plain message is a normal turn whose end tries the
 merge again. Undo of the turn that completed the merge takes the merge back
 too, base included; a clean update is not a turn, so Undo stops at it. The
@@ -555,9 +589,9 @@ remaining prompts and limits.
     (below). Either way it is the same ship, with the same guarantees.
   - The prompt tells the agent to stay in its directory, to ship only
     through `ship`, and never to run `git push`, `gh pr create` or switch
-    branches itself. After each turn Theodore points the space ref at
-    whatever `HEAD` is; a `HEAD` that no longer descends from the base is
-    flagged instead of silently recorded.
+    branches itself. After each turn Theodore points the space ref at a
+    snapshot on whatever `HEAD` is; the agent's own commits stay as it
+    made them.
   - Theodore's secrets are stripped from the agent env (existing).
   - Every git command Theodore runs in the worktree first checks that git
     resolves exactly that worktree (§6 "Worktree guard"); otherwise nothing
@@ -640,7 +674,7 @@ gone?  ─▶ "No conversation found" / "no rollout found"
 | same agent, same worktree | yes; the model and mode may change (flags are per run) |
 | another agent | no: new session from the replayed transcript (last 12 messages) |
 | Gemini | never: it has no resume, every turn replays the transcript |
-| after Undo last turn | no: the session holds the undone turn; the replay leaves it out |
+| after Undo or Back to here | no: the session holds the undone turns; the replay leaves them out |
 | after unarchive | yes (the worktree path is the same); no if the checkpoints were gone |
 | the resumed run failed for another reason | the session stays for the next turn |
 
@@ -722,11 +756,17 @@ Details, limits and errors: `docs/config.md` §7.
 ```
 ~/.theodore/repos/<host>/<owner>/<repo>.git    bare cache
    ├─ refs/heads/*                ◀── force-fetched from the remote, pruned
-   └─ refs/theodore/spaces/<id>   ──▶ last checkpoint   (Theodore's own ref)
-~/.theodore/spaces/<id>/          detached worktree at the checkpoint + live edits
+   ├─ refs/theodore/spaces/<id>   ──▶ last checkpoint   (Theodore's own ref)
+   └─ refs/theodore/checkpoints/<id>/<sha>  every checkpoint, kept from gc
+~/.theodore/spaces/<id>/          detached worktree: the agent's HEAD + uncommitted edits
 
-turn ends ─▶ git add -A ─▶ commit "turn N" ─▶ update-ref refs/theodore/spaces/<id> HEAD
-Update    ─▶ fetch ─▶ checkpoint ─▶ git merge <base tip> in the worktree ─▶ base_sha = tip
+turn ends ─▶ index ─copy─▶ temp index ─add -A─▶ write-tree ─▶ commit-tree -p HEAD "turn N"
+          ─▶ update-ref refs/theodore/spaces/<id> + refs/theodore/checkpoints/<id>/<sha>
+             (HEAD, branch and index untouched; same tree on same HEAD = same checkpoint)
+Undo      ─▶ diff-tree <worktree now> <checkpoint> ─▶ rm what it lacks,
+             checkout-index (temp index) what differs ─▶ reset --mixed <its HEAD> ─▶ ref
+Update    ─▶ fetch ─▶ checkpoint ─▶ uncommitted edits become HEAD (mixed reset to that
+             checkpoint, no file written) ─▶ git merge <base tip> ─▶ base_sha = tip
 Ship      ─▶ commit-tree <checkpoint tree> -p <base> (author: you) ─▶ refs/theodore/shipped/<id>
 Open PR   ─▶ git push origin <shipped>:refs/heads/<login>/<slug>   (never forced)
 Push      ─▶ commit-tree <checkpoint tree> -p <last shipped> [-p <base tip merged since>] ─▶ push (fast-forward)
@@ -734,7 +774,8 @@ Merge     ─▶ (local folder) fetch <cache> <shipped ref> ─▶ git merge int
 Keep      ─▶ (local folder) fetch <cache> <shipped ref>:refs/heads/space/<slug>
 Keep      ─▶ (local folder) git -C <folder> fetch <cache> <ref>:refs/heads/<branch>
 Continue  ─▶ ls-remote + fetch <base> ─▶ tip ─▶ (turns not pushed) commit-tree 3-way onto tip
-          ─▶ reset --hard + clean -fd the worktree, update-ref refs/theodore/spaces/<id>
+          ─▶ as Undo: HEAD = tip (mixed reset), files = that commit (only what differs),
+             the unpushed turns uncommitted on it; update-ref refs/theodore/spaces/<id>
 ```
 
 Why detached plus a private ref, not a real branch in the cache:
@@ -745,10 +786,28 @@ Why detached plus a private ref, not a real branch in the cache:
 | be deleted before it is pushed | the same fetch runs with `--prune` |
 
 Every turn is a commit, so the diff is commit-to-commit (cacheable, same as a
-PR's revisions), "undo last turn" is a ref move plus `reset --hard` and
-`clean -fd` in the worktree (ignored files such as installed deps stay), and the agent's own
-`git commit`s are simply kept. Checkpoints are authored by Theodore and never
-leave the cache; what ships is one squashed commit authored by you (§12 #2).
+PR's revisions). A checkpoint is a snapshot, not a commit in the worktree:
+
+| | Commit in the worktree (before) | Snapshot (now) |
+| --- | --- | --- |
+| `HEAD`, branch, index | moved, rewritten | as the agent left them |
+| the agent's own commits | folded into "turn N" | kept as it made them |
+| `turn_log` | `before` / `after` | + `before_head` / `after_head` (the `HEAD` under each) |
+| Undo | `reset --hard` + `clean -fd`: every file touched | mixed reset + only the files that differ |
+| unchanged file's mtime | bumped | kept |
+
+Update from base is the one step that moves `HEAD`: the edits so far
+become a commit (the checkpoint itself) and the merge goes on top, so a
+turn that completed it records the merge commit as both `after` and
+`after_head`.
+Old checkpoints are commits that were `HEAD`, so a `turn_log` entry without
+heads goes back with `HEAD` = the checkpoint itself; nothing is rewritten.
+Shipping squashes the checkpoint's tree, so it ships both kinds the same
+way. Each snapshot's parent is `HEAD`, not the checkpoint before it, so
+`refs/theodore/checkpoints/<id>/<sha>` keeps every one reachable for Undo
+and Push. A worktree recreated from the ref (unarchive) starts with `HEAD`
+at the checkpoint. Checkpoints are authored by Theodore and never leave the
+cache; what ships is one squashed commit authored by you (§12 #2).
 
 **Worktree guard** (checkpoint, Undo, the busy check, reopen, archive):
 
@@ -793,7 +852,8 @@ still squashes):
 
 ```
 Update ─▶ fetch the base ─▶ tip == base_sha? ─▶ "already up to date"
-  └─▶ checkpoint "edits before updating from main" (= from)
+  └─▶ checkpoint "edits before updating from main" (= from, a snapshot)
+      └─▶ mixed reset to from: its edits become HEAD's own, no file written
       └─▶ git merge --no-edit --ff <tip>   (Theodore's identity, no hooks, merge.conflictStyle=diff3)
             ├─ clean ─────▶ merge commit = checkpoint "merge main" ─▶ base_sha = tip ─▶ diff vs tip
             └─ conflicts ─▶ merge left in progress, space.updating = { base_tip, from, conflicts, started_at }
@@ -954,7 +1014,8 @@ New synced model `space` (core-owned, written only by commands):
 | `usage`, `turns`, `error`, `created_at`, `updated_at` | |
 | `shipped` | the last ship: `how` (`pr · merged_locally · branch`), `branch`, `sha` (the squashed commit), `head` (the checkpoint it came from — later turns are "not pushed"), `pushes`, `at` |
 | `done_at` | set when the PR merges (seen by the poller's spaces sweep) or on Merge locally / Keep as branch; cleared by Continue |
-| `turn_log` | per turn: your message and the reply (`chat_message` ids), messages steered into it (`steered`), checkpoint `before` / `after`, `undone`; `base_before` when the turn completed an Update from base (Undo puts that base back) |
+| `turn_log` | per turn: your message and the reply (`chat_message` ids), messages steered into it (`steered`), checkpoint `before` / `after` and the worktree's `HEAD` under each (`before_head` / `after_head`, none on old entries), `undone`; `base_before` when the turn completed an Update from base (Undo puts that base back); a Revert is an entry too, with `reverted` paths and its own message as `reply` |
+| `worktree_head` | the worktree's `HEAD` under `head_sha` (none: `head_sha` is `HEAD`) |
 | `title` | the chat agent's proposed title (§3 "New space"); `None` until it lands |
 | `handoff_summary` | the earlier conversation, summarized once and cached (§5 "One session per space") |
 | `progress` | the running turn's tracker (`update_progress`): `steps` (label, `pending · active · done`), `note`, `at`; `null` once the turn ends |
@@ -1119,6 +1180,8 @@ downloaded to this Mac yet".
 | `unarchive_space` | recreate the worktree from the ref, reopen the live diff |
 | `undo_space_turn` | worktree and ref back to the last live turn's `before`; the turn is marked undone |
 | `set_space_pinned` | `space.pinned`; pinned spaces sort first (sidebar, ⌘K) — never touches `updated_at` |
+| `rewind_space` | "Back to here": back to right after the turn of `reply`; every later turn undone |
+| `revert_space_file` | `paths` as in the base (`from: base`) or before the last agent turn (`last_turn`); checkpointed as a `turn_log` entry; the next prompt says so |
 | `space_send_feedback` | threads / drafts / findings of the space's PR or own review, quoted as one turn |
 | `space_base_status` | the base's tip in the copy on this Mac and how many commits the space is behind it; no network |
 | `update_space_from_base` | merge the base's tip into the space (§6); while `updating`, complete that merge if no markers are left |
@@ -1157,7 +1220,7 @@ no row, or `true`, means on. The flag forces them on and locks the switch.
 
 | Phase | Scope |
 | --- | --- |
-| **Built** | `space` model; create / send / stop / review / archive; transcript in chat rows; checkpoint per turn; sidebar section; space page with chat + diff; Review opens the grouped review; crash → failed. Shipping: squash into one commit by you; Open PR / Open as draft (`HostAdapter::create_pr` + `find_open_pr` on GitHub, GitLab, Bitbucket, sandbox and fixtures, through the outbox, idempotent by head branch) and Push (never forced); branch `<login>/<slug>`; Merge locally and Keep as branch for local folders; modes Ask / Edit / Run; Archive button and `spaces.auto_archive_days`. "Send to agent" on a space PR's / own review's threads, drafts and findings; Undo last turn (`turn_log`); Unarchive; one agent session per space (Claude Code `--resume`, Codex `exec resume`); background notifications and the dock badge (`spaces.notify`); names transliterated from Cyrillic and accented goals, `-2` for repeats; a chat-agent-proposed name and title in the background, never delaying turn 1 (`space_naming`); a cached, once-generated handoff summary for a space that outgrows the replayed window (`space_handoff`); `setup` / `run` / `check` / `archive` from the project config (`docs/config.md`) with logs and Open app; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; the agent's `space-tools` for the change: `ship`, `get_space_diff`, `get_review_comments`, `add_review_comment`, `set_base`, `update_progress` (the tracker above the composer); mirroring into a local folder's own working tree — on / Sync now / off with Discard, at most one per folder, paused (not auto-written) across a restart (§6 "Mirror into a local folder") |
+| **Built** | `space` model; create / send / stop / review / archive; transcript in chat rows; checkpoint per turn; sidebar section; space page with chat + diff; Review opens the grouped review; crash → failed. Shipping: squash into one commit by you; Open PR / Open as draft (`HostAdapter::create_pr` + `find_open_pr` on GitHub, GitLab, Bitbucket, sandbox and fixtures, through the outbox, idempotent by head branch) and Push (never forced); branch `<login>/<slug>`; Merge locally and Keep as branch for local folders; modes Ask / Edit / Run; Archive button and `spaces.auto_archive_days`. "Send to agent" on a space PR's / own review's threads, drafts and findings; Undo last turn (`turn_log`); Unarchive; one agent session per space (Claude Code `--resume`, Codex `exec resume`); background notifications and the dock badge (`spaces.notify`); names transliterated from Cyrillic and accented goals, `-2` for repeats; a chat-agent-proposed name and title in the background, never delaying turn 1 (`space_naming`); a cached, once-generated handoff summary for a space that outgrows the replayed window (`space_handoff`); `setup` / `run` / `check` / `archive` from the project config (`docs/config.md`) with logs and Open app; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; the agent's `space-tools` for the change: `ship`, `get_space_diff`, `get_review_comments`, `add_review_comment`, `set_base`, `update_progress` (the tracker above the composer); mirroring into a local folder's own working tree — on / Sync now / off with Discard, at most one per folder, paused (not auto-written) across a restart (§6 "Mirror into a local folder"); `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; the agent's `space-tools` for the change: `ship`, `get_space_diff`, `get_review_comments`, `add_review_comment`, `set_base`, `update_progress` (the tracker above the composer) |
 | **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel`; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent" |
 | **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel`; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent" |
 | **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel`; interactive terminal tabs (§3 "Terminal") over a real PTY, surviving navigation, closed on archive / app quit |
@@ -1169,6 +1232,8 @@ no row, or `true`, means on. The flag forces them on and locks the switch.
 | **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; `max_parallel`; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent"; Update from base (merge, never rebase): "Base moved: N commits behind", conflicts resolved by an agent turn, Complete merge / Abort; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent" for setup; "Fix with agent" on the Checks tab, sending a failing check's log (GitHub Actions) or link as one turn; `copy` and `ports` default to `.env*` and 2 with zero config; "Set up with agent" and "Fix with agent" |
 | **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel` |
 | **Later** | OS sandbox for agents; live diff during a turn (snapshot the working tree through a temporary index); signed shipped commits; spaces started from an issue or a failing check; several agents racing one goal, pick the best diff |
+| **v2** | My PRs "Drafting" group and the sidebar's `⎇ #n` glyph; "Send all to agent" footer and feedback tracked as tasks; Threads / Checks tabs on the space page; `space_run` rows and per-turn diffs; Delete and ref GC; queue + `max_parallel` |
+| **Later** | OS sandbox for agents; signed shipped commits; spaces started from an issue or a failing check; several agents racing one goal, pick the best diff |
 
 ## 12. Decisions (owner, 2026-10-21)
 

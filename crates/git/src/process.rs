@@ -109,11 +109,12 @@ impl GitProc<'_> {
     }
 
     /// `run` below `ceiling`, with extra variables on the child
-    /// (`GIT_INDEX_FILE` for a snapshot through a temporary index).
+    /// (`GIT_INDEX_FILE` for a snapshot through a temporary index, commit
+    /// dates).
     pub(crate) async fn run_env_below(
         &self,
         ceiling: &Path,
-        env: &[(&str, &Path)],
+        env: &[(&str, &std::ffi::OsStr)],
     ) -> GitResult<Vec<u8>> {
         let mut cmd = self.command_below(Some(ceiling));
         cmd.envs(env.iter().copied());

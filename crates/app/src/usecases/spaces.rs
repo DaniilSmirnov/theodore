@@ -1,7 +1,8 @@
 //! Spaces (docs/spaces.md): the stage before a pull request. A space is a
 //! detached worktree of a project's cache with its checkpoints on
 //! `refs/theodore/spaces/<id>`; each chat message runs one agent turn in
-//! it, the turn ends in a checkpoint commit, and the branch review of
+//! it, the turn ends in a checkpoint (a snapshot of the worktree,
+//! `space_checkpoints`), and the branch review of
 //! `base...checkpoint` (the `open_branch` plumbing) is the live diff and the
 //! grouped Review.
 
@@ -195,6 +196,7 @@ impl Core {
             build_mode: None,
             question: None,
             mirror: None,
+            worktree_head: None,
         };
         self.apply(vec![NewAction {
             model: models::SPACE.into(),
@@ -439,6 +441,7 @@ impl Core {
             && self.setting_string("agents.claude.effort", "").await.trim() == ULTRACODE;
         let wrap = |prompt: String| {
             let prompt = crate::usecases::space_pr::with_continue_note(&space, prompt);
+            let prompt = crate::usecases::space_checkpoints::with_reverts(&space, prompt);
             with_ultracode(with_failed_check(&space, prompt), ultracode)
         };
         // The same agent in the same worktree continues its session and
@@ -612,67 +615,10 @@ impl Core {
         Ok(())
     }
 
-    /// Undo last turn (docs/spaces.md §7): the worktree and the checkpoint
-    /// ref go back to where the turn started; the transcript keeps the turn,
-    /// marked undone, and later prompts leave it out. Refused while a turn
-    /// runs, on an archived space, and once the turn was shipped.
+    /// Undo last turn (docs/spaces.md §3): `rewind_space` to just before
+    /// the last turn not undone yet.
     pub async fn undo_space_turn(&self, space: &str) -> AppResult<Space> {
-        // Not while a ship reads the checkpoint.
-        let _guard = self.0.ship_lock.lock().await;
-        let _queue = self.space_queue_lock(space).await;
-        let space = self.space_row(space).await?;
-        let i = undoable_turn(&space).map_err(AppError::Invalid)?;
-        let turn = space.turn_log[i].clone();
-        let project = self.space_project(&space).await?;
-        let repo_path = self.ensure_project_cache(&project).await?;
-        let wt = self
-            .0
-            .deps
-            .git
-            .space_worktree(&repo_path, &space.id, &space.base_sha)
-            .await?;
-        self.0
-            .deps
-            .git
-            .space_reset(&wt.path, &space.id, &turn.before)
-            .await
-            .map_err(|e| match e {
-                theodore_ports::GitError::Busy(busy) => AppError::Invalid(format!(
-                    "can't undo: {busy} in the space's worktree; finish or abort it first"
-                )),
-                e => e.into(),
-            })?;
-        let mut log = space.turn_log.clone();
-        log[i].undone = true;
-        let mut data = serde_json::json!({
-            "status": SpaceStatus::Idle,
-            "head_sha": turn.before,
-            "error": null,
-            "turn_log": log,
-            // The agent's session still holds the undone turn: the next
-            // one starts over from the transcript, which leaves it out.
-            "agent_session": null,
-            "updated_at": self.0.deps.clock.now(),
-        });
-        // The turn completed an update from base: the old base is back.
-        if let Some(base) = &turn.base_before {
-            data["base_sha"] = serde_json::json!(base);
-        }
-        self.apply(vec![NewAction {
-            model: models::SPACE.into(),
-            model_id: space.id.clone(),
-            action: SyncActionCode::C,
-            data: Some(data),
-        }])
-        .await?;
-        if turn.before != turn.after {
-            self.space_review(SpaceReviewRequest {
-                space: space.id.clone(),
-                group: false,
-            })
-            .await?;
-        }
-        self.space_row(&space.id).await
+        self.rewind_space_from(space, None).await
     }
 
     /// Brings an archived space back: its worktree is recreated from the
@@ -807,6 +753,19 @@ impl Core {
     /// The review of `base_sha...refs/theodore/spaces/<id>`. Caller holds
     /// `open_lock`.
     async fn open_space_review(&self, space: &Space, group: bool) -> AppResult<OpenPrResponse> {
+        self.open_space_review_at(space, group, None).await
+    }
+
+    /// `open_space_review`, with `live` (a snapshot no ref points at) as
+    /// the head instead of the checkpoint: the diff during a turn
+    /// (`space_live_diff`). Its files are the space worktree's own, so no
+    /// PR worktree is checked out for it.
+    pub(crate) async fn open_space_review_at(
+        &self,
+        space: &Space,
+        group: bool,
+        live: Option<&theodore_domain::Sha>,
+    ) -> AppResult<OpenPrResponse> {
         let project = self.space_project(space).await?;
         let repo_path = self.ensure_project_cache(&project).await?;
         let refname = space_ref(&space.id);
@@ -823,7 +782,7 @@ impl Core {
                 &repo_path,
                 &project.repo,
                 pr_ref.number,
-                &refname,
+                live.map_or(refname.as_str(), |s| s.as_str()),
                 space.base_sha.as_str(),
             )
             .await?;
@@ -831,8 +790,11 @@ impl Core {
         detail.summary.head_ref = space.branch.clone();
         detail.summary.base_ref = space.base.clone();
         let head = detail.summary.head_sha.clone();
-        let worktree = self.0.deps.git.worktree(&pr_ref, &head).await?;
-        self.finish_open_with(pr_ref, detail, revision, repo_path, worktree.path, group)
+        let worktree = match live {
+            Some(_) => PathBuf::from(&space.worktree),
+            None => self.0.deps.git.worktree(&pr_ref, &head).await?.path,
+        };
+        self.finish_open_with(pr_ref, detail, revision, repo_path, worktree, group)
             .await
     }
 
@@ -1054,6 +1016,8 @@ async fn drive_turn(core: &Core, turn: Turn) {
         stream_text: true,
     };
     let started = std::time::Instant::now();
+    // The diff follows the agent's edits while it works (no checkpoints).
+    let live = crate::usecases::space_live_diff::start(core, &space.id, &cwd);
     let mut streamed = stream_run(core, req.clone(), &cancel, &run_id).await;
     let session_gone = streamed.session_gone && !cancel.is_cancelled();
     if session_gone && let Some(replay) = replay {
@@ -1095,8 +1059,10 @@ async fn drive_turn(core: &Core, turn: Turn) {
         None if resumed && !session_gone => space.agent_session.clone(),
         None => None,
     };
-    // The agent is done: its token goes before the after-turn check.
+    // The agent is done: its token goes before the after-turn check, and
+    // the live diff stops before the real checkpoint replaces it.
     drop(tools_guard);
+    let shown_live = live.stop().await;
     let cancelled = cancel.is_cancelled();
     let ms = started.elapsed().as_millis() as u64;
     if let (Some(e), false) = (&error, cancelled)
@@ -1149,8 +1115,8 @@ async fn drive_turn(core: &Core, turn: Turn) {
     // A rebase or conflict left in the worktree: the answer stands, the
     // snapshot waits for the next turn, and the space says why.
     let mut skipped = None;
-    let head = match saved.result {
-        Ok(head) => Some(head),
+    let checkpoint = match saved.result {
+        Ok(cp) => Some(cp),
         Err(theodore_ports::GitError::Busy(busy)) => {
             skipped = Some(
                 saved
@@ -1177,6 +1143,7 @@ async fn drive_turn(core: &Core, turn: Turn) {
         attachments: vec![],
         queued: None,
     };
+    let head = checkpoint.as_ref().map(|cp| cp.sha.clone());
     let changed = head.as_ref().is_some_and(|h| *h != space.head_sha);
     // `check` (docs/config.md) is part of the turn: the space stays
     // running, and Stop stops it too.
@@ -1204,8 +1171,9 @@ async fn drive_turn(core: &Core, turn: Turn) {
     if let Some(extra) = saved.patch {
         crate::usecases::space_update::merge_fields(&mut patch, extra);
     }
-    if let Some(head) = &head {
-        patch["head_sha"] = serde_json::json!(head);
+    if let Some(cp) = &checkpoint {
+        patch["head_sha"] = serde_json::json!(cp.sha);
+        patch["worktree_head"] = serde_json::json!(cp.head);
         // Nothing else writes the log while a turn runs (undo is refused),
         // but read it fresh rather than trust the snapshot from the send.
         let mut log = core
@@ -1217,7 +1185,7 @@ async fn drive_turn(core: &Core, turn: Turn) {
             message,
             reply: reply.id.clone(),
             before: space.head_sha.clone(),
-            after: head.clone(),
+            after: cp.sha.clone(),
             undone: false,
             steered: core.take_steered(&run_id),
             check: checking.then(|| theodore_contract::SpaceCheck {
@@ -1230,6 +1198,9 @@ async fn drive_turn(core: &Core, turn: Turn) {
             }),
             base_before: saved.base_before.clone(),
             plan,
+            before_head: space.worktree_head.clone(),
+            after_head: Some(cp.head.clone()),
+            reverted: vec![],
         });
         patch["turn_log"] = serde_json::json!(log);
     }
@@ -1264,7 +1235,7 @@ async fn drive_turn(core: &Core, turn: Turn) {
     if changed && let Some(after) = &head {
         core.spawn_space_code_changed(cwd.clone(), space.head_sha.clone(), after.clone());
     }
-    if changed {
+    if changed || shown_live {
         // The live diff follows the new checkpoint; grouping waits for Review.
         if let Err(e) = core
             .space_review(SpaceReviewRequest {
@@ -1341,7 +1312,7 @@ fn with_failed_check(space: &Space, prompt: String) -> String {
         .turn_log
         .iter()
         .rev()
-        .find(|t| !t.undone)
+        .find(|t| !t.undone && t.reverted.is_empty())
         .and_then(|t| t.check.as_ref())
         .filter(|c| c.status == theodore_contract::SpaceCheckStatus::Failed);
     match failed {
@@ -1360,57 +1331,6 @@ fn to_json<T: serde::Serialize>(v: &T) -> AppResult<serde_json::Value> {
 /// 12 hex chars: short enough for a path, unique enough per machine.
 fn new_space_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
-}
-
-/// The index in `turn_log` of the turn "Undo last turn" would undo — the
-/// last one not undone yet — or why there is none to undo.
-pub(crate) fn undoable_turn(space: &Space) -> Result<usize, String> {
-    match space.status {
-        SpaceStatus::Running => {
-            return Err("the agent is still working; stop it before undoing".into());
-        }
-        SpaceStatus::Archived => return Err("this space is archived".into()),
-        SpaceStatus::Idle | SpaceStatus::Failed => {}
-    }
-    if space.updating.is_some() {
-        return Err("finish or abort the update from base first".into());
-    }
-    let i = space
-        .turn_log
-        .iter()
-        .rposition(|t| !t.undone)
-        .ok_or_else(|| "there is no turn to undo".to_string())?;
-    let turn = &space.turn_log[i];
-    if turn.after != space.head_sha {
-        return Err("the space moved since its last turn".into());
-    }
-    if let Some(shipped) = &space.shipped {
-        // Shipped from a checkpoint at or before this turn's start: the
-        // turn's own change hasn't left the space. Anything else (this
-        // turn's result, or a checkpoint we can't place) was shipped.
-        let mut earlier = space.turn_log[..i]
-            .iter()
-            .filter(|t| !t.undone)
-            .flat_map(|t| [&t.before, &t.after]);
-        let before_turn = shipped.head == turn.before
-            || shipped.head == space.base_sha
-            || earlier.any(|h| *h == shipped.head);
-        if !before_turn {
-            return Err(match shipped.how {
-                theodore_contract::ShipKind::Pr => {
-                    "this turn is already pushed; ask the agent to revert it instead"
-                }
-                theodore_contract::ShipKind::MergedLocally => {
-                    "this turn is already merged; ask the agent to revert it instead"
-                }
-                theodore_contract::ShipKind::Branch => {
-                    "this turn is already written as a branch; ask the agent to revert it instead"
-                }
-            }
-            .into());
-        }
-    }
-    Ok(i)
 }
 
 /// `true` for a space review's `PrRef::host_id`.

@@ -9,7 +9,14 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use theodore_domain::{HostKind, RepoRef, Sha};
 use theodore_git::GitCli;
-use theodore_ports::{CredentialSource, GitError, GitPort, WorktreeBusy};
+use theodore_ports::{CredentialSource, GitError, GitPort, SpaceCheckpoint, WorktreeBusy};
+
+fn at(sha: &Sha) -> SpaceCheckpoint {
+    SpaceCheckpoint {
+        sha: sha.clone(),
+        head: sha.clone(),
+    }
+}
 
 struct NoAuth;
 impl CredentialSource for NoAuth {
@@ -147,7 +154,7 @@ async fn a_space_dir_without_git_never_touches_the_parent_repo() {
     assert!(matches!(err, GitError::NotAWorktree(_)), "{err:?}");
     let err = h
         .git
-        .space_reset(&wt.path, "s1", &h.base)
+        .space_reset(&wt.path, "s1", &at(&h.base))
         .await
         .unwrap_err();
     assert!(matches!(err, GitError::NotAWorktree(_)), "{err:?}");
@@ -165,14 +172,14 @@ async fn a_space_dir_without_git_never_touches_the_parent_repo() {
     assert!(wt.path.join("draft.txt").exists());
     assert_eq!(
         git(&h.cache, &["rev-parse", "refs/theodore/spaces/s1"]),
-        turn1.as_str()
+        turn1.sha.as_str()
     );
 
     // Recovery: the dir is moved aside, never deleted, and the worktree
     // comes back from the checkpoint ref.
     let again = h.git.space_worktree(&h.cache, "s1", &h.base).await.unwrap();
     assert_eq!(again.path, wt.path);
-    assert_eq!(again.head, turn1);
+    assert_eq!(again.head, turn1.sha);
     assert!(again.path.join(".git").is_file());
     assert!(!again.path.join("draft.txt").exists());
     let aside = home.join(".theodore/spaces/.moved-aside");
@@ -236,7 +243,7 @@ async fn an_unfinished_git_operation_skips_the_checkpoint_and_refuses_undo() {
     git(p, &["checkout", "-q", "--detach", h.base.as_str()]);
     std::fs::write(p.join("a.txt"), "one\nB\n").unwrap();
     let other = commit_all(p, "other");
-    git(p, &["checkout", "-q", "--detach", turn1.as_str()]);
+    git(p, &["checkout", "-q", "--detach", turn1.sha.as_str()]);
 
     let cases: [(&[&str], &[&str], WorktreeBusy); 3] = [
         (
@@ -260,11 +267,11 @@ async fn an_unfinished_git_operation_skips_the_checkpoint_and_refuses_undo() {
         assert_eq!(h.git.worktree_busy(p).await.unwrap(), Some(busy));
         let err = h.git.space_checkpoint(p, "s1", "turn 2").await.unwrap_err();
         assert!(matches!(err, GitError::Busy(b) if b == busy), "{err:?}");
-        let err = h.git.space_reset(p, "s1", &h.base).await.unwrap_err();
+        let err = h.git.space_reset(p, "s1", &at(&h.base)).await.unwrap_err();
         assert!(matches!(err, GitError::Busy(b) if b == busy), "{err:?}");
         assert_eq!(
             git(&h.cache, &["rev-parse", "refs/theodore/spaces/s1"]),
-            turn1.as_str()
+            turn1.sha.as_str()
         );
         git(p, abort);
         assert_eq!(h.git.worktree_busy(p).await.unwrap(), None);

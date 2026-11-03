@@ -12,6 +12,7 @@
 
 mod auth;
 mod branches;
+mod checkpoints;
 mod config_file;
 mod conflicts;
 mod diff;
@@ -473,12 +474,30 @@ impl GitPort for GitCli {
         worktree: &Path,
         space: &str,
         message: &str,
-    ) -> GitResult<Sha> {
+    ) -> GitResult<theodore_ports::SpaceCheckpoint> {
         self.space_checkpoint_op(worktree, space, message).await
     }
 
-    async fn space_reset(&self, worktree: &Path, space: &str, to: &Sha) -> GitResult<()> {
+    async fn space_reset(
+        &self,
+        worktree: &Path,
+        space: &str,
+        to: &theodore_ports::SpaceCheckpoint,
+    ) -> GitResult<()> {
         self.space_reset_op(worktree, space, to).await
+    }
+
+    async fn space_restore_paths(
+        &self,
+        worktree: &Path,
+        paths: &[String],
+        from: &Sha,
+    ) -> GitResult<()> {
+        self.space_restore_paths_op(worktree, paths, from).await
+    }
+
+    async fn space_fingerprint(&self, worktree: &Path) -> GitResult<String> {
+        self.space_fingerprint_op(worktree).await
     }
 
     async fn worktree_busy(

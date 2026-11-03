@@ -296,6 +296,22 @@ pub trait CoreApi: Send + Sync {
     ) -> Result<theodore_contract::Space, CommandError> {
         Err(not_ready())
     }
+    /// "Back to here": the space back to right after a turn; later turns
+    /// undone (docs/spaces.md §3).
+    async fn rewind_space(
+        &self,
+        _req: theodore_contract::RewindSpaceRequest,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        Err(not_ready())
+    }
+    /// Revert one file of the space's diff to the base or to before the
+    /// last turn, as an undoable entry (docs/spaces.md §3).
+    async fn revert_space_file(
+        &self,
+        _req: theodore_contract::RevertSpaceFileRequest,
+    ) -> Result<theodore_contract::Space, CommandError> {
+        Err(not_ready())
+    }
     /// Recreates an archived space's worktree from its checkpoint ref.
     async fn unarchive_space(
         &self,

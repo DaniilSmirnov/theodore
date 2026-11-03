@@ -78,6 +78,9 @@ impl GitCli {
         if let Some(busy) = git.busy().await? {
             return Err(GitError::Busy(busy));
         }
+        // Checkpoints leave edits uncommitted (`checkpoints`); a merge
+        // wants them in `HEAD`.
+        crate::checkpoints::commit_edits(&git, id, "edits before updating from the base").await?;
         let mut args: Vec<&str> = THEODORE.to_vec();
         args.extend([
             // The common ancestor's lines between the two sides: what each

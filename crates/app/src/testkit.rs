@@ -406,6 +406,15 @@ pub struct FakeGit {
     /// `abort` with the checkpoint.
     merge_results: Mutex<VecDeque<theodore_ports::SpaceMerge>>,
     pub merge_calls: Mutex<Vec<(&'static str, String, Sha)>>,
+    /// The `HEAD` every `space_reset` moved the worktree to.
+    pub reset_heads: Mutex<Vec<Sha>>,
+    /// A space worktree's own `HEAD` (`SpaceCheckpoint::head`); unset: the
+    /// checkpoint itself, as before snapshots.
+    pub space_heads: Mutex<HashMap<String, Sha>>,
+    /// `(paths, from)` of every `space_restore_paths`.
+    pub restored: Mutex<Vec<(Vec<String>, Sha)>>,
+    /// `space_fingerprint`'s answer.
+    pub fingerprint: Mutex<String>,
     /// Shipping a space: identity, squashed commits, pushes, folder ops.
     pub ship: Mutex<FakeShip>,
     // ── mirroring a space into a local folder (docs/spaces.md) ──────────
@@ -529,6 +538,10 @@ impl FakeGit {
             resets: Mutex::new(Vec::new()),
             merge_results: Mutex::new(VecDeque::new()),
             merge_calls: Mutex::new(Vec::new()),
+            reset_heads: Mutex::new(Vec::new()),
+            space_heads: Mutex::new(HashMap::new()),
+            restored: Mutex::new(Vec::new()),
+            fingerprint: Mutex::new(String::new()),
             ship: Mutex::new(FakeShip {
                 identity: Some(theodore_ports::Identity {
                     name: "Ada Lovelace".into(),
@@ -676,6 +689,11 @@ impl FakeGit {
             .lock()
             .unwrap()
             .insert(name.to_string(), sha);
+    }
+
+    /// What `name` resolves to now (a space's checkpoint ref, say).
+    pub fn resolve_ref_of(&self, name: &str) -> Option<Sha> {
+        self.resolve_refs.lock().unwrap().get(name).cloned()
     }
 
     pub fn set_commit(&self, sha: Sha, commit: CommitLog) {
@@ -973,7 +991,7 @@ impl GitPort for FakeGit {
         _worktree: &Path,
         space: &str,
         message: &str,
-    ) -> GitResult<Sha> {
+    ) -> GitResult<theodore_ports::SpaceCheckpoint> {
         self.checkpoints
             .lock()
             .unwrap()
@@ -993,11 +1011,45 @@ impl GitPort for FakeGit {
             .ok_or_else(|| GitError::Parse(format!("no space {space}")))?;
         drop(refs);
         self.ensure_commit(&head, message);
-        Ok(head)
+        let wt_head = self
+            .space_heads
+            .lock()
+            .unwrap()
+            .get(space)
+            .cloned()
+            .unwrap_or_else(|| head.clone());
+        Ok(theodore_ports::SpaceCheckpoint {
+            sha: head,
+            head: wt_head,
+        })
+    }
+
+    async fn space_restore_paths(
+        &self,
+        _worktree: &Path,
+        paths: &[String],
+        from: &Sha,
+    ) -> GitResult<()> {
+        self.restored
+            .lock()
+            .unwrap()
+            .push((paths.to_vec(), from.clone()));
+        Ok(())
+    }
+
+    async fn space_fingerprint(&self, worktree: &Path) -> GitResult<String> {
+        let _ = worktree;
+        Ok(self.fingerprint.lock().unwrap().clone())
     }
 
     async fn space_snapshot(&self, worktree: &Path) -> GitResult<Sha> {
         if let Some(sha) = self.ship.lock().unwrap().snapshot.clone() {
+            // Resolvable by its sha, as git would, for a live diff.
+            self.resolve_refs
+                .lock()
+                .unwrap()
+                .insert(sha.0.clone(), sha.clone());
+            self.ensure_commit(&sha, "snapshot of the worktree");
             return Ok(sha);
         }
         // The space is the worktree's last path component (`space_worktree`).
@@ -1014,18 +1066,31 @@ impl GitPort for FakeGit {
             .ok_or_else(|| GitError::Parse(format!("no space {space}")))
     }
 
-    async fn space_reset(&self, _worktree: &Path, space: &str, to: &Sha) -> GitResult<()> {
+    async fn space_reset(
+        &self,
+        _worktree: &Path,
+        space: &str,
+        to: &theodore_ports::SpaceCheckpoint,
+    ) -> GitResult<()> {
+        if let Some(e) = self.checkpoint_errors.lock().unwrap().pop_front() {
+            return Err(e);
+        }
         self.resets
             .lock()
             .unwrap()
-            .push((space.to_string(), to.clone()));
+            .push((space.to_string(), to.sha.clone()));
+        self.reset_heads.lock().unwrap().push(to.head.clone());
+        self.space_heads
+            .lock()
+            .unwrap()
+            .insert(space.to_string(), to.head.clone());
         self.resolve_refs
             .lock()
             .unwrap()
-            .insert(theodore_ports::space_ref(space), to.clone());
+            .insert(theodore_ports::space_ref(space), to.sha.clone());
         // A reset can land on a commit no checkpoint made (Continue's new
         // base): `describe_branch` still finds it.
-        self.ensure_commit(to, "reset");
+        self.ensure_commit(&to.sha, "reset");
         Ok(())
     }
 

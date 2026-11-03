@@ -275,6 +275,8 @@ export const DiffPane = observer(function DiffPane({
   /** Asking the AI about a line or hunk (it opens the AI panel); off where
    *  the diff has no AI panel next to it (a space's live diff). */
   askAi = true,
+  /** More items for a file's menu (a space's diff: Revert). */
+  fileItems,
 }: {
   pr: PrId;
   rev: Revision;
@@ -290,6 +292,7 @@ export const DiffPane = observer(function DiffPane({
   expandHunk?: { hunk: HunkId; nonce: number } | null;
   nextGroup?: boolean;
   askAi?: boolean;
+  fileItems?: (file: FileDiff) => ContextMenuItem[];
 }) {
   const store = useRootStore();
   const ui = useUi();
@@ -341,8 +344,9 @@ export const DiffPane = observer(function DiffPane({
         rangeStart.current = r;
       },
       askAi,
+      fileItems,
     }),
-    [setComposer, diffPaths, findHunk, askAi],
+    [setComposer, diffPaths, findHunk, askAi, fileItems],
   );
   const [interdiffEntries, setInterdiffEntries] = useState<
     InterdiffEntry[] | null
@@ -1042,6 +1046,8 @@ interface LineActions {
   /** The diff has an AI panel next to it: offer asking about lines and
    *  hunks, and the ways into the panel. */
   askAi: boolean;
+  /** More items for a file's menu, after the built-in ones. */
+  fileItems?: (file: FileDiff) => ContextMenuItem[];
 }
 
 type DraftRow = ModelRows['draft'];
@@ -1227,6 +1233,7 @@ function FileBlockInner({
         label: collapsedFile ? 'Expand' : 'Collapse',
         onAction: () => foldTo(!collapsedFile),
       });
+      items.push(...(actions.fileItems?.(file) ?? []));
       return items;
     })(e);
 

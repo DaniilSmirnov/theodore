@@ -191,6 +191,11 @@ pub struct Space {
     /// Mirror off. At most one space of a project mirrors at a time.
     #[serde(default)]
     pub mirror: Option<SpaceMirror>,
+    /// The worktree's own `HEAD` when `head_sha` was taken (a checkpoint
+    /// is a snapshot on top of it); `None`: `head_sha` is that `HEAD`
+    /// (a new space, or a checkpoint from before snapshots).
+    #[serde(default)]
+    pub worktree_head: Option<Sha>,
 }
 
 /// A merge of the base into the space, left in progress on conflicts
@@ -311,6 +316,16 @@ pub struct SpaceTurn {
     /// Approve / Revise.
     #[serde(default)]
     pub plan: Option<String>,
+    /// The worktree's `HEAD` at `before` and at `after` (a checkpoint is a
+    /// snapshot on top of it); `None`: that checkpoint is `HEAD` itself.
+    #[serde(default)]
+    pub before_head: Option<Sha>,
+    #[serde(default)]
+    pub after_head: Option<Sha>,
+    /// Not an agent turn but your Revert of these files in the diff: its
+    /// `reply` is its own `message`, and the next turn's prompt says so.
+    #[serde(default)]
+    pub reverted: Vec<String>,
 }
 
 /// Where a new space's work starts (docs/spaces.md §3 "New space"), instead

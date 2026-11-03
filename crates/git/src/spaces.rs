@@ -143,25 +143,6 @@ impl GitCli {
         })
     }
 
-    pub(crate) async fn space_checkpoint_op(
-        &self,
-        worktree: &Path,
-        id: &str,
-        message: &str,
-    ) -> GitResult<Sha> {
-        validate_space_id(id)?;
-        let askpass = self.ensure_askpass()?;
-        let _wt = crate::locks::lock(worktree).await;
-        let git = self.space_git(worktree, &askpass);
-        git.verify_root().await?;
-        // Mid-rebase or with conflict markers in the files, a snapshot
-        // would record half an operation: the next turn checkpoints it.
-        if let Some(busy) = git.busy().await? {
-            return Err(GitError::Busy(busy));
-        }
-        snapshot(&git, id, message).await
-    }
-
     pub(crate) async fn worktree_busy_op(
         &self,
         worktree: &Path,
@@ -191,91 +172,6 @@ impl GitCli {
             "space directory was not its git worktree; moved aside"
         );
         Ok(to)
-    }
-
-    pub(crate) async fn space_reset_op(
-        &self,
-        worktree: &Path,
-        id: &str,
-        to: &Sha,
-    ) -> GitResult<()> {
-        validate_space_id(id)?;
-        let askpass = self.ensure_askpass()?;
-        let refname = space_ref(id);
-        let _wt = crate::locks::lock(worktree).await;
-        let git = self.space_git(worktree, &askpass);
-        git.verify_root().await?;
-        // Undo would throw the unfinished operation away with the turn.
-        if let Some(busy) = git.busy().await? {
-            return Err(GitError::Busy(busy));
-        }
-        let steps: [&[&str]; 3] = [
-            &["reset", "-q", "--hard", to.as_str()],
-            // Untracked files the turn left behind; ignored ones (deps,
-            // build output) stay, so the next turn needn't reinstall.
-            &["clean", "-q", "-fd"],
-            &["update-ref", &refname, to.as_str()],
-        ];
-        for args in steps {
-            git.run(args).await?;
-        }
-        Ok(())
-    }
-
-    /// `GitPort::space_snapshot`: a copy of the worktree's index (so `add`
-    /// reuses its stat cache) under the worktree's git dir, `add -A` into
-    /// it, then `write-tree` and `commit-tree`. No ref moves; the copy is
-    /// removed again.
-    pub(crate) async fn space_snapshot_op(&self, worktree: &Path) -> GitResult<Sha> {
-        let askpass = self.ensure_askpass()?;
-        let _wt = crate::locks::lock(worktree).await;
-        let git = self.space_git(worktree, &askpass);
-        git.verify_root().await?;
-        let head = git.run_text(&["rev-parse", "--verify", "HEAD"]).await?;
-        let head = head.trim().to_string();
-        let git_dir = git.run_text(&["rev-parse", "--absolute-git-dir"]).await?;
-        let git_dir = PathBuf::from(git_dir.trim());
-        let index = git_dir.join("theodore-snapshot.index");
-        let real = git_dir.join("index");
-        let tree = async {
-            if real.exists() {
-                std::fs::copy(&real, &index)?;
-            } else {
-                let _ = std::fs::remove_file(&index);
-                git.run_env(&["read-tree", "HEAD"], &[("GIT_INDEX_FILE", &index)])
-                    .await?;
-            }
-            git.run_env(&["add", "-A"], &[("GIT_INDEX_FILE", &index)])
-                .await?;
-            let out = git
-                .run_env(&["write-tree"], &[("GIT_INDEX_FILE", &index)])
-                .await?;
-            Ok::<_, GitError>(String::from_utf8_lossy(&out).trim().to_string())
-        }
-        .await;
-        let _ = std::fs::remove_file(&index);
-        let tree = tree?;
-        let head_tree = git.run_text(&["rev-parse", "HEAD^{tree}"]).await?;
-        if head_tree.trim() == tree {
-            return Ok(Sha::new(head));
-        }
-        // Theodore's own identity, as for checkpoints: never the user's
-        // signing or hooks for a commit no ref points at.
-        let sha = git
-            .run_text(&[
-                "-c",
-                "user.name=Theodore",
-                "-c",
-                "user.email=theodore@localhost",
-                "commit-tree",
-                &tree,
-                "-p",
-                &head,
-                "-m",
-                "snapshot of the worktree",
-            ])
-            .await?;
-        Ok(Sha::new(sha.trim().to_string()))
     }
 
     pub(crate) async fn remove_space_worktree_op(&self, repo: &Path, id: &str) -> GitResult<()> {
@@ -323,8 +219,11 @@ impl GitCli {
 }
 
 /// `add -A`, a commit when anything is staged (with a merge in progress,
-/// its merge commit), and the space ref at `HEAD`: one checkpoint. The
-/// caller holds the worktree lock and has run `verify_root`.
+/// its merge commit), and the space ref at `HEAD`: the checkpoint that
+/// completes an update from base (`space_update`), where `HEAD` itself
+/// must move. Every other checkpoint is a snapshot that leaves `HEAD`
+/// alone (`checkpoints`). The caller holds the worktree lock and has run
+/// `verify_root`.
 pub(crate) async fn snapshot(git: &SpaceGit<'_>, id: &str, message: &str) -> GitResult<Sha> {
     git.run(&["add", "-A"]).await?;
     // Exit 1 = something is staged.
@@ -360,8 +259,16 @@ pub(crate) async fn snapshot(git: &SpaceGit<'_>, id: &str, message: &str) -> Git
     let head = head.trim().to_string();
     // Refs outside `refs/heads` and `refs/worktree` are shared by every
     // worktree, so this lands in the bare cache.
-    git.run(&["update-ref", &space_ref(id), &head]).await?;
-    Ok(Sha::new(head))
+    let head = Sha::new(head);
+    git.run(&["update-ref", &space_ref(id), head.as_str()])
+        .await?;
+    git.run(&[
+        "update-ref",
+        &theodore_ports::space_checkpoint_ref(id, &head),
+        head.as_str(),
+    ])
+    .await?;
+    Ok(head)
 }
 
 #[cfg(test)]

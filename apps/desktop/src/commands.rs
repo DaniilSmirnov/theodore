@@ -835,6 +835,27 @@ pub async fn undo_space_turn(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn rewind_space(
+    op: crate::op::Op,
+    req: theodore_contract::RewindSpaceRequest,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::Space, CommandError> {
+    op.run(async move { core.rewind_space(req).await }).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn revert_space_file(
+    op: crate::op::Op,
+    req: theodore_contract::RevertSpaceFileRequest,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<theodore_contract::Space, CommandError> {
+    op.run(async move { core.revert_space_file(req).await })
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn unarchive_space(
     op: crate::op::Op,
     space: String,

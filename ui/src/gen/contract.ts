@@ -1344,6 +1344,18 @@ export type ResolveRequest = {
 };
 
 /**
+ *  "Revert to base" / "Revert the last turn's change" on a file of the
+ *  space's diff: the files are restored, checkpointed as an entry of the
+ *  turn log (undoable), and the next turn's prompt says so.
+ */
+export type RevertSpaceFileRequest = {
+	space: string,
+	/**  The file, and for a rename its old path too. */
+	paths: string[],
+	from: SpaceRevertFrom,
+};
+
+/**
  *  Host-level rollup of the PR's reviews (GitHub's `reviewDecision`; GitLab
  *  has no 1:1 equivalent — derived best-effort from approvals).
  */
@@ -1376,6 +1388,16 @@ export type Revision = {
 export type RevisionRequest = {
 	pr: PrId,
 	head: Sha,
+};
+
+/**
+ *  "Back to here" on an agent reply: the space goes back to right after
+ *  that turn; every later turn is marked undone.
+ */
+export type RewindSpaceRequest = {
+	space: string,
+	/**  `SpaceTurn::reply` of the turn to keep. */
+	reply: string,
 };
 
 export type RunSkillRequest = {
@@ -1743,6 +1765,12 @@ export type Space = {
 	 *  Mirror off. At most one space of a project mirrors at a time.
 	 */
 	mirror?: SpaceMirror | null,
+	/**
+	 *  The worktree's own `HEAD` when `head_sha` was taken (a checkpoint
+	 *  is a snapshot on top of it); `None`: `head_sha` is that `HEAD`
+	 *  (a new space, or a checkpoint from before snapshots).
+	 */
+	worktree_head?: Sha | null,
 };
 
 export type SpaceAnswerItem = {
@@ -1942,6 +1970,13 @@ export type SpaceQueuedRequest = {
 	action: QueuedAction,
 };
 
+/**  Where "Revert" takes a file back to. */
+export type SpaceRevertFrom =
+/**  As it is in the base: the space's change to it is gone. */
+"base" |
+/**  As it was before the last agent turn: only that turn's change goes. */
+"last_turn";
+
 export type SpaceReviewRequest = {
 	space: string,
 	/**  Also group the diff by meaning (Review); `false` for the live diff. */
@@ -2115,6 +2150,17 @@ export type SpaceTurn = {
 	 *  Approve / Revise.
 	 */
 	plan?: string | null,
+	/**
+	 *  The worktree's `HEAD` at `before` and at `after` (a checkpoint is a
+	 *  snapshot on top of it); `None`: that checkpoint is `HEAD` itself.
+	 */
+	before_head?: Sha | null,
+	after_head?: Sha | null,
+	/**
+	 *  Not an agent turn but your Revert of these files in the diff: its
+	 *  `reply` is its own `message`, and the next turn's prompt says so.
+	 */
+	reverted?: string[],
 };
 
 /**

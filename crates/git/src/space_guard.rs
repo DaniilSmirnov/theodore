@@ -65,9 +65,30 @@ impl SpaceGit<'_> {
         Ok(String::from_utf8_lossy(&self.run(args).await?).into_owned())
     }
 
-    /// `run` with extra variables on the child (`GIT_INDEX_FILE`).
-    pub(crate) async fn run_env(&self, args: &[&str], env: &[(&str, &Path)]) -> GitResult<Vec<u8>> {
+    /// `run` with extra variables on the child (`GIT_INDEX_FILE`, dates).
+    pub(crate) async fn run_env(
+        &self,
+        args: &[&str],
+        env: &[(&str, &std::ffi::OsStr)],
+    ) -> GitResult<Vec<u8>> {
         self.proc(args).run_env_below(&self.ceiling, env).await
+    }
+
+    /// `run_env`, with `stdin` fed to the child (`checkout-index --stdin`).
+    pub(crate) async fn run_env_stdin(
+        &self,
+        args: &[&str],
+        env: &[(&str, &std::ffi::OsStr)],
+        stdin: &[u8],
+    ) -> GitResult<Vec<u8>> {
+        let mut proc = self.proc(args);
+        proc.stdin = Some(stdin);
+        proc.run_env_below(&self.ceiling, env).await
+    }
+
+    /// The worktree this runs in.
+    pub(crate) fn root(&self) -> &Path {
+        self.worktree
     }
 
     pub(crate) async fn run_raw(&self, args: &[&str]) -> GitResult<RawOutput> {
