@@ -3,7 +3,6 @@ import { ThemePicker } from './ThemePicker';
 import {
   ArrowLeft,
   ArrowRotateRight,
-  CurlyBrackets,
   ChevronRight,
   CircleCheckFill,
   CircleInfo,
@@ -70,6 +69,7 @@ import { DeviceLoginPanel } from './DeviceLoginPanel';
 import { IntegrationsPage } from './linear/IntegrationsPage';
 import { projectLabel } from './Projects';
 import { ConfigEditor } from './project/ConfigEditor';
+import { ProjectLanguages } from './project/ProjectLanguages';
 import { PrivacyCard } from './Privacy';
 import { SandboxBadge } from './sandbox/SandboxBadge';
 import { SandboxPage } from './sandbox/SandboxPage';
@@ -78,7 +78,6 @@ import { isLabsVisible } from './space/mode';
 import { LabsPage } from './space/SpacePage';
 import { isHostOn, isLinearOn } from './settings/labs';
 import { LabsPage as ExperimentsPage } from './settings/LabsPage';
-import { LanguagesPage } from './settings/LanguagesPage';
 
 const AGENTS: AgentId[] = ['claude', 'codex', 'gemini'];
 const AI_KEYS = ['agents.grouping', 'agents.chat', 'agents.fix'] as const;
@@ -95,7 +94,6 @@ const PAGES: { id: Page; title: string; icon: ReactNode }[] = [
   { id: 'agents', title: 'Agents', icon: <Cpu /> },
   { id: 'integrations', title: 'Integrations', icon: <PlugConnection /> },
   { id: 'projects', title: 'Projects', icon: <Folder /> },
-  { id: 'languages', title: 'Languages', icon: <CurlyBrackets /> },
   { id: 'about', title: 'About & updates', icon: <CircleInfo /> },
   { id: 'sandbox', title: 'Sandbox', icon: <Cubes3 /> },
   { id: 'labs', title: 'Spaces', icon: <Sparkles /> },
@@ -109,8 +107,7 @@ const SUB: Record<Page, string> = {
   agents: 'Agent CLIs on this computer, and which one handles each task.',
   integrations: 'Other tools Theodore can link PRs to.',
   projects: 'Connected repositories and the settings effective in each.',
-  languages:
-    'Grammars and language servers that give reviews and spaces exact definitions and references.',
+  languages: 'Connected repositories and the settings effective in each.',
   updates: 'Version, release channel and updates.',
   about: 'Version, release channel and updates.',
   sandbox: 'The simulated host this window runs against: faults and timeline.',
@@ -178,7 +175,13 @@ export const SettingsNav = observer(function SettingsNav({
       <ListBox
         aria-label="Settings pages"
         selectionMode="single"
-        selectedKeys={[page === 'updates' ? 'about' : page]}
+        selectedKeys={[
+          page === 'updates'
+            ? 'about'
+            : page === 'languages'
+              ? 'projects'
+              : page,
+        ]}
         onSelectionChange={(keys) => {
           const k = keys === 'all' ? undefined : [...keys][0];
           if (k) ui.go({ name: 'settings', page: k as Page });
@@ -926,7 +929,8 @@ const SOURCE_NOTE: Record<'repo' | 'user' | 'default', string> = {
 };
 
 /** Settings → Projects → ⟨repo⟩: the settings effective for this repo and
- *  where each came from, then the project's config file: create it from
+ *  where each came from, its languages (`ProjectLanguages`), then the
+ *  project's config file: create it from
  *  these settings, edit, check and save it (`ConfigEditor`). */
 const RepoSettingsPage = observer(function RepoSettingsPage({
   project,
@@ -936,6 +940,9 @@ const RepoSettingsPage = observer(function RepoSettingsPage({
   onBack: () => void;
 }) {
   const store = useRootStore();
+  // Bumped when the Languages switches write the local file, so the
+  // config editor below reads it again.
+  const [configRev, setConfigRev] = useState(0);
   const scope = `repo:${project.repo.owner}/${project.repo.name}`;
   const rows: { key: string; title: string }[] = [
     ...AI_KEYS.map((key) => ({ key, title: AI_TITLE[key] })),
@@ -980,7 +987,13 @@ const RepoSettingsPage = observer(function RepoSettingsPage({
         </span>
       </section>
       <Separator />
-      <ConfigEditor project={project} />
+      <ProjectLanguages
+        key={project.id}
+        project={project}
+        onConfigWritten={() => setConfigRev((r) => r + 1)}
+      />
+      <Separator />
+      <ConfigEditor project={project} rev={configRev} />
     </>
   );
 });
@@ -1159,17 +1172,19 @@ export const SettingsPage = observer(function SettingsPage({
 }) {
   const store = useRootStore();
   const labs = isLabsVisible(store);
-  // `updates` is an old page id: it now lives on About & updates.
-  const shown: Page = page === 'updates' ? 'about' : page;
+  // Old page ids: `updates` now lives on About & updates, `languages` in
+  // each project's settings.
+  const shown: Page =
+    page === 'updates' ? 'about' : page === 'languages' ? 'projects' : page;
   const title = PAGES.find((p) => p.id === shown)?.title ?? 'Settings';
   return (
     <div className="view settings-page flex min-w-0 flex-1 flex-col overflow-auto">
       <div className="mx-auto flex w-full max-w-[760px] flex-col gap-6 px-8 py-8">
         <div>
           <Typography.Heading level={4}>{title}</Typography.Heading>
-          <span className="text-sm text-muted">{SUB[page]}</span>
+          <span className="text-sm text-muted">{SUB[shown]}</span>
         </div>
-        {page === 'account' ? (
+        {shown === 'account' ? (
           <AccountPage />
         ) : page === 'appearance' ? (
           <section className="flex flex-col gap-2">
@@ -1182,10 +1197,8 @@ export const SettingsPage = observer(function SettingsPage({
           isLinearOn(store) ? (
             <IntegrationsPage />
           ) : null
-        ) : page === 'projects' ? (
+        ) : shown === 'projects' ? (
           <ProjectsPage />
-        ) : page === 'languages' ? (
-          <LanguagesPage />
         ) : page === 'sandbox' ? (
           <SandboxPage />
         ) : page === 'labs' ? (

@@ -16,8 +16,9 @@ use theodore_domain::{AgentId, FindingId, PrId, RunId};
 use theodore_mcp::{
     AppStatus, BackendError, CheckOutcome, GroupWithHunks, LogTail, McpServer, NewFinding,
     NewPatch, PrContext, REVIEW_TOOL_NAMES, ReviewToolsBackend, RunContext, SPACE_TOOL_NAMES,
-    SpaceCommandName, SpaceInfo, SpaceToolError, SpaceToolsBackend, ToolSet,
+    SpaceCommandName, SpaceInfo, SpaceToolError, SpaceToolsBackend, TerminalTail, ToolSet,
 };
+use theodore_ports::{UserAnswer, UserQuestion};
 
 struct EmptyReview;
 
@@ -132,6 +133,21 @@ impl SpaceToolsBackend for FakeSpaces {
             available: 1,
         })
     }
+    async fn read_terminal(
+        &self,
+        space: &str,
+        terminal: Option<&str>,
+        lines: usize,
+    ) -> Result<TerminalTail, SpaceToolError> {
+        self.record(format!("read_terminal {space} {terminal:?} {lines}"));
+        Ok(TerminalTail {
+            id: Some("t1".into()),
+            title: Some("Terminal 1".into()),
+            running: Some(true),
+            lines: vec!["$ ls".into(), "Cargo.toml".into()],
+            note: None,
+        })
+    }
     async fn space_info(&self, space: &str) -> Result<SpaceInfo, SpaceToolError> {
         self.record(format!("space_info {space}"));
         Ok(SpaceInfo {
@@ -144,6 +160,23 @@ impl SpaceToolsBackend for FakeSpaces {
             env: vec!["THEODORE_PORT".into()],
             commands: vec![],
         })
+    }
+    /// Answers each question with its first option.
+    async fn ask_user(
+        &self,
+        space: &str,
+        run: &RunId,
+        questions: Vec<UserQuestion>,
+    ) -> Result<Vec<UserAnswer>, SpaceToolError> {
+        self.record(format!("ask_user {space} {run} {}", questions.len()));
+        Ok(questions
+            .into_iter()
+            .map(|q| UserAnswer {
+                selected: vec![q.options[0].clone()],
+                question: q.question,
+                other: None,
+            })
+            .collect())
     }
 }
 
@@ -173,6 +206,9 @@ async fn names(client: &RunningService<rmcp::RoleClient, ()>) -> Vec<String> {
         .iter()
         .map(|t| t.name.to_string())
         .collect();
+    // On every server, whatever the run: the CLI's permission prompts.
+    let approve = names.iter().position(|n| n == theodore_ports::APPROVE_TOOL);
+    names.remove(approve.expect("approve_tool listed"));
     names.sort();
     names
 }
@@ -245,6 +281,9 @@ async fn a_space_turn_gets_only_the_space_tools() {
     assert_eq!(info["env"], json!(["THEODORE_PORT"]));
     let logs = json_of(&call(&client, "read_logs", json!({ "kind": "run" })).await);
     assert_eq!(logs["kind"], json!("run"));
+    let terminal = json_of(&call(&client, "read_terminal", json!({})).await);
+    assert_eq!(terminal["id"], json!("t1"));
+    assert_eq!(terminal["lines"], json!(["$ ls", "Cargo.toml"]));
 
     // The space is the token's, whatever the agent sends.
     assert_eq!(
@@ -256,6 +295,7 @@ async fn a_space_turn_gets_only_the_space_tools() {
             "app_status s1",
             "space_info s1",
             "read_logs s1 run 100",
+            "read_terminal s1 None 200",
         ]
     );
     drop(client);
@@ -295,6 +335,31 @@ async fn read_logs_tail_is_bounded() {
             "read_logs s1 check 400",
             "read_logs s1 check 1",
             "read_logs s1 check 7"
+        ]
+    );
+    drop(client);
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn read_terminal_lines_is_bounded_and_terminal_is_passed_through() {
+    let spaces = FakeSpaces::new(true);
+    let handle = McpServer::start_with_spaces(Arc::new(EmptyReview), spaces.clone())
+        .await
+        .unwrap();
+    let endpoint = handle.register_run(space_run());
+    let client = connect(&endpoint.url, &endpoint.token).await;
+    for lines in [json!(100000), json!(0), json!(7)] {
+        call(&client, "read_terminal", json!({ "lines": lines })).await;
+    }
+    call(&client, "read_terminal", json!({ "terminal": "t2" })).await;
+    assert_eq!(
+        spaces.calls(),
+        [
+            "read_terminal s1 None 2000",
+            "read_terminal s1 None 1",
+            "read_terminal s1 None 7",
+            "read_terminal s1 Some(\"t2\") 200",
         ]
     );
     drop(client);
@@ -367,6 +432,91 @@ async fn a_plain_review_gets_no_space_tools() {
         .await;
     assert!(r.is_err());
     assert!(spaces.calls().is_empty());
+    drop(client);
+    handle.shutdown().await;
+}
+
+/// Claude Code's permission prompts (issue #83): an MCP tool the run
+/// couldn't pre-approve goes through with its input; built-in tools stay
+/// denied, on both servers.
+#[tokio::test]
+async fn approve_tool_lets_mcp_tools_through_and_denies_the_rest() {
+    let handle = McpServer::start_with_spaces(Arc::new(EmptyReview), FakeSpaces::new(true))
+        .await
+        .unwrap();
+    let review = RunContext::review(RunId::new("r1"), PrId::new("github:o/r#1"), AgentId::Claude);
+    for run in [space_run(), review] {
+        let endpoint = handle.register_run(run);
+        let client = connect(&endpoint.url, &endpoint.token).await;
+        let ask = |tool: &str| json!({ "tool_name": tool, "input": { "id": "ENG-1" }, "tool_use_id": "toolu_1" });
+        let allowed = json_of(
+            &call(
+                &client,
+                "approve_tool",
+                ask("mcp__claude_ai_Linear__get_issue"),
+            )
+            .await,
+        );
+        assert_eq!(
+            allowed,
+            json!({ "behavior": "allow", "updatedInput": { "id": "ENG-1" } }),
+            "{}",
+            endpoint.name
+        );
+        for tool in ["Bash", "Edit", "Write"] {
+            let denied = json_of(&call(&client, "approve_tool", ask(tool)).await);
+            assert_eq!(denied["behavior"], "deny", "{tool} on {}", endpoint.name);
+            assert!(denied["message"].is_string());
+            assert!(denied.get("updatedInput").is_none());
+        }
+        drop(client);
+    }
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn ask_user_returns_the_answers_and_refuses_bad_questions() {
+    let spaces = FakeSpaces::new(true);
+    let handle = McpServer::start_with_spaces(Arc::new(EmptyReview), spaces.clone())
+        .await
+        .unwrap();
+    let endpoint = handle.register_run(space_run());
+    let client = connect(&endpoint.url, &endpoint.token).await;
+    let answered = json_of(
+        &call(
+            &client,
+            "ask_user",
+            json!({ "questions": [
+                { "question": "Which store?", "options": ["SQLite", "Postgres"] },
+                { "question": "Which tests?", "options": ["unit", "e2e"], "multi": true },
+            ] }),
+        )
+        .await,
+    );
+    assert_eq!(
+        answered,
+        json!({ "answers": [
+            { "question": "Which store?", "selected": ["SQLite"] },
+            { "question": "Which tests?", "selected": ["unit"] },
+        ] })
+    );
+    // One option, or none at all: refused before the user sees anything.
+    for bad in [
+        json!({ "questions": [{ "question": "Sure?", "options": ["yes"] }] }),
+        json!({ "questions": [] }),
+    ] {
+        let r = client
+            .call_tool(
+                CallToolRequestParams::new("ask_user")
+                    .with_arguments(bad.as_object().unwrap().clone()),
+            )
+            .await;
+        assert!(
+            r.as_ref().map_or(true, |r| r.is_error == Some(true)),
+            "{r:?}"
+        );
+    }
+    assert_eq!(spaces.calls(), ["ask_user s1 space:s1:m1 2"]);
     drop(client);
     handle.shutdown().await;
 }

@@ -163,17 +163,24 @@ fn args_with(
         args.push("--add-dir".to_string());
         args.push(dir.display().to_string());
     }
-    // The run's own MCP server, whatever it is named; with the user's
-    // servers on, theirs too (`mcp__*`). `--permission-prompts none`
-    // denies whatever isn't pre-approved, so they must be listed to be usable.
-    let mut mcp_tools = format!(
+    // The run's own MCP server, whatever it is named. `--permission-prompts
+    // none` denies whatever isn't pre-approved.
+    let mcp_tools = format!(
         "mcp__{}__*",
         req.mcp
             .as_ref()
             .map_or(theodore_ports::REVIEW_TOOLS, |m| m.name.as_str())
     );
-    if req.user_mcp {
-        mcp_tools.push_str(",mcp__*");
+    // The user's servers can't be pre-approved: claude.ai connectors are
+    // named only once loaded, and `mcp__*` matches no server (2.1.312).
+    // Their calls go to Theodore's `approve_tool` instead, which lets MCP
+    // tools through and denies the rest, as `none` would.
+    if let Some(tool) = approve_tool(req) {
+        if let Some(i) = args.iter().position(|a| a == "--permission-prompts") {
+            args[i + 1] = "host".to_string();
+        }
+        args.push("--permission-prompt-tool".to_string());
+        args.push(tool);
     }
     match req.mode {
         AgentMode::ReadOnly => {
@@ -192,6 +199,18 @@ fn args_with(
             args.push(format!("{READ_TOOLS},Bash,{mcp_tools}"));
             args.push("--permission-mode".to_string());
             args.push("acceptEdits".to_string());
+        }
+        AgentMode::Plan => {
+            // Claude Code's plan mode: it explores and writes its plan to
+            // its own plan file (`~/.claude/plans/`), nothing else. Shell
+            // and edits are denied outright, as for a review run; `Write`
+            // stays for the plan file, which the mode confines it to.
+            args.push("--allowedTools".to_string());
+            args.push(format!("{READ_TOOLS},{mcp_tools}"));
+            args.push("--disallowedTools".to_string());
+            args.push("Bash,Edit,MultiEdit,NotebookEdit".to_string());
+            args.push("--permission-mode".to_string());
+            args.push("plan".to_string());
         }
         AgentMode::Run => {
             // Every tool, no prompts: the CLI's own settings are the limit.
@@ -226,6 +245,15 @@ fn args_with(
     args
 }
 
+/// `mcp__<server>__approve_tool` when the user's MCP servers load next to
+/// Theodore's own and something would otherwise prompt (Run prompts for
+/// nothing).
+fn approve_tool(req: &AgentRequest) -> Option<String> {
+    let mcp = req.mcp.as_ref()?;
+    (req.user_mcp && req.mode != AgentMode::Run)
+        .then(|| format!("mcp__{}__{}", mcp.name, theodore_ports::APPROVE_TOOL))
+}
+
 /// The tools that write files; one `PreToolUse` matcher for all of them.
 const EDIT_TOOLS: &str = "Edit|Write|MultiEdit|NotebookEdit";
 
@@ -240,6 +268,14 @@ fn edit_settings(req: &AgentRequest, guard: Option<&Path>) -> Option<String> {
     }
     let mut roots = vec![req.cwd.clone()];
     roots.extend(attachment_dirs(req).into_iter().map(Path::to_path_buf));
+    if req.mode == AgentMode::Plan {
+        // Plan writes only its plan file (`plans`); the worktree stays
+        // untouched. No config dir known: every write is denied, and the
+        // plan comes from the final message instead.
+        roots = crate::models::claude_config_dir()
+            .map(|d| vec![d.join("plans")])
+            .unwrap_or_default();
+    }
     let mut settings = serde_json::json!({});
     if req.mode == AgentMode::Edit {
         let mut allow: Vec<String> = Vec::new();
@@ -357,6 +393,41 @@ impl ClaudeParser {
             usage: std::mem::take(&mut self.usage),
         }
     }
+}
+
+/// The plan a plan-mode run hands in, from its tool calls. Recorded from
+/// `claude -p … --permission-mode plan` (2.1.312, `tests/fixtures/
+/// claude_plan_mode.jsonl`): `-p` has no `ExitPlanMode`, so the plan is
+/// the file it `Write`s under `~/.claude/plans/` (Plan mode denies `Edit`,
+/// so a revision writes it whole again). An `ExitPlanMode` call, where a
+/// version has one, carries it as `input.plan`.
+fn plans(events: &[AgentEvent]) -> Vec<AgentEvent> {
+    events
+        .iter()
+        .filter_map(|ev| {
+            let AgentEvent::ToolCall { name, input, .. } = ev else {
+                return None;
+            };
+            let text = |key: &str| {
+                input
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.trim().is_empty())
+                    .map(str::to_string)
+            };
+            match name.as_str() {
+                "ExitPlanMode" => text("plan"),
+                "Write" if text("file_path").is_some_and(|p| is_plan_file(&p)) => text("content"),
+                _ => None,
+            }
+        })
+        .map(|text| AgentEvent::Plan { text })
+        .collect()
+}
+
+/// A file under Claude Code's plan directory (`~/.claude/plans/*.md`).
+fn is_plan_file(path: &str) -> bool {
+    path.contains("/.claude/plans/") && path.ends_with(".md")
 }
 
 /// Pure: one stream-json line in, zero or more normalized events out.
@@ -547,10 +618,19 @@ fn claude_usage(u: &Value, usd: f64) -> Usage {
 
 impl LineParser for ClaudeParser {
     fn on_line(&mut self, line: &str) -> Vec<AgentEvent> {
-        if self.stdin_input {
-            return self.on_stdin_line(line);
-        }
-        parse_line(line)
+        let mut events = if self.stdin_input {
+            self.on_stdin_line(line)
+        } else {
+            parse_line(line)
+        };
+        let plans = plans(&events);
+        // Before `Done`: the plan is part of the run, not after it.
+        let at = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Done { .. } | AgentEvent::Error { .. }))
+            .unwrap_or(events.len());
+        events.splice(at..at, plans);
+        events
     }
 
     fn on_exit(&mut self, success: bool, stderr_tail: &str) -> AgentEvent {
@@ -874,32 +954,69 @@ mod mcp_config_tests {
         assert_eq!(args[d + 1], "Bash,Edit,Write,MultiEdit,NotebookEdit");
     }
 
+    /// `flag`'s value, if `args` has it.
+    fn flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        let i = args.iter().position(|a| a == flag)?;
+        Some(args[i + 1].as_str())
+    }
+
     /// `agents.user_mcp` on: the user's own MCP servers load next to
-    /// `--mcp-config`, and their tools are pre-approved in every mode that
-    /// has an allowlist; a review run still can't write or run commands.
+    /// `--mcp-config`, and their calls are put to Theodore's `approve_tool`
+    /// instead of denied (issue #83); a review run still can't write or
+    /// run commands.
     #[test]
-    fn user_mcp_on_loads_and_allows_the_users_servers() {
-        for mode in [AgentMode::ReadOnly, AgentMode::Edit] {
+    fn user_mcp_on_loads_the_users_servers_and_asks_theodore() {
+        for (mode, server) in [
+            (AgentMode::ReadOnly, theodore_ports::REVIEW_TOOLS),
+            (AgentMode::Edit, theodore_ports::SPACE_TOOLS),
+        ] {
             let mut req = req_with_mcp("t");
             req.mode = mode;
             req.user_mcp = true;
+            req.mcp.as_mut().unwrap().name = server.into();
             let guard = write_mcp_config(&req).unwrap().expect("mcp config file");
             let args = build_args(&req, &Default::default(), Some(guard.path()));
             assert!(!args.iter().any(|a| a == "--strict-mcp-config"), "{args:?}");
             assert!(args.iter().any(|a| a == "--mcp-config"), "{args:?}");
-            let i = args.iter().position(|a| a == "--allowedTools").unwrap();
-            let allowed: Vec<&str> = args[i + 1].split(',').collect();
-            assert!(allowed.contains(&"mcp__review-tools__*"), "{allowed:?}");
-            assert!(allowed.contains(&"mcp__*"), "{allowed:?}");
+            assert_eq!(
+                flag(&args, "--permission-prompt-tool"),
+                Some(format!("mcp__{server}__approve_tool").as_str()),
+                "{mode:?}"
+            );
+            // `none` would deny before the tool is asked.
+            assert_eq!(flag(&args, "--permission-prompts"), Some("host"));
+            let allowed: Vec<&str> = flag(&args, "--allowedTools").unwrap().split(',').collect();
+            assert!(allowed.contains(&format!("mcp__{server}__*").as_str()));
+            // Matches no server in Claude Code: dead weight, and misleading.
+            assert!(!allowed.contains(&"mcp__*"), "{allowed:?}");
         }
         let mut req = req_with_mcp("t");
         req.user_mcp = true;
         let args = build_args(&req, &Default::default(), None);
-        let i = args
-            .iter()
-            .position(|a| a == "--disallowedTools")
-            .expect("denylist");
-        assert!(args[i + 1].contains("Bash") && args[i + 1].contains("Write"));
+        let denied = flag(&args, "--disallowedTools").expect("denylist");
+        assert!(denied.contains("Bash") && denied.contains("Write"));
+    }
+
+    /// Off, without Theodore's server, or in Run: nothing to ask, so
+    /// whatever isn't pre-approved stays denied, as before.
+    #[test]
+    fn no_approve_tool_without_user_mcp_a_server_or_prompts() {
+        let off = req_with_mcp("t");
+        let mut no_server = req_with_mcp("t");
+        no_server.user_mcp = true;
+        no_server.mcp = None;
+        let mut run = req_with_mcp("t");
+        run.user_mcp = true;
+        run.mode = AgentMode::Run;
+        for req in [off, no_server, run] {
+            let args = build_args(&req, &Default::default(), None);
+            assert!(
+                !args.iter().any(|a| a == "--permission-prompt-tool"),
+                "{args:?}"
+            );
+            assert_eq!(flag(&args, "--permission-prompts"), Some("none"));
+            assert!(!args.iter().any(|a| a.split(',').any(|t| t == "mcp__*")));
+        }
     }
 
     #[cfg(unix)]
@@ -1035,6 +1152,23 @@ mod run_mode_tests {
         assert!(s["hooks"]["PreToolUse"][0]["hooks"][0]["command"].is_string());
         // A binary that never installed the guard offers no hook.
         assert!(settings_of(&build_args_guarded(&req, &Default::default(), None, None)).is_none());
+
+        // Plan: the guard's only root is Claude's plan directory, so the
+        // plan file is written and the worktree never is.
+        req.mode = AgentMode::Plan;
+        let s = settings_of(&build_args_guarded(
+            &req,
+            &Default::default(),
+            None,
+            Some(exe),
+        ))
+        .expect("settings");
+        assert!(s.get("permissions").is_none());
+        let cmd = s["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(cmd.ends_with("/plans'"), "{cmd}");
+        assert!(!cmd.contains("/data/spaces/a1"), "{cmd}");
 
         req.mode = AgentMode::ReadOnly;
         let args = build_args_guarded(&req, &Default::default(), None, Some(exe));

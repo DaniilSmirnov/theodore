@@ -36,10 +36,15 @@
 #                                                       https://github.com/<repo>/releases/download)
 #   GRAMMARS_RELEASE_TAG   the release tag assets are published under
 #                                                      (default: grammars-<12 hex chars
-#                                                       of sha256(grammars.toml)> —
-#                                                       content-addressed, so re-running
-#                                                       on an unchanged pin reuses the
-#                                                       same tag)
+#                                                       of sha256(grammars.toml ++ every
+#                                                       crates/code-intel-toolchain/queries/*.scm,
+#                                                       concatenated in sorted filename
+#                                                       order)> — content-addressed, so
+#                                                       re-running with nothing changed
+#                                                       reuses the same tag, and editing
+#                                                       one of our own query files (even
+#                                                       with grammars.toml untouched)
+#                                                       still produces a new one)
 #   CODESIGN_IDENTITY      a Developer ID to sign dylibs with
 #                          (--options runtime); unset: ad-hoc `codesign -s -`
 #   CODESIGN_KEYCHAIN      keychain to find that identity in (`codesign
@@ -78,8 +83,24 @@ fi
 gh_repo="${GITHUB_REPOSITORY:-JeanIsahakyan/theodore}"
 release_base="${GRAMMARS_RELEASE_BASE:-https://github.com/$gh_repo/releases/download}"
 
+# Our own queries dir, read in sorted-filename order: every grammar.toml
+# key referring into it (the per-language fallback, or an explicit
+# tags_query_local) names a file here, so the release tag has to change
+# whenever one of these files does, not just when grammars.toml does.
+queries_dir="$root/crates/code-intel-toolchain/queries"
+own_query_files=()
+if [ -d "$queries_dir" ]; then
+  while IFS= read -r f; do
+    own_query_files+=("$f")
+  done < <(find "$queries_dir" -type f -name '*.scm' | sort)
+fi
+
 if [ -z "${GRAMMARS_RELEASE_TAG:-}" ]; then
-  toml_hash=$(shasum -a 256 "$toml" | awk '{print substr($1, 1, 12)}')
+  if [ "${#own_query_files[@]}" -gt 0 ]; then
+    toml_hash=$(cat "$toml" "${own_query_files[@]}" | shasum -a 256 | awk '{print substr($1, 1, 12)}')
+  else
+    toml_hash=$(shasum -a 256 "$toml" | awk '{print substr($1, 1, 12)}')
+  fi
   release_tag="grammars-$toml_hash"
 else
   release_tag="$GRAMMARS_RELEASE_TAG"
@@ -147,6 +168,8 @@ if cur is not None:
 
 for g in grammars:
     g.setdefault('tags_query', None)
+    g.setdefault('tags_query_local', None)
+    g.setdefault('tags_query_local_mode', 'replace')
     print(json.dumps(g))
 PY
 
@@ -161,6 +184,8 @@ while IFS= read -r grammar_json; do
   rev=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['rev'])" "$grammar_json")
   version=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['version'])" "$grammar_json")
   tags_query_rel=$(python3 -c "import json,sys; v=json.loads(sys.argv[1])['tags_query']; print(v if v else '')" "$grammar_json")
+  tags_query_local_rel=$(python3 -c "import json,sys; v=json.loads(sys.argv[1])['tags_query_local']; print(v if v else '')" "$grammar_json")
+  tags_query_local_mode=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['tags_query_local_mode'])" "$grammar_json")
   n_langs=$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])['languages']))" "$grammar_json")
 
   echo "=== $package $version (rev ${rev:0:12}) ==="
@@ -194,6 +219,24 @@ while IFS= read -r grammar_json; do
     tags_src="$src_checkout/$tags_query_rel"
   fi
 
+  # An explicit override/addition from this repo (grammars.toml:
+  # tags_query_local), resolved once per package too.
+  local_override=""
+  if [ -n "$tags_query_local_rel" ]; then
+    local_override="$root/$tags_query_local_rel"
+    if [ ! -f "$local_override" ]; then
+      echo "✗ $package: tags_query_local $tags_query_local_rel not found" >&2
+      exit 1
+    fi
+    case "$tags_query_local_mode" in
+      replace | append) ;;
+      *)
+        echo "✗ $package: tags_query_local_mode must be \"replace\" or \"append\", got \"$tags_query_local_mode\"" >&2
+        exit 1
+        ;;
+    esac
+  fi
+
   lang_idx=0
   obj_files=()
   while [ "$lang_idx" -lt "$n_langs" ]; do
@@ -220,9 +263,22 @@ while IFS= read -r grammar_json; do
       obj_files+=("$scanner_obj")
     fi
 
-    # Per-language tags query, falling back to our own hand-written one
-    # when the grammar ships none (listed in grammars.toml's comments).
+    # Per-language tags query.
+    #  - tags_query_local set, mode "append": upstream's bytes, then ours.
+    #  - tags_query_local set, mode "replace" (default): ours only.
+    #  - tags_query_local unset, upstream shipped none: fall back to our
+    #    own, matching this language's id (listed in grammars.toml's
+    #    comments) — the only case the fallback below still fires.
     lang_tags_src="$tags_src"
+    if [ -n "$local_override" ]; then
+      if [ "$tags_query_local_mode" = "append" ] && [ -n "$lang_tags_src" ]; then
+        combined="$pkg_work/$lang_id-tags-combined.scm"
+        cat "$lang_tags_src" "$local_override" > "$combined"
+        lang_tags_src="$combined"
+      else
+        lang_tags_src="$local_override"
+      fi
+    fi
     if [ -z "$lang_tags_src" ]; then
       own_tags="$root/crates/code-intel-toolchain/queries/$lang_id-tags.scm"
       if [ -f "$own_tags" ]; then

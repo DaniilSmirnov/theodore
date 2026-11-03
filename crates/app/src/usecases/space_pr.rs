@@ -20,8 +20,8 @@ use theodore_contract::{
 };
 use theodore_domain::{AgentId, PrId, PrState, Sha};
 use theodore_ports::{
-    AgentEvent, AgentMode, AgentRequest, DiffOptions, GitError, Identity, NewAction, SpaceCommit,
-    SyncActionCode,
+    AgentEvent, AgentMode, AgentRequest, DiffOptions, GitError, Identity, NewAction,
+    SpaceCheckpoint, SpaceCommit, SyncActionCode,
 };
 
 use crate::core::Core;
@@ -268,7 +268,8 @@ impl Core {
                 &space.id,
                 &format!("{}: edits before continuing", space.name),
             )
-            .await?;
+            .await?
+            .sha;
         let pushed = space
             .shipped
             .as_ref()
@@ -304,7 +305,14 @@ impl Core {
                 })?,
             _ => tip.clone(),
         };
-        git.space_reset(&wt.path, &space.id, &start).await?;
+        // A snapshot on the base's tip (docs/spaces.md §6): `HEAD` goes to
+        // the tip, the unpushed turns stay as uncommitted edits on it — the
+        // replayed commit's parent is the tip, like any checkpoint's.
+        let to = SpaceCheckpoint {
+            sha: start.clone(),
+            head: tip.clone(),
+        };
+        git.space_reset(&wt.path, &space.id, &to).await?;
 
         let branch = self.continued_branch(&space, &repo_path).await?;
         let now = self.0.deps.clock.now();
@@ -328,6 +336,7 @@ impl Core {
                 "branch": branch,
                 "base_sha": tip,
                 "head_sha": start,
+                "worktree_head": (start != tip).then_some(&tip),
                 "worktree": wt.path.display().to_string(),
                 "pr": null,
                 "shipped": null,

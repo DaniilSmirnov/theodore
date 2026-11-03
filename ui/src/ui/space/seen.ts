@@ -24,3 +24,15 @@ export function markSpaceSeen(id: string, at: number): void {
     JSON.stringify(Object.fromEntries(spaceSeen.entries())),
   );
 }
+
+/** "Mark as unread" (context menu / ⌘K): forgets the space was seen, so
+ *  it shows the ● glyph and counts toward the dock badge again, without
+ *  waiting for a new turn. */
+export function markSpaceUnseen(id: string): void {
+  if (!spaceSeen.has(id)) return;
+  runInAction(() => spaceSeen.delete(id));
+  localStorage.setItem(
+    LS_SEEN,
+    JSON.stringify(Object.fromEntries(spaceSeen.entries())),
+  );
+}

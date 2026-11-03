@@ -153,6 +153,20 @@ describe('DiffPane folds a file', () => {
     expect(hunks()).toBe(2);
   });
 
+  it('folds when marked Viewed while one of its hunks has focus', async () => {
+    // A click in a hunk (or J/K, or `V`) focuses it; Viewed still folds.
+    const f = await open(false, 'a0');
+    m = f;
+    expect(hunks()).toBe(2);
+    await click(viewedToggle());
+    expect(folded()).not.toBeNull();
+    expect(hunks()).toBe(0);
+    // A jump after that opens it again, so the focused hunk is on screen.
+    await f.focus('a1');
+    expect(folded()).toBeNull();
+    expect(m.host.querySelector('#H-a1')).not.toBeNull();
+  });
+
   it('folds and unfolds by hand from the chevron, without touching Viewed', async () => {
     m = await open();
     await click(chevron());

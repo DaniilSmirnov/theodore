@@ -1,0 +1,89 @@
+name: Servers
+
+# Builds the language servers we ship no upstream macOS binary for
+# (docs/code-intel.md §4.2 "No macOS binary upstream" — today just gopls)
+# and publishes them as a GitHub release's assets.
+#
+#   scripts/build-servers.sh ─▶ gopls-<ver>-darwin-arm64.tar.gz
+#     ─▶ release "servers-<content hash of build-servers.sh>" (prerelease)
+#     ─▶ gopls-manifest-snippet.yaml (workflow artifact only — a human
+#        pastes its sha256 into
+#        crates/code-intel-toolchain/manifest/languages.yaml's gopls entry,
+#        once this release exists)
+#
+# Manual (workflow_dispatch), or automatically when build-servers.sh
+# changes on staging (a server version bump merged like anything else).
+# Never on main or a PR, same reasoning as grammars.yml: this never needs
+# to run twice for the same pin, and the release tag is content-addressed
+# so a re-run of the same pin republishes the same tag's assets rather
+# than piling up releases.
+#
+# The release this makes is always `--prerelease` and `--latest=false`, and
+# its tag never matches what the updater polls (`releases/latest/...`,
+# `channel-staging`, `channel-beta` — docs/releasing.md "Branch flow" /
+# "Staging channel"), so it can never be picked up as an app update — same
+# updater-safety reasoning as grammars.yml.
+#
+# No signing step here (unlike grammars.yml): a language server runs as a
+# child process, and `code-intel-toolchain` ad-hoc signs the binary itself
+# right after unpacking it (crates/code-intel-toolchain/src/lib.rs
+# `sign_adhoc`, docs/code-intel.md §4.2 "Signing"), so there is nothing for
+# CI to sign ahead of time.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [staging]
+    paths:
+      - scripts/build-servers.sh
+
+concurrency:
+  group: servers-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Matches build.yml / grammars.yml's macOS runner.
+    runs-on: macos-26
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+
+      - name: build servers
+        run: sh scripts/build-servers.sh
+
+      - name: read the release tag build-servers.sh was generated for
+        id: tag
+        run: echo "tag=$(cat target/servers/RELEASE_TAG)" >> "$GITHUB_OUTPUT"
+
+      # A content-addressed tag (servers-<hash of build-servers.sh>):
+      # re-running on an unchanged pin republishes the same tag's assets
+      # instead of creating a new release every time.
+      - name: publish the servers release (prerelease, never "latest")
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --target "${{ github.sha }}" \
+              --title "Servers ($TAG)" \
+              --notes "Language servers built from scripts/build-servers.sh at ${{ github.sha }}. Not an app release: never polled by the updater (docs/releasing.md)." \
+              --prerelease \
+              --latest=false
+          fi
+          shopt -s nullglob
+          assets=(target/servers/*.tar.gz)
+          gh release upload "$TAG" --repo "${{ github.repository }}" --clobber "${assets[@]}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: servers-manifest-snippet
+          path: target/servers/gopls-manifest-snippet.yaml
+          if-no-files-found: error

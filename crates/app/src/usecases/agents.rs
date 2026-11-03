@@ -593,7 +593,9 @@ fn tool_target(input: &serde_json::Value) -> Option<String> {
             .or_else(|| s("url"))
             // Theodore's `set_base` and `ship`.
             .or_else(|| s("branch"))
-            .or_else(|| s("action"))?
+            .or_else(|| s("action"))
+            // `read_terminal`'s terminal id, when the agent named one.
+            .or_else(|| s("terminal"))?
             .trim()
             .to_string()
     };
@@ -621,6 +623,7 @@ pub(crate) fn tool_log_line(name: &str) -> String {
         "stop_app" => "stop the app",
         "app_status" => "app status",
         "read_logs" => "read the logs",
+        "read_terminal" => "read a terminal",
         "space_info" => "space info",
         "ship" => "ship the change",
         "get_space_diff" => "read the diff",
@@ -880,6 +883,17 @@ mod tool_label_tests {
                 &serde_json::json!({ "branch": "release" })
             ),
             "tool: change the base branch · release"
+        );
+        assert_eq!(
+            tool_log_line_with(
+                "mcp__space-tools__read_terminal",
+                &serde_json::json!({ "terminal": "t1" })
+            ),
+            "tool: read a terminal · t1"
+        );
+        assert_eq!(
+            tool_log_line_with("mcp__space-tools__read_terminal", &serde_json::json!({})),
+            "tool: read a terminal"
         );
         for (name, label) in [
             ("get_review_comments", "read the review comments"),

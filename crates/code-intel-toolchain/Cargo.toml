@@ -31,6 +31,9 @@ tree-sitter-language = "0.1"
 wiremock.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 pretty_assertions.workspace = true
+# tests/tsgo_lsp.rs only: drives a downloaded tsgo through the real LSP
+# client to check its definition/references/documentSymbol support.
+theodore-code-intel-lsp.workspace = true
 
 # Not `workspace = true`: the grammar loader needs `unsafe` (dlopen + a C
 # symbol), so `unsafe_code` is `deny` here instead of `forbid`, allowed only

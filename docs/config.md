@@ -257,9 +257,10 @@ code_intel:
   install: ask               # ask | always | never: language servers
   languages: [typescript, rust]   # empty: detected
   servers: { python: pyright }    # preferred server per language
-  max_servers: 4
+  max_servers: 4              # these four: your global file only
   idle_minutes: 10
   max_file_kb: 1024
+  cache_mb: 512              # index.sqlite size cap
   lsp:                       # your global / local file only
     spaces: true
     review: false            # true: a PR's code may run during reviews
@@ -274,13 +275,19 @@ code_intel:
 | `max_servers` | `4` | language servers alive at once |
 | `idle_minutes` | `10` | an idle server is shut down after this |
 | `max_file_kb` | `1024` | larger files are not indexed |
+| `cache_mb` | `512` | the symbol index is kept under this, least recently used first |
 | `lsp.spaces` | `true` | language servers serve your spaces (an untrusted space only with `lsp.review` too) |
 | `lsp.review` | `false` | language servers serve review runs on PRs. **A PR's code may run** (build scripts, macros, plugins), written by whoever opened the PR |
 
+- `max_servers`, `idle_minutes`, `max_file_kb` and `cache_mb` are one
+  setting for the whole app (one server pool, one index): only your global
+  file sets them, the editor warns on them elsewhere. A change applies
+  without a restart.
 - `lsp.*` is honoured only from your global and local files. A repo's file
   setting it is ignored, with a toast, and the editor warns on that line:
   a repo turning servers on for reviews of its own PRs would run their
-  authors' code. Unset, the Settings → Languages toggles apply.
+  authors' code. Each project's switches (Settings → Projects → ⟨project⟩
+  → Languages) write its local file; unset there, your global file applies.
 
 - Read like the rest of the repo layer: at the base, never at a PR's head,
   so a PR can't change what gets downloaded or run.
@@ -366,6 +373,7 @@ No tool runs a command the agent writes; there is no shell tool.
 | `stop_app` | stops `run`, waits up to 10 s for it to exit; returns the status |
 | `app_status` | `running`, `ports`, `urls` (`http://localhost:<port>` each), whether `run` is set and allowed, how the last run ended |
 | `read_logs` | the last `tail` lines (default 100, at most 400) of one `kind`: `setup`, `run`, `check` or `archive`; stderr lines start with `! ` |
+| `read_terminal` | one of the space's open terminals (docs/spaces.md §3 "Terminal"): `terminal?` (id, default the most recently active), `lines?` (default 200, at most 2000); returns `id`, `title`, `running`, `lines` (ANSI stripped), or a `note` when none is open |
 | `space_info` | name, branch, base, worktree, ports and URLs, the **names** of the variables a command gets (§4, `env`) — never their values — and which commands are set and allowed |
 
 ```

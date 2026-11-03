@@ -370,3 +370,72 @@ async fn push_after_an_update_merges_the_base_into_the_pr_branch() {
     assert_eq!(c.head, Sha::new("merged-base222"), "the merged tree");
     assert_eq!(ship.pushes[1], (s.branch.clone(), Sha::new("squash2")));
 }
+
+/// Snapshot checkpoints with an update (docs/spaces.md §3, §6): "Back to
+/// here" over the turn that completed the merge puts the old base back,
+/// and nothing goes back — rewind or Revert — while the merge resolves.
+#[tokio::test]
+async fn back_to_here_over_an_update_restores_the_base_and_waits_for_it() {
+    let f = fixtures();
+    let (core, _recv, project) = host_project(&f).await;
+    let s = one_turn(&f, &core, &project).await;
+    base_moves(&f);
+    f.git
+        .push_merge_result(SpaceMerge::Conflicts(vec!["a.txt".into()]));
+    f.git
+        .push_merge_result(SpaceMerge::Conflicts(vec!["a.txt".into()]));
+    f.agents.push_script(done("Not yet."));
+    core.update_space_from_base(&s.id).await.unwrap();
+    let s = idle(&f, &s.id).await;
+    assert!(s.updating.is_some());
+    let err = core
+        .rewind_space(theodore_contract::RewindSpaceRequest {
+            space: s.id.clone(),
+            reply: s.turn_log[0].reply.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("update from base"), "{err}");
+    let err = core
+        .revert_space_file(theodore_contract::RevertSpaceFileRequest {
+            space: s.id.clone(),
+            paths: vec!["a.txt".into()],
+            from: theodore_contract::SpaceRevertFrom::Base,
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("update from base"), "{err}");
+
+    // Resolved by the next turn: the merge commit is the checkpoint and
+    // `HEAD` both.
+    f.agents.push_script(done("Resolved."));
+    core.space_send(theodore_contract::SpaceSendRequest {
+        space: s.id.clone(),
+        text: "resolve it".into(),
+        agent: None,
+        model: None,
+        mode: None,
+        attachments: None,
+    })
+    .await
+    .unwrap();
+    let s = idle(&f, &s.id).await;
+    assert_eq!(s.updating, None);
+    assert_eq!(s.base_sha, Sha::new("base222"));
+    let merged = s.turn_log.last().unwrap();
+    assert_eq!(merged.after, Sha::new("merged-base222"));
+    assert_eq!(merged.after_head, Some(Sha::new("merged-base222")));
+    assert_eq!(s.worktree_head, Some(Sha::new("merged-base222")));
+
+    // Back to turn 1: both later turns undone, the old base back.
+    let s = core
+        .rewind_space(theodore_contract::RewindSpaceRequest {
+            space: s.id.clone(),
+            reply: s.turn_log[0].reply.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(s.head_sha, Sha::new("turn111"));
+    assert_eq!(s.base_sha, Sha::new("base000"));
+    assert!(s.turn_log[1..].iter().all(|t| t.undone));
+}

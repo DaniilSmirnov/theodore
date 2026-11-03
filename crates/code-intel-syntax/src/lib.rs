@@ -35,7 +35,7 @@ mod text;
 pub use edit::{insert_after, replace_range};
 pub use error::{Result, SyntaxError};
 pub use grammar::{CompiledGrammar, Grammar, kind_for_syntax_type};
-pub use index::{IndexOutcome, SyntaxIndex};
+pub use index::{Eviction, IndexOutcome, SyntaxIndex};
 pub use indexer::{
     GrammarFuture, GrammarProvider, Indexer, IndexerConfig, Priority, Progress, WorkspaceIndex,
 };

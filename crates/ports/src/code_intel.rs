@@ -267,7 +267,7 @@ pub struct ServerStatus {
     pub state: ServerState,
 }
 
-/// One language of a workspace, for `status()` and Settings → Languages.
+/// One language of a workspace, for `status()` and project settings → Languages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LanguageStatus {
     pub language: LanguageId,
@@ -277,6 +277,82 @@ pub struct LanguageStatus {
     /// The server that would serve it, if the manifest has one.
     pub server: Option<ServerStatus>,
     pub index_percent: u8,
+}
+
+/// Machine-wide limits (`code_intel.max_servers`, `idle_minutes`,
+/// `max_file_kb`, `cache_mb`; docs/code-intel.md §9). The app has one
+/// server pool and one index for every project, so these come from your
+/// global config only, never from a repo's or a local file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeIntelLimits {
+    /// Language servers alive at once.
+    pub max_servers: usize,
+    /// An unused server is shut down after this many minutes.
+    pub idle_minutes: u32,
+    /// Larger files are not indexed.
+    pub max_file_kb: usize,
+    /// `index.sqlite` is kept under this; least recently used blobs go.
+    pub cache_mb: u64,
+}
+
+impl Default for CodeIntelLimits {
+    fn default() -> Self {
+        Self {
+            max_servers: 4,
+            idle_minutes: 10,
+            max_file_kb: 1024,
+            cache_mb: 512,
+        }
+    }
+}
+
+/// What an install is downloading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InstallItem {
+    Grammar,
+    Server,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum InstallProgressState {
+    /// `received` bytes so far; `total` when the server said.
+    Downloading {
+        received: u64,
+        total: Option<u64>,
+    },
+    Installed,
+    Failed {
+        error: String,
+    },
+}
+
+/// One step of [`CodeIntelPort::install`]: at most a few per second per
+/// item while downloading, then `Installed` or `Failed` once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallProgress {
+    /// The language being installed.
+    pub language: LanguageId,
+    pub what: InstallItem,
+    /// The grammar package (`tree-sitter-rust`) or server (`rust-analyzer`).
+    pub name: String,
+    pub state: InstallProgressState,
+}
+
+/// Where [`CodeIntelPort::install`] reports its progress.
+pub type InstallProgressFn = std::sync::Arc<dyn Fn(InstallProgress) + Send + Sync>;
+
+/// Hover text for the diff view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hover {
+    /// Markdown. From the syntax layer: the definition's signature line(s)
+    /// in a code block and a line saying it was matched by name.
+    pub text: String,
+    /// `Lsp`: the server's hover. `Syntax`: a definition with the name
+    /// under the cursor, which may be another symbol of that name.
+    pub source: Source,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -357,9 +433,27 @@ pub trait CodeIntelPort: Send + Sync {
         new_name: &str,
     ) -> CodeIntelResult<Vec<TextEdit>>;
 
+    /// Hover text at `at`: the language server's, else the signature of a
+    /// definition with the name under the cursor (`Hover::source` says
+    /// which). `None`: nothing to show.
+    async fn hover(&self, root: &Path, path: &str, at: Position) -> CodeIntelResult<Option<Hover>>;
+
     /// Download `language`'s grammar and preferred server: the user said
-    /// yes, or `code_intel.install: always`.
-    async fn install(&self, language: &LanguageId) -> CodeIntelResult<()>;
+    /// yes, or `code_intel.install: always`. `progress` hears each download
+    /// (throttled) and how each item ended.
+    async fn install(
+        &self,
+        language: &LanguageId,
+        progress: Option<InstallProgressFn>,
+    ) -> CodeIntelResult<()>;
+    /// Delete what Theodore downloaded for `language`: its server's
+    /// versions (its sessions stop, in every worktree) and its grammar
+    /// package. Refused while an open worktree has files of a language that
+    /// grammar parses. Afterwards both are `Missing`, and the grammar is
+    /// not fetched again on its own until [`install`](Self::install).
+    async fn remove(&self, language: &LanguageId) -> CodeIntelResult<()>;
+    /// Apply new machine-wide limits, live.
+    async fn set_limits(&self, limits: CodeIntelLimits);
 
     /// A file in the worktree changed on disk (spaces' watcher).
     async fn file_changed(&self, root: &Path, path: &str);

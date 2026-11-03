@@ -51,13 +51,18 @@ async fn trusted_space_routes_to_the_ready_server() {
     assert_eq!(found.items[0].range.start.line, 2);
 
     // `helper();` on line 3: the fake answers its first occurrence, plus a
-    // location outside the worktree, which is dropped.
+    // location outside the worktree, which stays out of the items (their
+    // paths are repo-relative) and is named in the note.
     let def = ci
         .definition(wt.path(), "src/lib.rs", at(3, 14))
         .await
         .unwrap();
     assert_eq!(def.source, Source::Lsp);
     assert_eq!(def.items.len(), 1);
+    assert_eq!(
+        def.note.as_deref(),
+        Some("1 result outside the worktree (std / dependencies): /outside/lib.rs")
+    );
     assert_eq!(def.items[0].location.path, "src/lib.rs");
     assert_eq!(def.items[0].location.range.start.line, 2);
     assert_eq!(def.items[0].preview.lines().nth(1), Some("fn helper() {}"));
@@ -94,8 +99,13 @@ async fn trusted_space_routes_to_the_ready_server() {
     );
 
     // Spaces get the trusted options.
-    let hover = ci.hover(wt.path(), "src/lib.rs", at(1, 1)).await.unwrap();
-    let report: serde_json::Value = serde_json::from_str(&hover.unwrap()).unwrap();
+    let hover = ci
+        .hover(wt.path(), "src/lib.rs", at(1, 1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(hover.source, Source::Lsp);
+    let report: serde_json::Value = serde_json::from_str(&hover.text).unwrap();
     assert_eq!(report["init_options"]["mode"], "trusted");
 
     ci.close(wt.path()).await;
@@ -251,7 +261,7 @@ async fn review_sessions_get_review_options_and_their_own_process() {
         let (ci, root) = (ci.clone(), root.to_path_buf());
         async move {
             let hover = ci.hover(&root, "src/lib.rs", at(1, 1)).await.unwrap();
-            let report: serde_json::Value = serde_json::from_str(&hover.unwrap()).unwrap();
+            let report: serde_json::Value = serde_json::from_str(&hover.unwrap().text).unwrap();
             report["init_options"]["mode"].as_str().unwrap().to_string()
         }
     };

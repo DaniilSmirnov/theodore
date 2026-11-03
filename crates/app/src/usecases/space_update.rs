@@ -19,7 +19,9 @@ use theodore_contract::{
     SpaceUpdate, models,
 };
 use theodore_domain::Sha;
-use theodore_ports::{GitError, GitResult, NewAction, SpaceMerge, SyncActionCode, WorktreeBusy};
+use theodore_ports::{
+    GitError, GitResult, NewAction, SpaceCheckpoint, SpaceMerge, SyncActionCode, WorktreeBusy,
+};
 
 use crate::core::Core;
 use crate::error::{AppError, AppResult};
@@ -31,7 +33,7 @@ const LISTED: usize = 40;
 /// The end of a turn in a space (`drive_turn`): a normal checkpoint, or,
 /// while an update from base is resolving, the merge's completion.
 pub(crate) struct TurnCheckpoint {
-    pub result: GitResult<Sha>,
+    pub result: GitResult<SpaceCheckpoint>,
     /// More fields for the space's patch (`base_sha`, `updating`).
     pub patch: Option<serde_json::Value>,
     /// The base before the merge this turn completed (`SpaceTurn`).
@@ -124,13 +126,15 @@ impl Core {
         }
         // Hand edits since the last turn get a checkpoint of their own: the
         // merge wants a clean tree, and Abort comes back to it.
+        // The merge then makes it `HEAD` itself (`space_merge`).
         let from = git
             .space_checkpoint(
                 &wt.path,
                 &space.id,
                 &format!("{}: edits before updating from {}", space.name, space.base),
             )
-            .await?;
+            .await?
+            .sha;
         let now = self.0.deps.clock.now();
         match git
             .space_merge(&wt.path, &space.id, &tip, &merge_message(&space))
@@ -141,6 +145,8 @@ impl Core {
                     &space.id,
                     serde_json::json!({
                         "head_sha": head,
+                        // A merge commit: the checkpoint is `HEAD`.
+                        "worktree_head": null,
                         "base_sha": tip,
                         "status": SpaceStatus::Idle,
                         "error": null,
@@ -157,6 +163,7 @@ impl Core {
                     &space.id,
                     serde_json::json!({
                         "head_sha": from,
+                        "worktree_head": null,
                         "updating": SpaceUpdate {
                             base_tip: tip,
                             from: from.clone(),
@@ -225,6 +232,8 @@ impl Core {
             serde_json::json!({
                 "updating": null,
                 "head_sha": update.from,
+                // Abort resets hard to it: `HEAD` is the checkpoint.
+                "worktree_head": null,
                 "status": SpaceStatus::Idle,
                 "error": null,
                 // Its session resolved files that are gone now.
@@ -252,8 +261,9 @@ impl Core {
         merge_fields(&mut data, extra);
         let left = match &finish {
             Finish::Left(paths) => Some(paths.clone()),
-            Finish::Merged(head) | Finish::Abandoned(head) => {
-                data["head_sha"] = serde_json::json!(head);
+            Finish::Merged(cp) | Finish::Abandoned(cp) => {
+                data["head_sha"] = serde_json::json!(cp.sha);
+                data["worktree_head"] = serde_json::json!(cp.head);
                 data["status"] = serde_json::json!(SpaceStatus::Idle);
                 data["error"] = serde_json::Value::Null;
                 None
@@ -281,7 +291,10 @@ impl Core {
             .await?
         {
             SpaceMerge::Merged(head) => Ok((
-                Finish::Merged(head),
+                Finish::Merged(SpaceCheckpoint {
+                    sha: head.clone(),
+                    head,
+                }),
                 serde_json::json!({ "base_sha": update.base_tip, "updating": null }),
             )),
             SpaceMerge::Conflicts(conflicts) => Ok((
@@ -315,9 +328,10 @@ impl Core {
 }
 
 enum Finish {
-    Merged(Sha),
+    /// The merge commit: the checkpoint and `HEAD` both.
+    Merged(SpaceCheckpoint),
     Left(Vec<String>),
-    Abandoned(Sha),
+    Abandoned(SpaceCheckpoint),
 }
 
 /// The checkpoint at the end of a turn in `cwd` (docs/spaces.md §6): while

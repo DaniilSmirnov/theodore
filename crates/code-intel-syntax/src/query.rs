@@ -115,14 +115,17 @@ impl SyntaxIndex {
         kind: Option<CodeSymbolKind>,
     ) -> Result<Vec<CodeSymbol>> {
         let mut out = Vec::new();
+        let mut used: HashSet<String> = HashSet::new();
         for row in self.tags_named(name, true)? {
             for f in snap.paths_for_blob(&row.sha) {
                 let sym = row.to_symbol(&f.path);
                 if kind.is_none_or(|k| k == sym.kind) {
+                    used.insert(row.sha.clone());
                     out.push(sym);
                 }
             }
         }
+        self.touch_used(&used);
         out.sort_by(|a, b| (&a.path, a.range.start).cmp(&(&b.path, b.range.start)));
         Ok(out)
     }
@@ -134,12 +137,26 @@ impl SyntaxIndex {
         let entry = snap
             .get(path)
             .ok_or_else(|| CodeIntelError::FileNotFound(path.to_string()))?;
-        Ok(self
+        let syms: Vec<CodeSymbol> = self
             .tags_of_blob(&entry.blob_sha)?
             .iter()
             .filter(|t| t.is_def)
             .map(|t| t.to_symbol(path))
-            .collect())
+            .collect();
+        if !syms.is_empty() {
+            self.touch_used(&HashSet::from([entry.blob_sha.clone()]));
+        }
+        Ok(syms)
+    }
+
+    /// `touch`, best effort: a failed write never fails the query.
+    fn touch_used(&self, shas: &HashSet<String>) {
+        if shas.is_empty() {
+            return;
+        }
+        if let Err(e) = self.touch(shas.iter().map(String::as_str)) {
+            tracing::debug!(error = %e, "index: touch failed");
+        }
     }
 
     /// The identifier at `at` in `path`: the tag whose name covers it, or
@@ -240,6 +257,7 @@ impl SyntaxIndex {
                 hits.push((f.path.clone(), row.clone()));
             }
         }
+        self.touch_used(&hits.iter().map(|(_, r)| r.sha.clone()).collect());
         let def_paths: HashSet<&str> = hits
             .iter()
             .filter(|(_, r)| r.is_def)

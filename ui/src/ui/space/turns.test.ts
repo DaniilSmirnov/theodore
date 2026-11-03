@@ -7,9 +7,14 @@ import {
   nativeNotice,
   notifyOn,
   spaceOfReview,
+  lastAgentTurn,
+  rewindState,
   undoState,
   undoneMessages,
   waitingSpaces,
+  questionAsked,
+  plansByReply,
+  actionablePlan,
 } from './spaces';
 
 const space = (over: Partial<Space> & { id: string }): Space => ({
@@ -149,6 +154,55 @@ describe('undo last turn', () => {
   });
 });
 
+describe('back to here', () => {
+  const three = [...twoTurns, turn(3, 't2', 't3')];
+
+  it('offers every live reply but the last, with the core’s refusals', () => {
+    const s = space({ id: 's', head_sha: 't3', turn_log: three });
+    expect(rewindState(s, 'r1')).toEqual({ ok: true, reason: null });
+    expect(rewindState(s, 'r2')).toEqual({ ok: true, reason: null });
+    expect(rewindState(s, 'r3')).toBeNull();
+    expect(rewindState(s, 'nope')).toBeNull();
+    const running = space({ ...s, status: 'running' });
+    expect(rewindState(running, 'r1')).toMatchObject({
+      ok: false,
+      reason: /still working/,
+    });
+    // Shipped at turn 2: back to turn 2 is fine, back to turn 1 isn't.
+    const shipped = space({
+      ...s,
+      shipped: {
+        how: 'pr',
+        branch: 'space/s',
+        sha: 'squash',
+        head: 't2',
+        pushes: 1,
+        at: 0,
+      },
+    });
+    expect(rewindState(shipped, 'r2')?.ok).toBe(true);
+    expect(rewindState(shipped, 'r1')).toMatchObject({
+      ok: false,
+      reason: /Already pushed/,
+    });
+  });
+
+  it('skips undone turns', () => {
+    const log = [three[0]!, three[1]!, { ...three[2]!, undone: true }];
+    const s = space({ id: 's', head_sha: 't2', turn_log: log });
+    expect(rewindState(s, 'r2')).toBeNull();
+    expect(rewindState(s, 'r3')).toBeNull();
+    expect(rewindState(s, 'r1')?.ok).toBe(true);
+  });
+
+  it('reverts a file from the last agent turn, not from a revert', () => {
+    const revert = { ...turn(3, 't2', 'rev'), reply: 'm3', reverted: ['a'] };
+    const s = space({ id: 's', turn_log: [...twoTurns, revert] });
+    expect(lastAgentTurn(s)).toEqual(twoTurns[1]);
+    expect(lastAgentTurn(space({ id: 'x' }))).toBeNull();
+  });
+});
+
 describe('notifications', () => {
   it('are on unless turned off', () => {
     expect(notifyOn([])).toBe(true);
@@ -200,5 +254,52 @@ describe('notifications', () => {
     ];
     const seen = (id: string) => (id === 'seen' ? 10 : undefined);
     expect(waitingSpaces(spaces, seen)).toBe(2);
+    // A turn waiting on your answer counts too.
+    const asking = space({
+      id: 'asking',
+      status: 'running',
+      turns: 1,
+      question: { id: 'q', run: 'r', questions: [], asked_at: 0 },
+    });
+    expect(waitingSpaces([...spaces, asking], seen)).toBe(3);
+  });
+
+  it('a new question is a notice once, with its first question', () => {
+    const q = {
+      id: 'q1',
+      run: 'r',
+      questions: [{ question: 'Which store?', options: ['a', 'b'] }],
+      asked_at: 0,
+    };
+    const next = { name: 'fix', goal: '', question: q };
+    expect(questionAsked({ question: null }, next)).toEqual({
+      title: 'fix: question',
+      body: 'Which store?',
+    });
+    expect(questionAsked({ question: q }, next)).toBeNull();
+    expect(questionAsked(undefined, { ...next, question: null })).toBeNull();
+  });
+
+  it('only the last, live plan turn gets Approve / Revise', () => {
+    const t = (reply: string, plan: string | null, undone = false) =>
+      ({ reply, plan, undone }) as never;
+    const log = [t('a1', '1. old'), t('a2', null), t('a3', '1. new')];
+    expect(plansByReply(log)).toEqual(
+      new Map([
+        ['a1', '1. old'],
+        ['a3', '1. new'],
+      ]),
+    );
+    expect(actionablePlan({ status: 'idle', turn_log: log })).toBe('a3');
+    expect(actionablePlan({ status: 'running', turn_log: log })).toBeNull();
+    expect(
+      actionablePlan({ status: 'idle', turn_log: [...log, t('a4', null)] }),
+    ).toBeNull();
+    expect(
+      actionablePlan({
+        status: 'idle',
+        turn_log: [t('a1', '1. p'), t('a2', null, true)],
+      }),
+    ).toBe('a1');
   });
 });

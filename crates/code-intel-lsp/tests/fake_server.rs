@@ -175,8 +175,11 @@ async fn positions_convert_through_utf16_and_utf8() {
             .await
             .unwrap();
         assert_eq!(s.encoding(), Some(expect));
-        // The server's second location is outside the worktree: dropped.
-        assert_eq!(defs, vec![loc("src/lib.rs", 4, 4, 10)], "{enc}");
+        // The server's second location is outside the worktree: counted
+        // and named, never made relative.
+        assert_eq!(defs.items, vec![loc("src/lib.rs", 4, 4, 10)], "{enc}");
+        assert_eq!(defs.external_count, 1);
+        assert_eq!(defs.external, vec!["/outside/lib.rs".to_string()]);
 
         // Open the other file so references see it too.
         s.document_symbols(root, "src/other.rs").await.unwrap();
@@ -185,8 +188,9 @@ async fn positions_convert_through_utf16_and_utf8() {
             .await
             .unwrap();
         let other = col(OTHER, 2, "target");
+        assert_eq!(refs.external_count, 0);
         assert_eq!(
-            refs,
+            refs.items,
             vec![
                 loc("src/lib.rs", 4, 4, 10),
                 loc("src/lib.rs", 5, call, call + 6),
@@ -198,7 +202,7 @@ async fn positions_convert_through_utf16_and_utf8() {
             .references(root, "src/lib.rs", Position { line: 5, col: call }, false)
             .await
             .unwrap();
-        assert_eq!(without_decl.len(), 2);
+        assert_eq!(without_decl.items.len(), 2);
         s.shutdown().await;
     }
 }
@@ -380,6 +384,7 @@ async fn a_hung_request_times_out_and_the_session_survives() {
         !s.definition(root, "src/lib.rs", Position { line: 4, col: 5 })
             .await
             .unwrap()
+            .items
             .is_empty()
     );
 }
@@ -575,7 +580,7 @@ async fn worktrees_join_one_server_as_workspace_folders() {
         .definition(b.path(), "src/lib.rs", Position { line: 4, col: 5 })
         .await
         .unwrap();
-    assert_eq!(defs, vec![loc("src/lib.rs", 4, 4, 10)]);
+    assert_eq!(defs.items, vec![loc("src/lib.rs", 4, 4, 10)]);
 
     pool.release_root(b.path()).await;
     assert!(matches!(

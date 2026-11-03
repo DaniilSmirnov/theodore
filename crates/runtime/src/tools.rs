@@ -16,10 +16,11 @@ use theodore_mcp::{
     CodeToolsBackend, FileSummary, GroupSummary, GroupWithHunks, LogTail, McpHandle, McpServer,
     NewFinding, NewPatch, NewReviewComment, PrContext, ProgressStep, ReviewItem,
     ReviewToolsBackend, RunContext, ShipOutcome, ShipToolAction, SpaceCommandName, SpaceDiff,
-    SpaceInfo, SpaceToolError, SpaceToolsBackend, ToolSet,
+    SpaceInfo, SpaceToolError, SpaceToolsBackend, TerminalTail, ToolSet,
 };
 use theodore_ports::{
     Answer, CodeHit, CodeSymbol, CodeSymbolKind, Diagnostic, LanguageStatus, McpEndpoint, Position,
+    UserAnswer, UserQuestion,
 };
 
 /// Backend over the core. Created before the core exists (the core needs the
@@ -206,6 +207,17 @@ impl SpaceToolsBackend for CoreTools {
         self.space_core()?.space_tool_logs(space, kind, tail).await
     }
 
+    async fn read_terminal(
+        &self,
+        space: &str,
+        terminal: Option<&str>,
+        lines: usize,
+    ) -> Result<TerminalTail, SpaceToolError> {
+        self.space_core()?
+            .space_tool_read_terminal(space, terminal, lines)
+            .await
+    }
+
     async fn space_info(&self, space: &str) -> Result<SpaceInfo, SpaceToolError> {
         self.space_core()?.space_tool_info(space).await
     }
@@ -269,6 +281,17 @@ impl SpaceToolsBackend for CoreTools {
     ) -> Result<(), SpaceToolError> {
         self.space_core()?
             .space_tool_progress(space, &run_id.0, steps, note)
+            .await
+    }
+
+    async fn ask_user(
+        &self,
+        space: &str,
+        run_id: &RunId,
+        questions: Vec<UserQuestion>,
+    ) -> Result<Vec<UserAnswer>, SpaceToolError> {
+        self.space_core()?
+            .space_tool_ask(space, &run_id.0, questions)
             .await
     }
 }

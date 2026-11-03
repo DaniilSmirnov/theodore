@@ -18,6 +18,8 @@
 #   `/` matches the repo-relative path. First language whose glob matches wins.
 #   tags_extends  a language whose tags query is prepended to this one's
 #              (upstream TypeScript tags.scm is written to extend JavaScript's).
+#   prose      data or prose, not code (Markdown, JSON, YAML, TOML): never
+#              searched by a code query's text fallback.
 
 servers:
   - name: rust-analyzer
@@ -76,8 +78,42 @@ servers:
       plugins: []
       disableAutomaticTypingAcquisition: true
 
+  - name: tsgo
+    # TypeScript's native-preview compiler/language service (tsgo). Its
+    # LSP mode is verified for definition/references/documentSymbol
+    # (crates/code-intel-toolchain/tests/tsgo_lsp.rs, run with --ignored)
+    # against this crate's own package: it answers all three. Listed ahead
+    # of typescript-language-server (docs/code-intel.md §11 open question
+    # resolved: default for TypeScript).
+    version: "7.0.0-dev.20260707.2"
+    detect: [["tsgo", "--version"]]
+    download:
+      darwin-arm64:
+        # The npm package is platform-specific
+        # (@typescript/native-preview-darwin-arm64); the generic
+        # @typescript/native-preview just execs this one's binary.
+        url: https://registry.npmjs.org/@typescript/native-preview-darwin-arm64/-/native-preview-darwin-arm64-7.0.0-dev.20260707.2.tgz
+        sha256: a6d0b46d71358db2d602324c553366a58fa1d031f5dfa12c09a35b6be17fe503
+        size: 9270694
+        format: npm-tgz
+        bin: lib/tsgo
+    launch: ["{bin}", "--lsp", "--stdio"]
+    workspace_folders: true
+
   - name: gopls
+    # No macOS binary upstream; built by us (docs/code-intel.md §4.2):
+    # scripts/build-servers.sh + .github/workflows/servers.yml, pinned to
+    # that workflow's published build.
+    version: "0.24.0"
     detect: [["gopls", "version"]]
+    download:
+      darwin-arm64:
+        url: https://github.com/JeanIsahakyan/theodore/releases/download/servers-68915d68b083/gopls-0.24.0-darwin-arm64.tar.gz
+        sha256: 56c92b7c0835b512cd94f532c5a494345d4666fefc49cb174a469910e23e776d
+        size: 21605310
+        format: tar.gz
+        bin: gopls
+        redirect_hosts: [release-assets.githubusercontent.com, objects.githubusercontent.com]
     launch: ["{bin}"]
     workspace_folders: true
 
@@ -101,6 +137,76 @@ servers:
     launch: ["{bin}"]
     workspace_folders: true
 
+  - name: zls
+    # Upstream only publishes .tar.xz for darwin-arm64 (zigtools/zls
+    # release 0.17.0); ArchiveFormat has no xz variant (tar.gz, zip, gz,
+    # binary, npm-tgz, wheel — crates/code-intel-toolchain/src/manifest.rs),
+    # so there is no `download` here yet. Detect-only until that format
+    # exists: found on the machine, never downloaded (docs/code-intel.md
+    # §4.3 right column, same as sourcekit-lsp above).
+    detect: [["zls", "--version"]]
+    launch: ["{bin}"]
+    workspace_folders: true
+
+  - name: lua-language-server
+    version: "3.19.2"
+    detect: [["lua-language-server", "--version"]]
+    download:
+      darwin-arm64:
+        url: https://github.com/LuaLS/lua-language-server/releases/download/3.19.2/lua-language-server-3.19.2-darwin-arm64.tar.gz
+        sha256: 79149584320a23bd5fcd5bc31f47a1975acd8a4560a0e89036bb1016fa61687f
+        size: 3286148
+        format: tar.gz
+        bin: bin/lua-language-server
+        redirect_hosts: [release-assets.githubusercontent.com, objects.githubusercontent.com]
+    launch: ["{bin}"]
+    workspace_folders: true
+
+  - name: taplo
+    version: "0.10.0"
+    detect: [["taplo", "--version"]]
+    download:
+      darwin-arm64:
+        url: https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-darwin-aarch64.gz
+        sha256: 713734314c3e71894b9e77513c5349835eefbd52908445a0d73b0c7dc469347d
+        size: 4616415
+        format: gz
+        bin: taplo
+        redirect_hosts: [release-assets.githubusercontent.com, objects.githubusercontent.com]
+    launch: ["{bin}", "lsp", "stdio"]
+    workspace_folders: true
+
+  - name: marksman
+    version: "2026-02-08"
+    detect: [["marksman", "--version"]]
+    download:
+      darwin-arm64:
+        # A universal binary (x86_64 + arm64); one asset for both Mac
+        # platforms.
+        url: https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman-macos
+        sha256: 6a801c17b5ac0dba69787c5282b3b3bd416e66c96253fae098d311c6bbd1833b
+        size: 43856208
+        format: binary
+        bin: marksman
+        redirect_hosts: [release-assets.githubusercontent.com, objects.githubusercontent.com]
+    launch: ["{bin}", "server"]
+    workspace_folders: true
+
+  - name: terraform-ls
+    version: "0.39.1"
+    detect: [["terraform-ls", "--version"]]
+    download:
+      darwin-arm64:
+        # HashiCorp's own CDN, not GitHub releases: it answers the asset
+        # directly, no redirect, so no redirect_hosts.
+        url: https://releases.hashicorp.com/terraform-ls/0.39.1/terraform-ls_0.39.1_darwin_arm64.zip
+        sha256: 07748aa989fc3b9f6e4538ff83bc2e607ebc20c7587ce6556ae555d631e70b1b
+        size: 34111708
+        format: zip
+        bin: terraform-ls
+    launch: ["{bin}", "serve"]
+    workspace_folders: true
+
 languages:
   - id: rust
     globs: ["*.rs"]
@@ -108,12 +214,12 @@ languages:
   - id: typescript
     globs: ["*.ts", "*.mts", "*.cts"]
     tags_extends: javascript
-    servers: [typescript-language-server]
+    servers: [tsgo, typescript-language-server]
   - id: tsx
     globs: ["*.tsx"]
     lsp_id: typescriptreact
     tags_extends: javascript
-    servers: [typescript-language-server]
+    servers: [tsgo, typescript-language-server]
   - id: javascript
     globs: ["*.js", "*.mjs", "*.cjs", "*.jsx"]
     servers: [typescript-language-server]
@@ -132,13 +238,33 @@ languages:
   - id: swift
     globs: ["*.swift"]
     servers: [sourcekit-lsp]
+  - id: zig
+    globs: ["*.zig", "*.zon"]
+    servers: [zls]
+  - id: lua
+    globs: ["*.lua"]
+    servers: [lua-language-server]
   - id: json
+    prose: true
     globs: ["*.json", "*.jsonc"]
   - id: yaml
+    prose: true
     globs: ["*.yaml", "*.yml"]
   - id: toml
+    prose: true
     globs: ["*.toml"]
+    servers: [taplo]
   - id: markdown
+    prose: true
     globs: ["*.md", "*.markdown"]
+    servers: [marksman]
+  - id: terraform
+    globs: ["*.tf", "*.tfvars"]
+    servers: [terraform-ls]
   - id: dockerfile
     globs: ["Dockerfile", "Dockerfile.*", "*.dockerfile"]
+  - id: bash
+    # No language server pinned yet (bash-language-server needs Node and
+    # is not in scope here); the grammar (when CI builds one — another
+    # agent's grammars.toml entry) and text search still work without one.
+    globs: ["*.sh", "*.bash", ".bashrc", ".bash_profile", ".bash_aliases"]

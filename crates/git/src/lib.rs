@@ -12,6 +12,7 @@
 
 mod auth;
 mod branches;
+mod checkpoints;
 mod config_file;
 mod conflicts;
 mod diff;
@@ -21,6 +22,7 @@ mod history;
 mod local;
 mod locks;
 mod meta;
+mod mirror;
 mod parse;
 mod process;
 pub use process::isolate_from_user_config;
@@ -472,12 +474,30 @@ impl GitPort for GitCli {
         worktree: &Path,
         space: &str,
         message: &str,
-    ) -> GitResult<Sha> {
+    ) -> GitResult<theodore_ports::SpaceCheckpoint> {
         self.space_checkpoint_op(worktree, space, message).await
     }
 
-    async fn space_reset(&self, worktree: &Path, space: &str, to: &Sha) -> GitResult<()> {
+    async fn space_reset(
+        &self,
+        worktree: &Path,
+        space: &str,
+        to: &theodore_ports::SpaceCheckpoint,
+    ) -> GitResult<()> {
         self.space_reset_op(worktree, space, to).await
+    }
+
+    async fn space_restore_paths(
+        &self,
+        worktree: &Path,
+        paths: &[String],
+        from: &Sha,
+    ) -> GitResult<()> {
+        self.space_restore_paths_op(worktree, paths, from).await
+    }
+
+    async fn space_fingerprint(&self, worktree: &Path) -> GitResult<String> {
+        self.space_fingerprint_op(worktree).await
     }
 
     async fn worktree_busy(
@@ -566,6 +586,37 @@ impl GitPort for GitCli {
     ) -> GitResult<()> {
         self.write_folder_branch_op(folder, repo, space, branch)
             .await
+    }
+
+    async fn mirror_sync(
+        &self,
+        folder: &Path,
+        repo: &Path,
+        space: &str,
+        to: &Sha,
+        from: &Sha,
+    ) -> GitResult<Vec<String>> {
+        self.mirror_sync_op(folder, repo, space, to, from).await
+    }
+
+    async fn mirror_edited(
+        &self,
+        folder: &Path,
+        repo: &Path,
+        space: &str,
+        to: &Sha,
+        paths: &[String],
+    ) -> GitResult<Vec<String>> {
+        self.mirror_edited_op(folder, repo, space, to, paths).await
+    }
+
+    async fn mirror_restore(
+        &self,
+        folder: &Path,
+        from: &Sha,
+        paths: &[String],
+    ) -> GitResult<Vec<String>> {
+        self.mirror_restore_op(folder, from, paths).await
     }
 
     async fn commit_file(

@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use crate::DEFAULT_MAX_FILE_BYTES;
 use crate::error::{Result, SyntaxError};
 use crate::grammar::{CompiledGrammar, Grammar};
-use crate::index::{BlobStatus, SyntaxIndex};
+use crate::index::{BlobStatus, IndexOutcome, SyntaxIndex};
 use crate::snapshot::{FileEntry, Snapshot};
 use crate::text::mentions;
 
@@ -112,6 +112,8 @@ pub struct Indexer {
     provider: GrammarProvider,
     config: IndexerConfig,
     permits: Arc<Semaphore>,
+    /// `config.max_file_bytes`, changeable while workspaces index.
+    max_file_bytes: Arc<AtomicUsize>,
 }
 
 impl Indexer {
@@ -120,6 +122,7 @@ impl Indexer {
         Self {
             index,
             provider,
+            max_file_bytes: Arc::new(AtomicUsize::new(config.max_file_bytes)),
             config,
             permits,
         }
@@ -129,6 +132,17 @@ impl Indexer {
         &self.index
     }
 
+    pub fn max_file_bytes(&self) -> usize {
+        self.max_file_bytes.load(Ordering::Relaxed)
+    }
+
+    /// A new size limit for every workspace, open ones included: files
+    /// parsed from now on use it. Files skipped as too large under the old
+    /// one are retried by [`WorkspaceIndex::retry_too_large`].
+    pub fn set_max_file_bytes(&self, bytes: usize) {
+        self.max_file_bytes.store(bytes, Ordering::Relaxed);
+    }
+
     /// Starts indexing `snapshot` in the background; every file is queued
     /// at [`Priority::Rest`]. Must be called inside a Tokio runtime.
     pub fn start(&self, snapshot: Snapshot) -> WorkspaceIndex {
@@ -136,7 +150,7 @@ impl Indexer {
         let shared = Arc::new(Shared {
             index: self.index.clone(),
             provider: self.provider.clone(),
-            max_file_bytes: self.config.max_file_bytes,
+            max_file_bytes: self.max_file_bytes.clone(),
             permits: self.permits.clone(),
             cancel: CancellationToken::new(),
             abort: Arc::new(AtomicUsize::new(0)),
@@ -149,6 +163,7 @@ impl Indexer {
                 parked: HashMap::new(),
                 grammars: HashMap::new(),
                 processed: HashSet::new(),
+                too_large: HashSet::new(),
                 in_flight: 0,
             }),
         });
@@ -184,6 +199,8 @@ struct State {
     /// Blobs done with in this workspace: indexed, cached, skipped or
     /// failed.
     processed: HashSet<String>,
+    /// Processed blobs skipped as over the size limit.
+    too_large: HashSet<String>,
     in_flight: usize,
 }
 
@@ -232,7 +249,7 @@ struct Job {
 struct Shared {
     index: SyntaxIndex,
     provider: GrammarProvider,
-    max_file_bytes: usize,
+    max_file_bytes: Arc<AtomicUsize>,
     permits: Arc<Semaphore>,
     cancel: CancellationToken,
     /// tree-sitter's cancellation flag: non-zero aborts a running parse.
@@ -348,33 +365,35 @@ impl Shared {
         None
     }
 
-    /// Reads and indexes one file. Blocking.
-    fn run(&self, job: &Job) -> Result<()> {
+    /// Reads and indexes one file. Blocking. `true`: skipped as over the
+    /// size limit.
+    fn run(&self, job: &Job) -> Result<bool> {
+        let max = self.max_file_bytes.load(Ordering::Relaxed);
         let status = self.index.status(&job.sha, &job.grammar)?;
         if matches!(status, Some(BlobStatus::Indexed | BlobStatus::Binary)) {
-            return Ok(());
+            // Found cached: this worktree uses it, so it is not evicted first.
+            self.index.touch([job.sha.as_str()])?;
+            return Ok(false);
         }
         let full = self.lock().snapshot.root().join(&job.path);
         let len = std::fs::metadata(&full)?.len();
-        if len > self.max_file_bytes as u64 {
+        if len > max as u64 {
             if status.is_none() {
                 self.index
                     .record_skip(&job.sha, &job.grammar, BlobStatus::TooLarge)?;
+            } else {
+                self.index.touch([job.sha.as_str()])?;
             }
-            return Ok(());
+            return Ok(true);
         }
         let source = std::fs::read(&full)?;
-        self.index.index_compiled(
-            &job.sha,
-            &job.grammar,
-            &source,
-            self.max_file_bytes,
-            Some(&self.abort),
-        )?;
-        Ok(())
+        let outcome =
+            self.index
+                .index_compiled(&job.sha, &job.grammar, &source, max, Some(&self.abort))?;
+        Ok(outcome == IndexOutcome::TooLarge)
     }
 
-    fn finish(&self, sha: String, path: &str, result: Result<()>) {
+    fn finish(&self, sha: String, path: &str, result: Result<bool>) {
         {
             let mut st = self.lock();
             st.in_flight = st.in_flight.saturating_sub(1);
@@ -384,7 +403,10 @@ impl Shared {
                     tracing::debug!(path, error = %e, "not indexed");
                     st.processed.insert(sha);
                 }
-                Ok(()) => {
+                Ok(too_large) => {
+                    if too_large {
+                        st.too_large.insert(sha.clone());
+                    }
                     st.processed.insert(sha);
                 }
             }
@@ -488,7 +510,7 @@ impl WorkspaceIndex {
             candidates.dedup();
             (st.snapshot.root().to_path_buf(), candidates)
         };
-        let max = self.shared.max_file_bytes as u64;
+        let max = self.shared.max_file_bytes.load(Ordering::Relaxed) as u64;
         let cancel = self.shared.cancel.clone();
         let matched = tokio::task::spawn_blocking(move || {
             let finders: Vec<memmem::Finder<'_>> = names
@@ -582,6 +604,41 @@ impl WorkspaceIndex {
             }
         }
         self.shared.resolve(vec![lang.clone()]);
+        self.shared.bump();
+    }
+
+    /// Requeues the files skipped as over the size limit (the limit grew).
+    /// Returns how many.
+    pub fn retry_too_large(&self) -> usize {
+        let n = {
+            let mut st = self.shared.lock();
+            let shas: Vec<String> = st.too_large.drain().collect();
+            let mut paths: Vec<String> = Vec::new();
+            for sha in &shas {
+                st.processed.remove(sha);
+                paths.extend(st.snapshot.paths_for_blob(sha).map(|f| f.path.clone()));
+            }
+            for p in &paths {
+                st.enqueue(p, Priority::Rest);
+            }
+            paths.len()
+        };
+        self.shared.bump();
+        n
+    }
+
+    /// The index dropped these blobs (an eviction over the cap): they count
+    /// as not indexed again, so queries fill them in with text search.
+    /// Not requeued — a query about one of the files indexes it again
+    /// ([`index_now`](Self::index_now)).
+    pub fn forget(&self, shas: &[String]) {
+        {
+            let mut st = self.shared.lock();
+            for sha in shas {
+                st.processed.remove(sha);
+                st.too_large.remove(sha);
+            }
+        }
         self.shared.bump();
     }
 

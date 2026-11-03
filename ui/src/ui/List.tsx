@@ -50,7 +50,9 @@ import { api } from '../core/api';
 import { useRootStore, useUi } from '../stores/context';
 import { Avatar, Btn, Empty, Hints, K } from './bits';
 import { useContextMenu, type ContextMenuItem } from './ContextMenu';
+import { ListSearchBar } from './ListSearchBar';
 import { Peek } from './Peek';
+import { matchesSearch, prSearchText } from './search';
 import { PrStatusIcon, prStatusLabel } from './StatusIcon';
 import { latinKey, useViewKeys } from './keys';
 import {
@@ -1034,10 +1036,24 @@ export const Inbox = observer(function Inbox() {
     ...(showDone ? [{ id: 'done', title: 'Done', items: done }] : []),
   ].filter((g) => g.items.length || g.id === 'snoozed');
 
+  // ⌘F (search.ts): filtered groups replace the normal ones everywhere —
+  // navigation, Peek and the list itself — so J/K and Enter already work
+  // on just the matches.
+  const query = ui.listSearch?.scope === 'prs' ? ui.listSearch.query : null;
+  const visibleGroups =
+    query === null
+      ? groups
+      : groups
+          .map((g) => ({
+            ...g,
+            items: g.items.filter((p) => matchesSearch(prSearchText(p), query)),
+          }))
+          .filter((g) => g.items.length);
+
   // J/K and the Peek follow what's waiting: a PR you just snoozed or marked
   // done leaves the selection, which moves on to the next one.
   useListKeys(
-    order(groups.filter((g) => g.id !== 'snoozed' && g.id !== 'done')),
+    order(visibleGroups.filter((g) => g.id !== 'snoozed' && g.id !== 'done')),
   );
 
   return (
@@ -1064,9 +1080,24 @@ export const Inbox = observer(function Inbox() {
         />
         <PeekToggle on={ui.peek} fits={fits} toggle={() => ui.togglePeek()} />
       </ViewHeader>
+      {query !== null && (
+        <ListSearchBar
+          query={query}
+          onQueryChange={(q) => ui.setListSearchQuery(q)}
+          order={order(
+            visibleGroups.filter((g) => g.id !== 'snoozed' && g.id !== 'done'),
+          )}
+          selected={ui.selected}
+          onSelect={(id) => ui.select(id as PrId)}
+          onOpen={(id) => ui.go({ name: 'review', pr: id as PrId })}
+          onClose={() => ui.closeListSearch()}
+          placeholder="Search inbox…"
+          reopenToken={ui.listSearchFocusAt}
+        />
+      )}
       <div ref={pageRef} className="flex min-h-0 flex-1">
         <ListBody
-          groups={groups}
+          groups={visibleGroups}
           sel={ui.selected}
           picked={ui.picked}
           onSelect={(id) => ui.select(id)}
@@ -1126,7 +1157,8 @@ function ListHints() {
     <Hints>
       <K>J</K>
       <K>K</K> navigate <K>⏎</K> open <K>Space</K> preview <K>X</K> select{' '}
-      <K>E</K> done <K>H</K> snooze <K>⌘K</K> everything <K>⌘Z</K> undo
+      <K>E</K> done <K>H</K> snooze <K>⌘F</K> search <K>⌘K</K> everything{' '}
+      <K>⌘Z</K> undo
     </Hints>
   );
 }

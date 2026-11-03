@@ -35,10 +35,11 @@ use crate::backend::{
     ReviewToolsBackend, RunContext, SpaceToolError, SpaceToolsBackend, ToolSet,
 };
 use crate::tools::{
-    AddFindingParams, AddFindingResult, BaseFileResult, CodeAnswerResult, CodeEditResult,
-    CodeStatusResult, DiagnosticItem, DiagnosticsParams, FindSymbolParams, GetBaseFileParams,
-    GetGroupParams, GetSymbolParams, GroupResult, HitItem, InsertAfterSymbolParams, PositionParams,
-    PrContextResult, ProposePatchParams, ProposePatchResult, ReadLogsParams, RenameSymbolParams,
+    AddFindingParams, AddFindingResult, AskUserParams, AskUserResult, BaseFileResult,
+    CodeAnswerResult, CodeEditResult, CodeStatusResult, DiagnosticItem, DiagnosticsParams,
+    FindSymbolParams, GetBaseFileParams, GetGroupParams, GetSymbolParams, GroupResult, HitItem,
+    InsertAfterSymbolParams, PositionParams, PrContextResult, ProposePatchParams,
+    ProposePatchResult, ReadLogsParams, ReadTerminalParams, RenameSymbolParams,
     ReplaceSymbolBodyParams, SymbolBodyResult, SymbolItem,
 };
 
@@ -174,7 +175,8 @@ impl ReviewToolsServer {
             tool_router: Self::review_router()
                 + Self::space_router()
                 + Self::space_agent_router()
-                + Self::code_router(),
+                + Self::code_router()
+                + Self::approve_router(),
         }
     }
 
@@ -336,6 +338,23 @@ impl ReviewToolsServer {
     }
 
     #[tool(
+        description = "One of the space's open terminals (docs/spaces.md \"Terminal\"): its id, title, whether its shell still runs, and its last lines, ANSI stripped. Leave `terminal` out for the most recently active one. A clear note, not an error, when no terminal is open."
+    )]
+    async fn read_terminal(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(params): Parameters<ReadTerminalParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (_, space) = run_space(&parts)?;
+        let lines = params.bounded_lines();
+        space_result(
+            self.spaces
+                .read_terminal(&space, params.terminal.as_deref(), lines)
+                .await,
+        )
+    }
+
+    #[tool(
         description = "The space: name, branch, base, worktree path, ports and URLs, environment variable names (not values), and which commands are configured and allowed."
     )]
     async fn space_info(
@@ -344,6 +363,27 @@ impl ReviewToolsServer {
     ) -> Result<CallToolResult, ErrorData> {
         let (_, space) = run_space(&parts)?;
         space_result(self.spaces.space_info(&space).await)
+    }
+
+    #[tool(
+        description = "Ask the user 1-3 questions when you can't go on without their decision (which approach, which name, what they meant). Each question has 2-4 short options; the user may pick one (or several with multi) or type their own. Waits until they answer and returns the answers. Don't ask what you can find out yourself."
+    )]
+    async fn ask_user(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(params): Parameters<AskUserParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (run, space) = run_space(&parts)?;
+        let questions = params.into_questions();
+        if let Some(why) = theodore_ports::invalid_questions(&questions) {
+            return Err(ErrorData::invalid_params(why, None));
+        }
+        space_result(
+            self.spaces
+                .ask_user(&space, &run.run_id, questions)
+                .await
+                .map(|answers| AskUserResult { answers }),
+        )
     }
 }
 
@@ -528,8 +568,8 @@ impl ServerHandler for ReviewToolsServer {
             {
                 return Ok(CallToolResponse::Complete(CallToolResult::error(vec![
                     ContentBlock::text(
-                        "code edits are off: this turn is in Ask mode. Ask the user to switch \
-                         the space to Edit",
+                        "code edits are off: this turn is in Ask or Plan mode. Ask the user to \
+                         switch the space to Edit",
                     ),
                 ])));
             }

@@ -118,6 +118,16 @@ pub struct Worktree {
     pub head: Sha,
 }
 
+/// One space checkpoint (docs/spaces.md §6): the worktree as a commit, and
+/// the worktree's own `HEAD` when it was taken. `sha == head` when nothing
+/// was uncommitted; a checkpoint from before snapshots is a commit that was
+/// `HEAD`, so `head` is `sha` there too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceCheckpoint {
+    pub sha: Sha,
+    pub head: Sha,
+}
+
 /// One local branch of a project (plan "projects"): host projects list
 /// remote branches of the bare clone, local folder projects list the
 /// folder's own branches, both read off the same `refs/heads/*` namespace.
@@ -408,29 +418,61 @@ pub trait GitPort: Send + Sync {
         Err(GitError::Unsupported("space_worktree"))
     }
 
-    /// Commits everything in a space's worktree (if anything changed) as a
-    /// checkpoint and points `refs/theodore/spaces/<space>` at `HEAD` —
-    /// including commits the agent made itself. Returns `HEAD`. Commits
-    /// nothing, with `Busy`, while a rebase, merge or conflict is
-    /// unfinished there; `NotAWorktree` when git would resolve another
-    /// repository from `worktree`.
+    /// Snapshots everything in a space's worktree (tracked and untracked,
+    /// `.gitignore` honored) through a temporary index into a commit on top
+    /// of the worktree's `HEAD`, and points `refs/theodore/spaces/<space>`
+    /// at it. The worktree's `HEAD`, branch and index stay as they are, so
+    /// the agent's own commits are kept as it made them. A worktree that
+    /// matches the last checkpoint gets that checkpoint again; one that
+    /// matches `HEAD` gets `HEAD`. Snapshots nothing, with `Busy`, while a
+    /// rebase, merge or conflict is unfinished there; `NotAWorktree` when
+    /// git would resolve another repository from `worktree`.
     async fn space_checkpoint(
         &self,
         worktree: &Path,
         space: &str,
         message: &str,
-    ) -> GitResult<Sha> {
+    ) -> GitResult<SpaceCheckpoint> {
         let _ = (worktree, space, message);
         Err(GitError::Unsupported("space_checkpoint"))
     }
 
-    /// Moves a space back to an earlier checkpoint `to`: its worktree is
-    /// reset to it (tracked and untracked edits dropped; ignored files
-    /// stay) and `refs/theodore/spaces/<space>` points at it again. Same
+    /// Moves a space back to the earlier checkpoint `to`: `HEAD` is reset
+    /// (mixed) to `to.head` and the worktree made to match `to.sha`,
+    /// writing only the files whose content differs and removing untracked
+    /// files that weren't in it (ignored files stay);
+    /// `refs/theodore/spaces/<space>` points at `to.sha` again. Same
     /// refusals as `space_checkpoint`.
-    async fn space_reset(&self, worktree: &Path, space: &str, to: &Sha) -> GitResult<()> {
+    async fn space_reset(
+        &self,
+        worktree: &Path,
+        space: &str,
+        to: &SpaceCheckpoint,
+    ) -> GitResult<()> {
         let _ = (worktree, space, to);
         Err(GitError::Unsupported("space_reset"))
+    }
+
+    /// Makes `paths` in a space's worktree as they are in commit `from`:
+    /// written from it, or removed when `from` has no such file. `HEAD`,
+    /// the index and refs stay; the caller checkpoints. Same refusals as
+    /// `space_checkpoint`; a path that leaves the worktree is `Refused`.
+    async fn space_restore_paths(
+        &self,
+        worktree: &Path,
+        paths: &[String],
+        from: &Sha,
+    ) -> GitResult<()> {
+        let _ = (worktree, paths, from);
+        Err(GitError::Unsupported("space_restore_paths"))
+    }
+
+    /// A cheap fingerprint of a space worktree's changes (`HEAD`, what
+    /// `status` lists, and those files' size and mtime): equal while
+    /// nothing changed. Read only; never writes the index.
+    async fn space_fingerprint(&self, worktree: &Path) -> GitResult<String> {
+        let _ = worktree;
+        Err(GitError::Unsupported("space_fingerprint"))
     }
 
     /// The git operation unfinished in a space's `worktree`, if any. Read
@@ -444,7 +486,8 @@ pub trait GitPort: Send + Sync {
     /// The space's worktree as it is now, as a commit on top of `HEAD`:
     /// staged through a temporary index, so the worktree's own index, its
     /// `HEAD` and every ref stay as they were. `HEAD` itself when nothing
-    /// changed since the last checkpoint.
+    /// is uncommitted; the same worktree on the same `HEAD` gives the same
+    /// commit (its dates are `HEAD`'s).
     async fn space_snapshot(&self, worktree: &Path) -> GitResult<Sha> {
         let _ = worktree;
         Err(GitError::Unsupported("space_snapshot"))
@@ -571,6 +614,61 @@ pub trait GitPort: Send + Sync {
         Err(GitError::Unsupported("write_folder_branch"))
     }
 
+    // ── mirroring a space into a local folder (docs/spaces.md) ───────────
+
+    /// Writes the space's checkpoint `to` into `folder`'s working tree
+    /// (docs/spaces.md "Mirror into a local folder"): only the paths that
+    /// differ between `from` and `to` are rewritten or removed (the first
+    /// sync passes the space's own `base_sha`, so only what the agent
+    /// actually changed is written, not the whole tree). The folder's own
+    /// index, branch and `HEAD` are never touched — a temporary index does
+    /// the lookup. Returns the paths written or removed, for the caller to
+    /// fold into the running set mirroring has ever touched (`mirror_edited`
+    /// / `mirror_restore` work from that set, not from a single diff: a
+    /// path the agent added and then removed again has no net difference
+    /// between the session's endpoints, but still needs to be watched and
+    /// restored).
+    async fn mirror_sync(
+        &self,
+        folder: &Path,
+        repo: &Path,
+        space: &str,
+        to: &Sha,
+        from: &Sha,
+    ) -> GitResult<Vec<String>> {
+        let _ = (folder, repo, space, to, from);
+        Err(GitError::Unsupported("mirror_sync"))
+    }
+
+    /// Which of `paths` (the running set `mirror_sync` has ever touched) no
+    /// longer match what mirroring wrote there, checked against `to`'s
+    /// tree (the last checkpoint mirrored) by content — never a timestamp.
+    async fn mirror_edited(
+        &self,
+        folder: &Path,
+        repo: &Path,
+        space: &str,
+        to: &Sha,
+        paths: &[String],
+    ) -> GitResult<Vec<String>> {
+        let _ = (folder, repo, space, to, paths);
+        Err(GitError::Unsupported("mirror_edited"))
+    }
+
+    /// Restores every path in `paths` to its content at `from` (the
+    /// folder's own remembered `HEAD`, already local — no fetch needed)
+    /// and touches nothing else: the folder's branch, `HEAD` and index
+    /// stay exactly as they were. Returns the paths restored or removed.
+    async fn mirror_restore(
+        &self,
+        folder: &Path,
+        from: &Sha,
+        paths: &[String],
+    ) -> GitResult<Vec<String>> {
+        let _ = (folder, from, paths);
+        Err(GitError::Unsupported("mirror_restore"))
+    }
+
     // ── saving a project's config (docs/config.md) ───────────────────────
 
     /// Writes one commit on top of `parent` in the bare cache `repo` whose
@@ -658,6 +756,14 @@ pub fn space_ref(space: &str) -> String {
 }
 
 pub const SPACE_REF_PREFIX: &str = "refs/theodore/spaces/";
+
+/// Keeps one checkpoint of a space reachable (docs/spaces.md §6): each
+/// snapshot's parent is the worktree's `HEAD`, not the checkpoint before
+/// it, so without these refs an older checkpoint could be pruned by `gc`
+/// and Undo, rewind or Push would lose it.
+pub fn space_checkpoint_ref(space: &str, sha: &Sha) -> String {
+    format!("refs/theodore/checkpoints/{space}/{}", sha.as_str())
+}
 
 /// A local folder's checkout, from `GitPort::working_state`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

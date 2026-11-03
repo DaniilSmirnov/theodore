@@ -39,7 +39,7 @@ use theodore_ports::code_intel::{
 };
 
 pub use detect::git_ls_files;
-pub use download::http_client;
+pub use download::{OnBytes, http_client};
 pub use grammar::{LoadedGrammar, check_abi, supported_abi};
 pub use manifest::{
     ArchiveFormat, Artifact, BIN_PLACEHOLDER, GRAMMARS_SCHEMA, GrammarLanguage, GrammarSpec,
@@ -219,6 +219,17 @@ impl Toolchain {
     /// The language's grammar, downloaded if needed and loaded once per
     /// process. Concurrent calls share one download.
     pub async fn ensure_grammar(&self, language: &LanguageId) -> CodeIntelResult<LoadedGrammar> {
+        self.ensure_grammar_with(language, None).await
+    }
+
+    /// [`ensure_grammar`](Self::ensure_grammar), telling `on_bytes` how a
+    /// download goes (not called when the grammar is on disk, or when it
+    /// joins a download another call started).
+    pub async fn ensure_grammar_with(
+        &self,
+        language: &LanguageId,
+        on_bytes: Option<&OnBytes>,
+    ) -> CodeIntelResult<LoadedGrammar> {
         if let Some(g) = lock(&self.inner.grammars).get(language) {
             return Ok(g.clone());
         }
@@ -239,7 +250,9 @@ impl Toolchain {
             return Ok(g.clone());
         }
 
-        let result = self.load_or_install_grammar(&spec, language, &key).await;
+        let result = self
+            .load_or_install_grammar(&spec, language, &key, on_bytes)
+            .await;
         self.record(&key, &result);
         let loaded = result?;
         lock(&self.inner.grammars).insert(language.clone(), loaded.clone());
@@ -251,6 +264,7 @@ impl Toolchain {
         spec: &GrammarSpec,
         language: &LanguageId,
         key: &str,
+        on_bytes: Option<&OnBytes>,
     ) -> CodeIntelResult<LoadedGrammar> {
         let dir = self.grammar_dir(spec);
         let platform = self.inner.platform.clone();
@@ -267,7 +281,15 @@ impl Toolchain {
                 tracing::warn!(target: "code_intel", dir = %dir.display(), "grammar cache does not match the manifest; downloading again");
             }
             let _busy = Busy::mark(&self.inner, key);
-            grammar::install(&self.inner.http, &self.inner.root, spec, &platform, &dir).await?;
+            grammar::install(
+                &self.inner.http,
+                &self.inner.root,
+                spec,
+                &platform,
+                &dir,
+                on_bytes,
+            )
+            .await?;
         }
         let (spec, language) = (spec.clone(), language.clone());
         tokio::task::spawn_blocking(move || grammar::load(&dir, &spec, &language))
@@ -336,6 +358,16 @@ impl Toolchain {
     /// Download, verify and unpack `spec` for this platform. Already
     /// installed → returns it. Concurrent calls share one download.
     pub async fn install_server(&self, spec: &ServerSpec) -> CodeIntelResult<ResolvedServer> {
+        self.install_server_with(spec, None).await
+    }
+
+    /// [`install_server`](Self::install_server), telling `on_bytes` how the
+    /// download goes.
+    pub async fn install_server_with(
+        &self,
+        spec: &ServerSpec,
+        on_bytes: Option<&OnBytes>,
+    ) -> CodeIntelResult<ResolvedServer> {
         let platform = &self.inner.platform;
         let (Some(dl), Some(version)) = (spec.download_for(platform), spec.version.as_deref())
         else {
@@ -357,6 +389,7 @@ impl Toolchain {
                 &self.inner.http,
                 &dl.artifact(),
                 &self.inner.root.join("tmp"),
+                on_bytes,
             )
             .await?;
             let dir = self.server_dir(&spec.name, version);
@@ -418,6 +451,66 @@ impl Toolchain {
     }
 
     // ── cleanup ───────────────────────────────────────────────────────────
+
+    /// Deletes every downloaded version of server `name`
+    /// (`servers/<name>/`); one found on the machine is not ours and stays.
+    /// Refused while it downloads. Its state is `Missing` again. Blocking
+    /// (file system only); stopping its processes first is the caller's.
+    /// `true`: something was deleted.
+    pub fn remove_server(&self, name: &str) -> CodeIntelResult<bool> {
+        let prefix = format!("server:{name}@");
+        if lock(&self.inner.busy)
+            .iter()
+            .any(|k| k.starts_with(&prefix))
+        {
+            return Err(CodeIntelError::Other(format!(
+                "{name} is downloading; try again when it is done"
+            )));
+        }
+        lock(&self.inner.failed).retain(|k, _| !k.starts_with(&prefix));
+        let dir = self.inner.root.join("servers").join(name);
+        if !dir.exists() {
+            return Ok(false);
+        }
+        std::fs::remove_dir_all(&dir).map_err(|e| io_err(&dir, e))?;
+        tracing::info!(target: "code_intel", server = name, "server removed");
+        Ok(true)
+    }
+
+    /// Deletes the grammar package of `language` (with every language it
+    /// holds: `typescript` takes `tsx`) and forgets it was loaded, so its
+    /// state is `Missing` again. A library already loaded stays mapped in
+    /// this process (it is never unloaded) but no new load finds it.
+    /// Refused while it downloads. Blocking. Returns the package's
+    /// languages; empty when the language has no grammar.
+    pub fn remove_grammar(&self, language: &LanguageId) -> CodeIntelResult<Vec<LanguageId>> {
+        let Some(spec) = self.grammar_spec(language).cloned() else {
+            return Ok(Vec::new());
+        };
+        let key = grammar_key(&spec);
+        if lock(&self.inner.busy).contains(&key) {
+            return Err(CodeIntelError::Other(format!(
+                "{} is downloading; try again when it is done",
+                spec.package
+            )));
+        }
+        let langs: Vec<LanguageId> = spec.languages.iter().map(|l| l.id.clone()).collect();
+        {
+            let mut loaded = lock(&self.inner.grammars);
+            for l in &langs {
+                loaded.remove(l);
+            }
+        }
+        lock(&self.inner.failed).remove(&key);
+        let dir = self.grammar_dir(&spec);
+        for d in [grammar::partial_of(&dir), dir] {
+            if d.exists() {
+                std::fs::remove_dir_all(&d).map_err(|e| io_err(&d, e))?;
+            }
+        }
+        tracing::info!(target: "code_intel", package = %spec.package, "grammar removed");
+        Ok(langs)
+    }
 
     /// Remove what is no longer needed. Blocking (file system only).
     ///

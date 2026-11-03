@@ -31,6 +31,8 @@ mod project_state;
 pub use project_state::*;
 mod space_progress;
 pub use space_progress::*;
+mod space_checkpoints;
+pub use space_checkpoints::*;
 mod spaces;
 pub use spaces::*;
 mod space_queue;
@@ -616,6 +618,19 @@ pub enum Ephemeral {
         /// The server that would be downloaded (`clangd`).
         server: String,
     },
+    /// An install (`code_intel_install`, or `code_intel.install: always`)
+    /// downloading `language`'s grammar or server: `downloading` at most
+    /// four times a second per item, then `installed` or `failed`.
+    CodeIntelProgress {
+        /// The project whose worktree asked for it; `None` from Settings.
+        project: Option<String>,
+        language: String,
+        what: CodeInstallItem,
+        /// The grammar package (`tree-sitter-rust`) or server
+        /// (`rust-analyzer`).
+        name: String,
+        state: CodeInstallProgress,
+    },
     /// Raw PTY output of a space's terminal (docs/spaces.md "Terminal"),
     /// base64 (control sequences and all) so a chunk split mid UTF-8 still
     /// round-trips — `xterm.js`'s own parser tolerates that. `seq` is
@@ -807,6 +822,10 @@ pub fn types() -> specta::Types {
         .register::<CodeServer>()
         .register::<CodeInstall>()
         .register::<CodeServerState>()
+        .register::<CodeInstallItem>()
+        .register::<CodeInstallProgress>()
+        .register::<CodeHoverRequest>()
+        .register::<CodeHover>()
         .register::<StackInfo>()
         .register::<ReactionCount>()
         .register::<DiffSide>()
@@ -835,6 +854,9 @@ pub fn types() -> specta::Types {
         .register::<MergeSpaceResult>()
         .register::<SpaceRound>()
         .register::<SpaceTurn>()
+        .register::<RewindSpaceRequest>()
+        .register::<SpaceRevertFrom>()
+        .register::<RevertSpaceFileRequest>()
         .register::<AgentSession>()
         .register::<SpaceFeedback>()
         .register::<SpaceFeedbackRequest>()
@@ -844,6 +866,14 @@ pub fn types() -> specta::Types {
         .register::<SpaceUpdate>()
         .register::<SpaceBaseStatus>()
         .register::<SpaceFixCiRequest>()
+        .register::<SetSpacePinnedRequest>()
+        .register::<SpaceQuestion>()
+        .register::<SpaceQuestionItem>()
+        .register::<SpaceAnswerRequest>()
+        .register::<SpaceAnswerItem>()
+        .register::<MirrorStatus>()
+        .register::<SpaceMirror>()
+        .register::<UnmirrorSpaceRequest>()
         .register::<ConfigLayer>()
         .register::<ConfigFile>()
         .register::<ConfigEntry>()
@@ -895,7 +925,8 @@ pub fn types() -> specta::Types {
         .register::<SpaceTerminalInfo>()
         .register::<OpenTerminalRequest>()
         .register::<WriteTerminalRequest>()
-        .register::<ResizeTerminalRequest>();
+        .register::<ResizeTerminalRequest>()
+        .register::<TerminalMention>();
     // JS numbers: ids, counts and unix-ms timestamps stay far below 2^53.
     use specta::datatype::Primitive as P;
     specta_util::Remapper::new()

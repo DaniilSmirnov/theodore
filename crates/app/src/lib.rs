@@ -44,6 +44,8 @@ mod interdiff_tests;
 #[cfg(test)]
 mod linear_tests;
 #[cfg(test)]
+mod mirror_tests;
+#[cfg(test)]
 mod offline_tests;
 #[cfg(test)]
 mod projects_tests;
@@ -54,9 +56,13 @@ mod ship_tests;
 #[cfg(test)]
 mod space_agent_tools_tests;
 #[cfg(test)]
+mod space_checkpoints_tests;
+#[cfg(test)]
 mod space_commands_tests;
 #[cfg(test)]
 mod space_fix_ci_tests;
+#[cfg(test)]
+mod space_plan_tests;
 #[cfg(test)]
 mod space_pr_tests;
 #[cfg(test)]
@@ -71,6 +77,7 @@ mod space_update_tests;
 mod spaces_tests;
 
 pub use agent_defaults::AgentDefaults;
+pub use config::global_limits as code_intel_limits;
 pub use core::{Core, Receivers};
 pub use deps::{CodeTools, Deps, Grouper, GroupingAgent, OnPartial, RunTools, TokenStatus};
 pub use error::{AppError, AppResult, GrouperError};

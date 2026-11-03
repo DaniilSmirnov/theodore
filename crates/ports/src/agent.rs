@@ -26,12 +26,19 @@ pub enum AgentMode {
     /// Run mode, docs/spaces.md §5). Theodore adds no sandbox of its own:
     /// the CLI's own configuration is what limits it.
     Run,
+    /// read and explore, never edit; the turn ends with a plan (a space's
+    /// Plan mode, docs/spaces.md §5). Claude Code's own plan mode; the
+    /// others run read-only and are told to answer with a numbered plan.
+    Plan,
 }
 
 /// The MCP server name a PR run's tools go under (`mcp__review-tools__*`).
 pub const REVIEW_TOOLS: &str = "review-tools";
 /// The MCP server name a space turn's tools go under (`mcp__space-tools__*`).
 pub const SPACE_TOOLS: &str = "space-tools";
+/// The tool every Theodore MCP server has for Claude Code's permission
+/// prompts (`--permission-prompt-tool mcp__<server>__approve_tool`).
+pub const APPROVE_TOOL: &str = "approve_tool";
 
 fn review_tools() -> String {
     REVIEW_TOOLS.to_string()
@@ -129,6 +136,12 @@ pub enum AgentEvent {
         usage: Usage,
     },
     Stalled,
+    /// The plan a plan-mode run handed in (Claude Code's `ExitPlanMode`
+    /// input, or the plan file it wrote), next to the run's own events.
+    /// The last one counts; a run that reports none planned in its text.
+    Plan {
+        text: String,
+    },
     /// The CLI's session id for this run (Claude Code's `session_id`,
     /// Codex's `thread_id`): what [`AgentRequest::resume`] takes to continue
     /// it. May come more than once; the last one counts.

@@ -170,10 +170,15 @@ pub struct CodeIntelConfig {
     pub languages: Vec<String>,
     /// Language → the server preferred over the manifest's order.
     pub servers: BTreeMap<String, String>,
+    /// Machine-wide, like `idle_minutes`, `max_file_kb` and `cache_mb`:
+    /// read from your global file only (`global_limits`); a repo's or a
+    /// local file's value is ignored, with a warning in the editor.
     pub max_servers: u32,
     pub idle_minutes: u32,
     /// Larger files are not indexed.
     pub max_file_kb: u32,
+    /// `index.sqlite` is kept under this; least recently used blobs go.
+    pub cache_mb: u32,
     /// Where language servers may run. Only your global and local files
     /// set it (`repo_only_ignored`); unset falls back to Settings →
     /// Languages, then to the defaults.
@@ -212,6 +217,7 @@ impl Default for CodeIntelConfig {
             max_servers: DEFAULT_MAX_SERVERS,
             idle_minutes: DEFAULT_IDLE_MINUTES,
             max_file_kb: DEFAULT_MAX_FILE_KB,
+            cache_mb: DEFAULT_CACHE_MB,
             lsp: LspConfig::default(),
         }
     }
@@ -247,6 +253,35 @@ pub enum InstallPolicy {
 pub const DEFAULT_MAX_SERVERS: u32 = 4;
 pub const DEFAULT_IDLE_MINUTES: u32 = 10;
 pub const DEFAULT_MAX_FILE_KB: u32 = 1024;
+pub const DEFAULT_CACHE_MB: u32 = 512;
+
+/// `code_intel` keys that set one thing for the whole app (one server
+/// pool, one index): only the global layer's value counts.
+pub const MACHINE_WIDE: &[&str] = &[
+    "code_intel.max_servers",
+    "code_intel.idle_minutes",
+    "code_intel.max_file_kb",
+    "code_intel.cache_mb",
+];
+
+impl CodeIntelConfig {
+    /// The machine-wide limits, as the port takes them.
+    pub fn limits(&self) -> theodore_ports::CodeIntelLimits {
+        theodore_ports::CodeIntelLimits {
+            max_servers: self.max_servers as usize,
+            idle_minutes: self.idle_minutes,
+            max_file_kb: self.max_file_kb as usize,
+            cache_mb: u64::from(self.cache_mb),
+        }
+    }
+}
+
+/// The machine-wide limits from your global file alone (`MACHINE_WIDE`);
+/// defaults when it is missing or its `code_intel` section is bad.
+pub async fn global_limits(data_dir: &Path) -> theodore_ports::CodeIntelLimits {
+    let layers = read_layers(data_dir, None, None).await;
+    merge(&layers).config.code_intel.limits()
+}
 
 /// One layer's text, as read by the caller.
 #[derive(Debug, Clone)]
@@ -551,6 +586,7 @@ pub fn is_known(key: &str) -> bool {
         "code_intel.max_servers",
         "code_intel.idle_minutes",
         "code_intel.max_file_kb",
+        "code_intel.cache_mb",
         "code_intel.lsp.review",
         "code_intel.lsp.spaces",
     ];
@@ -690,9 +726,10 @@ pub const GLOBAL_TEMPLATE: &str = r#"# Theodore global config (docs/config.md).
 #   install: ask            # ask | always | never: download language servers
 #   languages: [typescript, rust]   # empty: detected
 #   servers: { python: pyright }    # preferred server per language
-#   max_servers: 4
+#   max_servers: 4          # these four: this file only, for the whole app
 #   idle_minutes: 10
 #   max_file_kb: 1024
+#   cache_mb: 512           # index.sqlite size cap
 #   lsp:                    # language servers; only here or in config.local.yaml
 #     spaces: true          # in your spaces
 #     review: false         # in PR reviews. true: a PR's code may run (build

@@ -19,6 +19,13 @@ pub fn isolate_from_user_config() {
     ISOLATED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Whether `isolate_from_user_config` has run (for a caller that builds its
+/// own `Command` instead of going through `GitProc`, e.g. `mirror.rs`'s
+/// temporary-index plumbing).
+pub(crate) fn isolated() -> bool {
+    ISOLATED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// One invocation of `git`. `token`, if present, is set only on this child
 /// process's env and read back by the askpass helper (`auth.rs`); it is
 /// never part of `args`.
@@ -102,11 +109,12 @@ impl GitProc<'_> {
     }
 
     /// `run` below `ceiling`, with extra variables on the child
-    /// (`GIT_INDEX_FILE` for a snapshot through a temporary index).
+    /// (`GIT_INDEX_FILE` for a snapshot through a temporary index, commit
+    /// dates).
     pub(crate) async fn run_env_below(
         &self,
         ceiling: &Path,
-        env: &[(&str, &Path)],
+        env: &[(&str, &std::ffi::OsStr)],
     ) -> GitResult<Vec<u8>> {
         let mut cmd = self.command_below(Some(ceiling));
         cmd.envs(env.iter().copied());
@@ -176,7 +184,7 @@ pub(crate) struct RawOutput {
     pub stderr: Vec<u8>,
 }
 
-fn io_err(e: std::io::Error) -> GitError {
+pub(crate) fn io_err(e: std::io::Error) -> GitError {
     if e.kind() == std::io::ErrorKind::NotFound {
         GitError::NotInstalled
     } else {

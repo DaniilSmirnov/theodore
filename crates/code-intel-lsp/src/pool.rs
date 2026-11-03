@@ -291,6 +291,27 @@ impl LspPool {
         out
     }
 
+    /// Shut down every session of `server`, in every repo and worktree (it
+    /// is being removed), and forget its crashes. The next `get_or_spawn`
+    /// starts it afresh.
+    pub async fn stop_server(&self, server: &str) {
+        let stop: Vec<Arc<LspSession>> = {
+            let mut slots = self.inner.slots.lock().await;
+            slots.crashes.retain(|(_, s), _| s != server);
+            let keys: Vec<SlotKey> = slots
+                .map
+                .keys()
+                .filter(|k| k.server == server)
+                .cloned()
+                .collect();
+            keys.iter()
+                .filter_map(|k| slots.map.remove(k))
+                .map(|s| s.session)
+                .collect()
+        };
+        shutdown_each(stop).await;
+    }
+
     /// Shut every server down.
     pub async fn shutdown_all(&self) {
         let sessions: Vec<Arc<LspSession>> = {

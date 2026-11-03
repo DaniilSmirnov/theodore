@@ -9,7 +9,7 @@ pub use theodore_ports::{
     Answer, AppStatus, BaseChange, CheckOutcome, CodeHit, CodeSymbol, CodeSymbolKind, Diagnostic,
     LanguageStatus, LogTail, NewReviewComment, Position, ProgressStep, ProgressStepState,
     ReviewItem, ShipOutcome, ShipToolAction, SpaceCommandName, SpaceDiff, SpaceInfo,
-    SpaceToolError,
+    SpaceToolError, TerminalTail, UserAnswer, UserQuestion,
 };
 
 /// Which server a run talks to, and so which tools it sees.
@@ -40,6 +40,7 @@ pub const SPACE_TOOL_NAMES: &[&str] = &[
     "stop_app",
     "app_status",
     "read_logs",
+    "read_terminal",
     "space_info",
     "ship",
     "get_space_diff",
@@ -47,6 +48,7 @@ pub const SPACE_TOOL_NAMES: &[&str] = &[
     "add_review_comment",
     "set_base",
     "update_progress",
+    "ask_user",
 ];
 
 /// The code tools, in both tool sets when the run has them
@@ -117,6 +119,10 @@ impl RunContext {
 
     /// Whether this run may list and call `tool`.
     pub fn allows(&self, tool: &str) -> bool {
+        // The CLI's permission prompts, on every server (`crate::approve`).
+        if tool == theodore_ports::APPROVE_TOOL {
+            return true;
+        }
         if CODE_TOOL_NAMES.contains(&tool) {
             return self.code != CodeTools::Off;
         }
@@ -250,6 +256,14 @@ pub trait SpaceToolsBackend: Send + Sync {
         kind: SpaceCommandName,
         tail: usize,
     ) -> Result<LogTail, SpaceToolError>;
+    /// `terminal` named, or else the space's most recently active one; its
+    /// last `lines` lines. The backend bounds `lines`.
+    async fn read_terminal(
+        &self,
+        space: &str,
+        terminal: Option<&str>,
+        lines: usize,
+    ) -> Result<TerminalTail, SpaceToolError>;
     async fn space_info(&self, space: &str) -> Result<SpaceInfo, SpaceToolError>;
 
     // ── the change itself (`space_agent`); unavailable unless implemented ──
@@ -313,6 +327,17 @@ pub trait SpaceToolsBackend: Send + Sync {
         let _ = (space, run_id, steps, note);
         Err(unavailable())
     }
+    /// Shows `questions` in the space and waits for your answers: until
+    /// you answer, the turn (`run_id`) is stopped, or the wait times out.
+    async fn ask_user(
+        &self,
+        space: &str,
+        run_id: &RunId,
+        questions: Vec<UserQuestion>,
+    ) -> Result<Vec<UserAnswer>, SpaceToolError> {
+        let _ = (space, run_id, questions);
+        Err(unavailable())
+    }
 }
 
 /// For servers started without spaces (tests, the CLI): every call fails.
@@ -338,6 +363,14 @@ impl SpaceToolsBackend for NoSpaceTools {
         _: SpaceCommandName,
         _: usize,
     ) -> Result<LogTail, SpaceToolError> {
+        Err(unavailable())
+    }
+    async fn read_terminal(
+        &self,
+        _: &str,
+        _: Option<&str>,
+        _: usize,
+    ) -> Result<TerminalTail, SpaceToolError> {
         Err(unavailable())
     }
     async fn space_info(&self, _: &str) -> Result<SpaceInfo, SpaceToolError> {

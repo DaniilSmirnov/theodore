@@ -60,7 +60,8 @@ pub fn build_args(req: &AgentRequest, cfg: &AgentBinaryConfig) -> Vec<String> {
     args.push("-s".to_string());
     args.push(
         match req.mode {
-            AgentMode::ReadOnly => "read-only",
+            // Plan: read only; the system prompt asks for the plan.
+            AgentMode::ReadOnly | AgentMode::Plan => "read-only",
             AgentMode::Edit | AgentMode::Run => "workspace-write",
         }
         .to_string(),
@@ -79,6 +80,15 @@ pub fn build_args(req: &AgentRequest, cfg: &AgentBinaryConfig) -> Vec<String> {
             "mcp_servers.{}.bearer_token_env_var=\"{MCP_TOKEN_ENV_VAR}\"",
             mcp.name
         ));
+        if crate::waits_on_user(req) {
+            // `ask_user` waits for you; Codex's own default is 60 s.
+            args.push("-c".to_string());
+            args.push(format!(
+                "mcp_servers.{}.tool_timeout_sec={}",
+                mcp.name,
+                crate::USER_TOOL_TIMEOUT_MS / 1000
+            ));
+        }
     }
     if let Some(model) = req.model.as_ref().or(cfg.model.as_ref()) {
         args.push("-m".to_string());

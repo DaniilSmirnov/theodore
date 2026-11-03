@@ -1,8 +1,10 @@
 import { openExternal } from '../core/openExternal';
 import { latinKey } from './latin';
+import { findScopeFor } from './search';
 import { isBuildMode } from './space/mode';
 import {
   archivedSpacesIn,
+  canMarkUnread,
   spaceTitle,
   spacesIn,
   undoState,
@@ -20,6 +22,7 @@ import {
   ArrowUpRightFromSquare,
   ArrowUturnCcwLeft,
   BranchesRight,
+  CircleFill,
   Clock,
   CodePullRequest,
   Eye,
@@ -34,6 +37,8 @@ import {
   Moon,
   PaperPlane,
   Pencil,
+  Pin,
+  PinSlash,
   Plus,
   Tray,
 } from '@gravity-ui/icons';
@@ -54,6 +59,7 @@ import { ALL } from '../core/workspaces';
 import { Avatar, K } from './bits';
 import { projectLabel } from './Projects';
 import { refreshProjectTracked } from './project/freshness';
+import { markSpaceUnseen, spaceSeen } from './space/seen';
 import { Sparkles } from '@gravity-ui/icons';
 
 export interface Item {
@@ -446,14 +452,39 @@ export const CommandMenu = observer(function CommandMenu() {
           keys: 'G N',
           run: () => ui.openModal('new-space'),
         },
-        ...spacesIn(ui.workspace, store.models.spaces.all()).map(
-          (sp): Item => ({
-            group: 'Spaces',
-            label: spaceTitle(sp),
-            sub: sp.branch,
-            icon: <Pencil />,
-            run: () => ui.go({ name: 'space', id: sp.id }),
-          }),
+        ...spacesIn(ui.workspace, store.models.spaces.all()).flatMap(
+          (sp): Item[] => [
+            {
+              group: 'Spaces',
+              label: spaceTitle(sp),
+              sub: sp.branch,
+              icon: <Pencil />,
+              run: () => ui.go({ name: 'space', id: sp.id }),
+            },
+            // Pin/unpin and Mark as unread (docs/spaces.md §3): listed only
+            // once searched for, so the default view stays short.
+            {
+              group: 'Spaces',
+              searchOnly: true,
+              label: `${sp.pinned ? 'Unpin' : 'Pin'} ${spaceTitle(sp)}`,
+              icon: sp.pinned ? <PinSlash /> : <Pin />,
+              run: () =>
+                void api
+                  .setSpacePinned({ space: sp.id, pinned: !sp.pinned })
+                  .catch(() => {}),
+            },
+            ...(canMarkUnread(sp, spaceSeen.get(sp.id))
+              ? [
+                  {
+                    group: 'Spaces',
+                    searchOnly: true,
+                    label: `Mark ${spaceTitle(sp)} as unread`,
+                    icon: <CircleFill className="size-3" />,
+                    run: () => markSpaceUnseen(sp.id),
+                  },
+                ]
+              : []),
+          ],
         ),
         // Archived ones only when searched for: open one to unarchive it.
         ...archivedSpacesIn(ui.workspace, store.models.spaces.all()).map(
@@ -655,6 +686,13 @@ export function useGlobalKeys() {
       if ((e.metaKey || e.ctrlKey) && latinKey(e) === 'k') {
         if (ui.modal === 'cmdk') ui.closeModal();
         else ui.openModal('cmdk');
+      } else if (!ui.modal && (e.metaKey || e.ctrlKey) && latinKey(e) === 'f') {
+        // GitHub #77: search the list that's "current" for this route.
+        // `null` leaves the key alone — a diff/text view, or nowhere to
+        // search (sidebar collapsed, spaces off on a non-PR page).
+        const scope = findScopeFor(ui.route.name, isBuildMode(store));
+        if (!scope || (scope === 'spaces' && !ui.sidebar)) return;
+        ui.openListSearch(scope);
       } else if (
         (e.metaKey || e.ctrlKey) &&
         latinKey(e) === 'z' &&

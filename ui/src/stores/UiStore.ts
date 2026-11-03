@@ -23,6 +23,7 @@ import {
 import type { ContextMenuItem } from '../ui/ContextMenu';
 import type { Display } from '../ui/List';
 import { isPrFilter, type PrFilter } from '../ui/prs/filters';
+import type { SearchScope } from '../ui/search';
 
 export type SettingsPage =
   | 'account'
@@ -30,7 +31,7 @@ export type SettingsPage =
   | 'agents'
   | 'integrations'
   | 'projects'
-  /** Code intelligence per project (docs/code-intel.md §9). */
+  /** Old id: languages moved into each project's settings (Projects). */
   | 'languages'
   | 'updates'
   | 'about'
@@ -277,6 +278,11 @@ export class UiStore {
   /** Tabs mid close animation (`JSON.stringify(route)`); removed after it. */
   closingTabs: string[] = [];
   place: Placer | null = null;
+  /** ⌘F's search field (`search.ts`): which list, and its query. Never
+   *  persisted — it's a transient overlay, not navigation state. */
+  listSearch: { scope: SearchScope; query: string } | null = null;
+  /** Bumped on every ⌘F so the field refocuses even when already open. */
+  listSearchFocusAt = 0;
 
   private persistTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -307,6 +313,8 @@ export class UiStore {
       modalTargets: observableShallow,
       contextMenu: observableRef,
       closingTabs: observableShallow,
+      listSearch: observable,
+      listSearchFocusAt: observable,
     });
     reaction(
       () => this.snapshot(),
@@ -664,6 +672,30 @@ export class UiStore {
   closeContextMenu(): void {
     runInAction(() => {
       this.contextMenu = null;
+    });
+  }
+
+  /** ⌘F: opens the field for `scope`, keeping its query if it was already
+   *  open on the same one, and bumps the refocus token either way. */
+  openListSearch(scope: SearchScope): void {
+    runInAction(() => {
+      this.listSearch = {
+        scope,
+        query: this.listSearch?.scope === scope ? this.listSearch.query : '',
+      };
+      this.listSearchFocusAt = Date.now();
+    });
+  }
+
+  setListSearchQuery(query: string): void {
+    runInAction(() => {
+      if (this.listSearch) this.listSearch.query = query;
+    });
+  }
+
+  closeListSearch(): void {
+    runInAction(() => {
+      this.listSearch = null;
     });
   }
 }

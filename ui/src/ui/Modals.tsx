@@ -189,6 +189,10 @@ const KEYS: [string, string][] = [
   ['X', 'select (bulk actions)'],
   ['E', 'done: leaves Inbox until new activity'],
   ['H', 'snooze: an hour, until next push, until checks pass'],
+  [
+    '⌘F',
+    'search this list (or the sidebar’s Spaces section, elsewhere) — ↑↓⏎ to open, Esc to clear',
+  ],
   ['Tasks', ''],
   ['Y', 'accept fix'],
   ['A', 'assign to a person or agent'],
@@ -218,6 +222,10 @@ const KEYS: [string, string][] = [
 const SPACE_KEYS: [string, string][] = [
   ['Spaces', ''],
   ['G N', 'new space'],
+  [
+    'right-click',
+    'pin / unpin, mark as unread (sidebar row, or type "pin"/"unread" in ⌘K)',
+  ],
   ['C or /', 'message the agent (Esc leaves the box)'],
   ['⏎ / ⇧⏎', 'send / new line'],
   ['M', 'mode: Ask → Edit → Run'],

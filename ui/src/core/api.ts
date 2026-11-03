@@ -68,9 +68,12 @@ import type {
   CreateSpaceRequest,
   MergeSpaceRequest,
   MergeSpaceResult,
+  RevertSpaceFileRequest,
+  RewindSpaceRequest,
   ShipSpaceRequest,
   Space,
   SpaceBaseStatus,
+  SpaceAnswerRequest,
   SpaceFeedbackRequest,
   SpaceFixCiRequest,
   SpaceIssue,
@@ -80,6 +83,7 @@ import type {
   SpaceConfigView,
   SpaceLogLine,
   SpaceRunRequest,
+  SetSpacePinnedRequest,
   SpaceSetupRequest,
   SpaceTerminalInfo,
   SpaceTrustRequest,
@@ -87,6 +91,8 @@ import type {
   GlobalConfigInfo,
   ConfigDraft,
   CheckConfigRequest,
+  CodeHover,
+  CodeHoverRequest,
   CodeIntelLspRequest,
   CodeIntelStatus,
   ConfigCheck,
@@ -103,10 +109,12 @@ import type {
   TaskDecision,
   TelemetryChoice,
   TelemetryStatus,
+  TerminalMention,
   Transaction,
   TransactionResult,
   UiEvent,
   TriageRequest,
+  UnmirrorSpaceRequest,
   UpdateInfo,
   WriteTerminalRequest,
 } from '../gen/contract';
@@ -310,7 +318,16 @@ export const api = {
     call<MergeSpaceResult>('merge_space', { req }),
   /** Continue after merge: a new branch on the base's fresh tip (§7). */
   continueSpace: (space: string) => call<Space>('continue_space', { space }),
+  /** "Back to here": later turns undone (docs/spaces.md §3). */
+  rewindSpace: (req: RewindSpaceRequest) =>
+    call<Space>('rewind_space', { req }),
+  /** Revert a file of the space's diff, as an undoable entry. */
+  revertSpaceFile: (req: RevertSpaceFileRequest) =>
+    call<Space>('revert_space_file', { req }),
   unarchiveSpace: (space: string) => call<Space>('unarchive_space', { space }),
+  /** Pin/unpin a space: pinned ones sort first (docs/spaces.md §3). */
+  setSpacePinned: (req: SetSpacePinnedRequest) =>
+    call<Space>('set_space_pinned', { req }),
   spaceSendFeedback: (req: SpaceFeedbackRequest) =>
     call<string>('space_send_feedback', { req }),
   /** "Base moved: N commits behind", from the copy on this Mac. A passive
@@ -325,6 +342,21 @@ export const api = {
   /** "Fix with agent": the space PR's failing checks' logs as the next
    *  turn. */
   spaceFixCi: (req: SpaceFixCiRequest) => call<string>('space_fix_ci', { req }),
+  /** Approve on a plan card: the next turn implements the plan. */
+  approveSpacePlan: (space: string) =>
+    call<string>('approve_space_plan', { space }),
+  /** Your answers to the agent's `ask_user` questions. */
+  answerSpaceQuestion: (req: SpaceAnswerRequest) =>
+    call<null>('answer_space_question', { req }),
+  /** "Mirror into `<folder>`": on fresh, or resuming a paused one. */
+  mirrorSpace: (space: string) => call<Space>('mirror_space', { space }),
+  /** "Sync now": re-syncs a mirrored space into its folder by hand. */
+  syncMirror: (space: string) => call<Space>('sync_mirror', { space }),
+  /** "Mirror off": refused (unless `discard`) if the folder was edited.
+   *  Quiet: the caller (the mirror banner) shows the refusal itself, with
+   *  a Discard button, instead of a toast. */
+  unmirrorSpace: (req: UnmirrorSpaceRequest) =>
+    call<Space>('unmirror_space', { req }, true),
   /** What a space runs, where each command comes from, and trust. */
   spaceConfig: (space: string) =>
     call<SpaceConfigView>('space_config', { space }),
@@ -356,6 +388,10 @@ export const api = {
   /** The space's open (or just-exited) terminals, with scrollback. */
   listSpaceTerminals: (space: string) =>
     call<SpaceTerminalInfo[]>('list_space_terminals', { space }),
+  /** `@terminal` in the composer: the space's most recently active
+   *  terminal's last lines, `null` when it has none open. */
+  spaceTerminalMention: (space: string) =>
+    call<TerminalMention | null>('space_terminal_mention', { space }),
   /** A project's merged config, read-only (Settings → Labs). */
   projectConfig: (project: string) =>
     call<EffectiveConfig>('project_config', { project }),
@@ -368,20 +404,29 @@ export const api = {
     call<ConfigCheck>('check_config', { req }, true),
   saveConfig: (req: SaveConfigRequest) =>
     call<SaveConfigResult>('save_config', { req }),
-  /** Settings → Languages, polled while something downloads: shown
+  /** Project settings → Languages, read again as installs settle: shown
    *  inline, never toasted. */
   codeIntelStatus: (project: string) =>
     call<CodeIntelStatus>('code_intel_status', { project }, true),
-  /** A language's grammar and server: Settings → Languages → Install, or
-   *  an install suggestion's Download. */
+  /** A language's grammar and server: project settings → Languages →
+   *  Install, or an install suggestion's Download. */
   codeIntelInstall: (language: string) =>
     call<null>('code_intel_install', { language }),
   /** An install suggestion's Not now: not suggested again. */
   codeIntelDecline: (language: string) =>
     call<null>('code_intel_decline', { language }),
-  /** Language servers in reviews or in spaces, on or off. */
+  /** Deletes a language's downloaded server and grammar. Its refusal (a
+   *  review or a space uses it) shows in the confirmation, not a toast. */
+  codeIntelRemove: (language: string) =>
+    call<null>('code_intel_remove', { language }, true),
+  /** One project's language servers in reviews or in spaces, on or off:
+   *  written to its local config file. */
   codeIntelSetLsp: (req: CodeIntelLspRequest) =>
     call<null>('code_intel_set_lsp', { req }),
+  /** Hover text for the identifier under the pointer in a PR's diff;
+   *  `null` when there is none. Never toasted: hovering is incidental. */
+  codeIntelHover: (req: CodeHoverRequest) =>
+    call<CodeHover | null>('code_intel_hover', { req }, true),
   globalConfig: () => call<GlobalConfigInfo>('global_config'),
   /** Creates the global config from a template when missing, then opens
    *  it in the default editor. */

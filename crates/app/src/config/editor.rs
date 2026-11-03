@@ -77,9 +77,13 @@ const CODE_INTEL_KEYS: &[(&str, &str)] = &[
         "languages: [typescript, rust]   # empty: detected",
     ),
     ("servers", "servers: { python: pyright }"),
-    ("max_servers", "max_servers: 4"),
+    (
+        "max_servers",
+        "max_servers: 4          # these four: global file only",
+    ),
     ("idle_minutes", "idle_minutes: 10"),
     ("max_file_kb", "max_file_kb: 1024"),
+    ("cache_mb", "cache_mb: 512"),
     (
         "lsp",
         "lsp:                    # global / local files only, never the repo's\n  spaces: true\n  review: false         # true: a PR's code may run during reviews",
@@ -161,10 +165,12 @@ fn has_value(v: Option<&Value>) -> bool {
 }
 
 /// `validate`, plus a warning for each key `layer` may not set (the repo's
-/// file can't turn on language servers, `config::repo_may_not_set`).
+/// file can't turn on language servers, `config::repo_may_not_set`; only
+/// the global file sets the machine-wide limits, `config::MACHINE_WIDE`).
 pub fn validate_layer(text: &str, layer: theodore_contract::ConfigLayer) -> Vec<ConfigProblem> {
+    use theodore_contract::ConfigLayer;
     let mut problems = validate(text);
-    if layer != theodore_contract::ConfigLayer::Repo {
+    if layer == ConfigLayer::Global {
         return problems;
     }
     let Ok(value @ Value::Object(_)) = serde_yaml::from_str::<Value>(text) else {
@@ -174,7 +180,17 @@ pub fn validate_layer(text: &str, layer: theodore_contract::ConfigLayer) -> Vec<
     let mut leaves = Vec::new();
     flatten(String::new(), &normalize(value), &mut leaves);
     for (key, _) in leaves {
-        if super::repo_may_not_set(&key) {
+        if super::MACHINE_WIDE.contains(&key.as_str()) {
+            problems.push(ConfigProblem {
+                level: ConfigProblemLevel::Warning,
+                line: line_of(&lines, &key),
+                column: None,
+                message: format!(
+                    "`{key}`: ignored here; it is one setting for the whole app, set in your \
+                     global file"
+                ),
+            });
+        } else if layer == ConfigLayer::Repo && super::repo_may_not_set(&key) {
             problems.push(ConfigProblem {
                 level: ConfigProblemLevel::Warning,
                 line: line_of(&lines, &key),
@@ -372,6 +388,154 @@ fn line_of(lines: &BTreeMap<String, u32>, dotted: &str) -> Option<u32> {
     }
 }
 
+/// What a new local file starts with when a switch creates it.
+const NEW_LOCAL_HEADER: &str = "# Theodore local config: yours, not committed (docs/config.md).";
+
+/// `text` (a config file; `None` when it doesn't exist yet) with the
+/// block-style leaf `path` (`["code_intel", "lsp", "review"]`) set to
+/// `value` (a YAML scalar), every other line kept as written: comments,
+/// order, the rest of the file. A line edit, checked afterwards: the
+/// result must parse and hold exactly the old leaves plus this one. `Err`
+/// says why the file can't be edited that way (a flow mapping, a dotted
+/// key, a parse error): the caller writes nothing.
+///
+/// ```text
+/// code_intel:            code_intel:
+///   install: ask    ─▶     lsp:
+///                            review: true
+///                          install: ask
+/// ```
+pub fn set_leaf(text: Option<&str>, path: &[&str], value: &str) -> Result<String, String> {
+    let old = text.unwrap_or("");
+    if old.lines().any(is_content) && serde_yaml::from_str::<serde_yaml::Value>(old).is_err() {
+        return Err("the file doesn't parse; fix it in the config editor first".into());
+    }
+    let mut lines: Vec<String> = match text {
+        Some(t) => t.lines().map(str::to_string).collect(),
+        None => vec![NEW_LOCAL_HEADER.to_string()],
+    };
+    set_in_block(&mut lines, 0, None, path, value)?;
+    let mut out = lines.join("\n");
+    out.push('\n');
+    check_leaf_edit(old, &out, path, value)?;
+    Ok(out)
+}
+
+fn is_content(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty() && !t.starts_with('#') && t != "---"
+}
+
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// Sets `path` in the block that starts at line `start` (after the
+/// parent's key line; the whole file when `parent_indent` is `None`) and
+/// whose lines are indented deeper than the parent.
+fn set_in_block(
+    lines: &mut Vec<String>,
+    start: usize,
+    parent_indent: Option<usize>,
+    path: &[&str],
+    value: &str,
+) -> Result<(), String> {
+    const STEP: usize = 2;
+    let (key, rest) = path.split_first().ok_or("an empty key")?;
+    let mut child: Option<usize> = None;
+    let mut found: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate().skip(start) {
+        if !is_content(line) {
+            continue;
+        }
+        let indent = indent_of(line);
+        if parent_indent.is_some_and(|p| indent <= p) {
+            break;
+        }
+        if indent != *child.get_or_insert(indent) {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(&format!("{key}.")) {
+            return Err(format!("`{key}` is written as a dotted key"));
+        }
+        if key_of(trimmed).as_deref() == Some(*key) {
+            if found.is_some() {
+                return Err(format!("`{key}` appears twice"));
+            }
+            found = Some(i);
+        }
+    }
+    let Some(at) = found else {
+        // Missing: right under the parent's line, or at the file's end.
+        let child = child.unwrap_or_else(|| parent_indent.map_or(0, |p| p + STEP));
+        let pos = if parent_indent.is_some() {
+            start
+        } else {
+            lines.len()
+        };
+        for (depth, k) in path.iter().enumerate() {
+            let pad = " ".repeat(child + depth * STEP);
+            let line = if depth + 1 == path.len() {
+                format!("{pad}{k}: {value}")
+            } else {
+                format!("{pad}{k}:")
+            };
+            lines.insert(pos + depth, line);
+        }
+        return Ok(());
+    };
+    let line = lines[at].clone();
+    let indent = indent_of(&line);
+    let colon = indent + line[indent..].find(':').ok_or("no colon")?;
+    let after = &line[colon + 1..];
+    // The comment keeps the spaces before its `#`.
+    let body = after.find(" #").map_or(after, |i| &after[..i]).trim_end();
+    let (scalar, comment) = (body.trim_start(), &after[body.len()..]);
+    if rest.is_empty() {
+        if scalar.starts_with(['{', '[', '|', '>', '&', '*', '!']) {
+            return Err(format!("`{key}` isn't a plain value"));
+        }
+        lines[at] = format!("{}: {value}{comment}", &line[..colon]);
+        return Ok(());
+    }
+    if !scalar.is_empty() {
+        return Err(format!("`{key}` is written inline"));
+    }
+    set_in_block(lines, at + 1, Some(indent), rest, value)
+}
+
+/// The edit changed exactly `path`: the same leaves as before, with it set.
+fn check_leaf_edit(old: &str, new: &str, path: &[&str], value: &str) -> Result<(), String> {
+    let leaves = |text: &str| -> Result<BTreeMap<String, Value>, String> {
+        let v = if text.lines().any(is_content) {
+            serde_yaml::from_str::<Value>(text).map_err(|e| e.to_string())?
+        } else {
+            Value::Null
+        };
+        let v = if v.is_null() {
+            Value::Object(Map::new())
+        } else {
+            v
+        };
+        let mut out = Vec::new();
+        flatten(String::new(), &normalize(v), &mut out);
+        Ok(out.into_iter().collect())
+    };
+    let mut want = leaves(old)?;
+    let set: Value = serde_yaml::from_str(value).map_err(|e| format!("{value}: {e}"))?;
+    want.insert(path.join("."), set);
+    let got = leaves(new).map_err(|e| format!("the edit wouldn't parse: {e}"))?;
+    if got == want {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{}` can't be set by a line edit here",
+            path.join(".")
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,5 +657,55 @@ mod tests {
         let text = render(&header("x"), &serde_json::json!({}));
         assert!(validate(&text).is_empty());
         assert_eq!(parsed(&text).value, serde_json::json!({}));
+    }
+
+    const REVIEW: &[&str] = &["code_intel", "lsp", "review"];
+
+    #[test]
+    fn a_missing_file_gets_a_header_and_the_leaf() {
+        let out = set_leaf(None, REVIEW, "true").unwrap();
+        assert!(out.starts_with("# Theodore local config"), "{out}");
+        assert!(
+            out.ends_with("code_intel:\n  lsp:\n    review: true\n"),
+            "{out}"
+        );
+        let out = set_leaf(Some(""), REVIEW, "false").unwrap();
+        assert_eq!(out, "code_intel:\n  lsp:\n    review: false\n");
+    }
+
+    #[test]
+    fn an_existing_value_is_replaced_in_place_with_its_comment() {
+        let text = "# mine\nreview:\n  hide: [\"gen/**\"]\ncode_intel:\n  install: ask\n  \
+                    lsp:\n    spaces: true\n    review: false   # careful\n";
+        let out = set_leaf(Some(text), REVIEW, "true").unwrap();
+        assert_eq!(out, text.replace("review: false", "review: true"));
+    }
+
+    #[test]
+    fn missing_levels_go_under_their_parent_at_its_indent() {
+        let text = "code_intel:\n    install: ask\nspaces:\n    setup: make\n";
+        let out = set_leaf(Some(text), &["code_intel", "lsp", "spaces"], "false").unwrap();
+        assert_eq!(
+            out,
+            "code_intel:\n    lsp:\n      spaces: false\n    install: ask\nspaces:\n    setup: make\n"
+        );
+        let out = set_leaf(Some("spaces:\n  setup: make"), REVIEW, "true").unwrap();
+        assert_eq!(
+            out,
+            "spaces:\n  setup: make\ncode_intel:\n  lsp:\n    review: true\n"
+        );
+    }
+
+    #[test]
+    fn shapes_a_line_edit_cannot_handle_are_refused() {
+        for text in [
+            "code_intel: {lsp: {review: true}}\n",
+            "code_intel:\n  lsp: {review: true}\n",
+            "code_intel.lsp.review: false\n",
+            "code_intel:\n  lsp.review: false\n",
+            "code_intel: [\n",
+        ] {
+            assert!(set_leaf(Some(text), REVIEW, "true").is_err(), "{text}");
+        }
     }
 }

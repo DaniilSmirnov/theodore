@@ -62,6 +62,8 @@ async function render(s: Space) {
   transport.onCall('detect_agents', () => []);
   transport.onCall('space_skills', () => []);
   transport.onCall('space_stop', () => null);
+  transport.onCall('approve_space_plan', () => 'm2');
+  transport.onCall('answer_space_question', () => null);
   setTransport(transport);
   const store = new RootStore();
   store.sync.pool.put(
@@ -117,6 +119,86 @@ describe('the space chat', () => {
     await settle();
     expect(transport.calls.find((c) => c.cmd === 'space_stop')).toMatchObject({
       args: { space: 's1' },
+    });
+  });
+
+  it('the last plan turn: a plan badge, Approve calls the core, Revise asks in the composer', async () => {
+    await render(
+      space({
+        mode: 'plan',
+        build_mode: 'run',
+        turn_log: [
+          {
+            n: 1,
+            message: 'u1',
+            reply: 'a1',
+            before: 'b',
+            after: 'h',
+            plan: '1. Add `--flag`',
+          } as never,
+        ],
+      }),
+    );
+    const agent = m!.host.querySelector('.chat-message[data-msg="a1"]')!;
+    expect(agent.querySelector('.space-plan-badge')?.textContent).toBe('plan');
+    const actions = agent.querySelector('.space-plan-actions')!;
+    expect(actions.textContent).toContain('implements it in Run');
+    const [approve, revise] = [...actions.querySelectorAll('button')] as [
+      HTMLButtonElement,
+      HTMLButtonElement,
+    ];
+    await act(async () => approve.click());
+    await settle();
+    expect(
+      transport.calls.find((c) => c.cmd === 'approve_space_plan'),
+    ).toMatchObject({ args: { space: 's1' } });
+    await act(async () => revise.click());
+    await settle();
+    expect(
+      m!.host
+        .querySelector('.chat-input textarea')
+        ?.getAttribute('placeholder'),
+    ).toBe('What should change in the plan?');
+  });
+
+  it('a waiting question: pick an option and send the answer', async () => {
+    await render(
+      space({
+        status: 'running',
+        run: 'space:s1:u2',
+        question: {
+          id: 'q1',
+          run: 'space:s1:u2',
+          asked_at: 0,
+          questions: [
+            { question: 'Which store?', options: ['SQLite', 'Postgres'] },
+          ],
+        },
+      }),
+    );
+    const card = m!.host.querySelector('.space-question')!;
+    expect(card.textContent).toContain('Which store?');
+    const send = card.querySelector<HTMLButtonElement>('.space-answer')!;
+    expect(send.disabled || send.getAttribute('aria-disabled') === 'true').toBe(
+      true,
+    );
+    const sqlite = [
+      ...card.querySelectorAll<HTMLButtonElement>('.space-option'),
+    ].find((b) => b.textContent === 'SQLite')!;
+    await act(async () => sqlite.click());
+    await settle();
+    await act(async () => send.click());
+    await settle();
+    expect(
+      transport.calls.find((c) => c.cmd === 'answer_space_question'),
+    ).toMatchObject({
+      args: {
+        req: {
+          space: 's1',
+          question: 'q1',
+          answers: [{ selected: ['SQLite'], other: null }],
+        },
+      },
     });
   });
 });

@@ -124,7 +124,8 @@ async fn two_turns(h: &Host, space: &str) -> (PathBuf, Sha) {
         .git
         .space_checkpoint(&wt.path, space, "turn 2")
         .await
-        .unwrap();
+        .unwrap()
+        .sha;
     (wt.path, head)
 }
 
@@ -208,7 +209,12 @@ async fn push_never_forces_and_new_turns_go_on_top() {
 
     // Turn 3, then Push: a new commit whose parent is the pushed one.
     std::fs::write(wt.join("c.txt"), "newer\n").unwrap();
-    let head3 = h.git.space_checkpoint(&wt, "s1", "turn 3").await.unwrap();
+    let head3 = h
+        .git
+        .space_checkpoint(&wt, "s1", "turn 3")
+        .await
+        .unwrap()
+        .sha;
     let second = h
         .git
         .space_commit(&h.cache, "s1", &squash(&head3, &first, "Address review"))
@@ -277,7 +283,12 @@ async fn new_turns_replay_onto_a_branch_someone_else_moved() {
     git(&other, &["push", "-q", "origin", branch]);
 
     std::fs::write(wt.join("c.txt"), "newer\n").unwrap();
-    let head3 = h.git.space_checkpoint(&wt, "s1", "turn 3").await.unwrap();
+    let head3 = h
+        .git
+        .space_checkpoint(&wt, "s1", "turn 3")
+        .await
+        .unwrap()
+        .sha;
     let tip = h
         .git
         .remote_branch(&h.cache, &repo(), branch)
@@ -311,7 +322,12 @@ async fn new_turns_replay_onto_a_branch_someone_else_moved() {
     commit_all(&other, "reviewer c");
     git(&other, &["push", "-q", "origin", branch]);
     std::fs::write(wt.join("c.txt"), "ours\n").unwrap();
-    let head4 = h.git.space_checkpoint(&wt, "s1", "turn 4").await.unwrap();
+    let head4 = h
+        .git
+        .space_checkpoint(&wt, "s1", "turn 4")
+        .await
+        .unwrap()
+        .sha;
     let tip = h
         .git
         .remote_branch(&h.cache, &repo(), branch)
@@ -364,7 +380,8 @@ async fn folder() -> Folder {
     let head = cli
         .space_checkpoint(&wt.path, "s1", "turn 1")
         .await
-        .unwrap();
+        .unwrap()
+        .sha;
     cli.space_commit(&cache, "s1", &squash(&head, &base, "Add c"))
         .await
         .unwrap();
@@ -506,10 +523,12 @@ async fn space_reset_moves_the_worktree_and_ref_back_a_turn() {
         .await
         .expect("reset");
 
-    assert_eq!(git(&wt.path, &["rev-parse", "HEAD"]), turn1.as_str());
+    // A snapshot checkpoint: `HEAD` stays at the base, the edits of turn 1
+    // are back as uncommitted ones.
+    assert_eq!(git(&wt.path, &["rev-parse", "HEAD"]), h.base.as_str());
     assert_eq!(
         git(&h.cache, &["rev-parse", "refs/theodore/spaces/s1"]),
-        turn1.as_str()
+        turn1.sha.as_str()
     );
     assert!(!wt.path.join("c.txt").exists());
     assert!(!wt.path.join("stray.txt").exists());
@@ -518,5 +537,8 @@ async fn space_reset_moves_the_worktree_and_ref_back_a_turn() {
         std::fs::read_to_string(wt.path.join("a.txt")).unwrap(),
         "one\ntwo\n"
     );
-    assert_eq!(git(&wt.path, &["status", "--porcelain"]), "");
+    assert_eq!(
+        git(&wt.path, &["status", "--porcelain"]),
+        "M a.txt\n?? .gitignore"
+    );
 }

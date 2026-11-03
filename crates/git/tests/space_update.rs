@@ -130,7 +130,7 @@ impl Host {
             .space_checkpoint(&wt.path, id, "turn 1")
             .await
             .unwrap();
-        (wt.path, head)
+        (wt.path, head.sha)
     }
 }
 
@@ -295,7 +295,12 @@ async fn push_after_an_update_merges_the_base_into_the_pr_branch() {
         panic!("clean")
     };
     std::fs::write(wt.join("b.txt"), "space, more\n").unwrap();
-    let head = h.git.space_checkpoint(&wt, "s1", "turn 2").await.unwrap();
+    let head = h
+        .git
+        .space_checkpoint(&wt, "s1", "turn 2")
+        .await
+        .unwrap()
+        .sha;
 
     let pushed = h
         .git
@@ -339,7 +344,12 @@ async fn push_after_an_update_merges_the_base_into_the_pr_branch() {
 
     // Nothing new on the base since: no second parent this time.
     std::fs::write(wt.join("b.txt"), "space, again\n").unwrap();
-    let head3 = h.git.space_checkpoint(&wt, "s1", "turn 3").await.unwrap();
+    let head3 = h
+        .git
+        .space_checkpoint(&wt, "s1", "turn 3")
+        .await
+        .unwrap()
+        .sha;
     let third = h
         .git
         .space_commit(

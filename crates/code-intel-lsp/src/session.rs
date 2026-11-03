@@ -43,10 +43,10 @@ use tokio::process::Command;
 use tokio::sync::{Notify, oneshot, watch};
 use tokio::time::Instant;
 
-use crate::LaunchConfig;
 use crate::convert;
 use crate::rpc::{self, Handler, Rpc, RpcError};
 use crate::text::{self, PositionEncoding};
+use crate::{LaunchConfig, Located, MAX_EXTERNAL};
 
 /// Timeouts and limits of one session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -600,17 +600,33 @@ impl LspSession {
         out
     }
 
-    /// Convert LSP locations to contract ones, dropping any outside `root`.
-    async fn locations(
-        &self,
-        root: &Path,
-        raw: Vec<(lsp_types::Uri, lsp_types::Range)>,
-    ) -> Vec<Location> {
-        self.locations_keep_index(root, raw)
+    /// Convert LSP locations to contract ones; those outside `root` (std,
+    /// dependencies) are counted and a few named, never made relative.
+    async fn located(&self, root: &Path, raw: Vec<(lsp_types::Uri, lsp_types::Range)>) -> Located {
+        let mut inside = Vec::new();
+        let mut out = Located::default();
+        for (uri, range) in raw {
+            let path = text::uri_path(uri.as_str());
+            if path
+                .as_deref()
+                .is_some_and(|p| text::relative(root, p).is_some())
+            {
+                inside.push((uri, range));
+                continue;
+            }
+            out.external_count += 1;
+            let shown = path.map_or_else(|| uri.as_str().to_string(), |p| p.display().to_string());
+            if out.external.len() < MAX_EXTERNAL && !out.external.contains(&shown) {
+                out.external.push(shown);
+            }
+        }
+        out.items = self
+            .locations_keep_index(root, inside)
             .await
             .into_iter()
             .flatten()
-            .collect()
+            .collect();
+        out
     }
 
     fn position_params(
@@ -627,13 +643,14 @@ impl LspSession {
         }
     }
 
-    /// Where the symbol at `at` is defined.
+    /// Where the symbol at `at` is defined: in the worktree, and how many
+    /// places outside it (std, dependencies).
     pub async fn definition(
         &self,
         root: &Path,
         path: &str,
         at: Position,
-    ) -> CodeIntelResult<Vec<Location>> {
+    ) -> CodeIntelResult<Located> {
         let _busy = self.begin().await?;
         let root = self.folder(root)?;
         let abs = text::resolve(&root, path)?;
@@ -657,7 +674,7 @@ impl LspSession {
                 .map(|l| (l.target_uri, l.target_selection_range))
                 .collect(),
         };
-        Ok(self.locations(&root, raw).await)
+        Ok(self.located(&root, raw).await)
     }
 
     /// Uses of the symbol at `at`, with its declaration if `include_decl`.
@@ -667,7 +684,7 @@ impl LspSession {
         path: &str,
         at: Position,
         include_decl: bool,
-    ) -> CodeIntelResult<Vec<Location>> {
+    ) -> CodeIntelResult<Located> {
         let _busy = self.begin().await?;
         let root = self.folder(root)?;
         let abs = text::resolve(&root, path)?;
@@ -687,7 +704,7 @@ impl LspSession {
             .into_iter()
             .map(|l| (l.uri, l.range))
             .collect();
-        Ok(self.locations(&root, raw).await)
+        Ok(self.located(&root, raw).await)
     }
 
     /// The symbols of one file, nested ones flattened with their container.

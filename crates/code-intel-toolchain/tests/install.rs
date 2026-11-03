@@ -489,3 +489,84 @@ async fn real_grammar_loads_and_parses() {
         }
     );
 }
+
+#[tokio::test]
+async fn downloads_report_their_bytes() {
+    let http = MockServer::start().await;
+    let body = vec![7u8; 300_000];
+    serve(&http, "/srv", body.clone()).await;
+    let root = tempfile::tempdir().unwrap();
+    let m = server_manifest(
+        &format!("{}/srv", http.uri()),
+        &sha(&body),
+        "binary",
+        "srv",
+        "",
+    );
+    let tc = toolchain(root.path(), m);
+    let spec = tc.manifest().server("srv").unwrap().clone();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, Option<u64>)>::new()));
+    let log = seen.clone();
+    let on_bytes = move |got: u64, total: Option<u64>| log.lock().unwrap().push((got, total));
+    tc.install_server_with(&spec, Some(&on_bytes))
+        .await
+        .unwrap();
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.first(), Some(&(0, Some(300_000))));
+    assert_eq!(seen.last(), Some(&(300_000, Some(300_000))));
+    assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0), "{seen:?}");
+}
+
+#[tokio::test]
+async fn remove_server_deletes_every_downloaded_version() {
+    let http = MockServer::start().await;
+    let body = b"#!/bin/sh\n".to_vec();
+    serve(&http, "/srv", body.clone()).await;
+    let root = tempfile::tempdir().unwrap();
+    let m = server_manifest(
+        &format!("{}/srv", http.uri()),
+        &sha(&body),
+        "binary",
+        "srv",
+        "",
+    );
+    let tc = toolchain(root.path(), m);
+    let spec = tc.manifest().server("srv").unwrap().clone();
+    let lang = LanguageId::new("x");
+    tc.install_server(&spec).await.unwrap();
+    std::fs::create_dir_all(root.path().join("servers/srv/0.9")).unwrap();
+
+    assert!(tc.remove_server("srv").unwrap());
+    assert!(!root.path().join("servers/srv").exists());
+    let (_, state) = tc
+        .server_for(&lang, None, root.path(), TrustMode::Review)
+        .await
+        .unwrap();
+    assert_eq!(state, InstallState::Missing);
+    assert!(!tc.remove_server("srv").unwrap(), "nothing left");
+}
+
+#[tokio::test]
+async fn remove_grammar_deletes_the_package_and_forgets_it() {
+    let http = MockServer::start().await;
+    serve(&http, "/json.dylib", b"lib".to_vec()).await;
+    serve(&http, "/json.tags.scm", b"tags".to_vec()).await;
+    let root = tempfile::tempdir().unwrap();
+    let tc = toolchain(
+        root.path(),
+        grammar_manifest(&http.uri(), &sha(b"lib"), &sha(b"tags")),
+    );
+    let json = LanguageId::new("json");
+    // Not a real dylib: it downloads, fails to load, and stays on disk.
+    assert!(tc.ensure_grammar(&json).await.is_err());
+    let dir = root.path().join("grammars/tree-sitter-json-0.24.8");
+    assert!(dir.is_dir());
+
+    assert_eq!(tc.remove_grammar(&json).unwrap(), vec![json.clone()]);
+    assert!(!dir.exists());
+    assert_eq!(tc.grammar_state(&json), InstallState::Missing, "not failed");
+    assert_eq!(
+        tc.remove_grammar(&LanguageId::new("nope")).unwrap(),
+        Vec::<LanguageId>::new()
+    );
+}

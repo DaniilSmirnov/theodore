@@ -36,12 +36,18 @@ pub fn http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// Told how a download goes: bytes received so far, and the total when the
+/// server or the manifest says. Called once per chunk; throttling is the
+/// listener's.
+pub type OnBytes = dyn Fn(u64, Option<u64>) + Send + Sync;
+
 /// Download `artifact` into a temp file under `tmp_dir`, checked by sha256.
 /// The file is removed when the returned handle drops.
 pub(crate) async fn fetch_verified(
     client: &reqwest::Client,
     artifact: &Artifact,
     tmp_dir: &Path,
+    on_bytes: Option<&OnBytes>,
 ) -> CodeIntelResult<NamedTempFile> {
     let first = Url::parse(&artifact.url)
         .map_err(|e| CodeIntelError::Download(format!("{}: {e}", artifact.url)))?;
@@ -101,6 +107,10 @@ pub(crate) async fn fetch_verified(
             .min(MAX_DOWNLOAD_BYTES);
         let mut hasher = Sha256::new();
         let mut read: u64 = 0;
+        let total = resp.content_length().or(artifact.size);
+        if let Some(f) = on_bytes {
+            f(0, total);
+        }
         while let Some(chunk) = resp
             .chunk()
             .await
@@ -117,6 +127,9 @@ pub(crate) async fn fetch_verified(
             out.write_all(&chunk)
                 .await
                 .map_err(|e| io_err(tmp.path(), e))?;
+            if let Some(f) = on_bytes {
+                f(read, total);
+            }
         }
         out.flush().await.map_err(|e| io_err(tmp.path(), e))?;
         drop(out);
