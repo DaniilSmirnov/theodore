@@ -5604,7 +5604,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-account-workos"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5623,7 +5623,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-agents"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "dirs 6.0.0",
@@ -5643,7 +5643,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-app"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5673,7 +5673,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-cli"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5708,7 +5708,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-code-intel"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "hex",
@@ -5732,7 +5732,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-code-intel-lsp"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "lsp-types",
  "pretty_assertions",
@@ -5747,7 +5747,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-code-intel-syntax"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "futures",
  "hex",
@@ -5777,7 +5777,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-code-intel-toolchain"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "flate2",
  "hex",
@@ -5804,7 +5804,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-contract"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "serde",
  "serde_json",
@@ -5817,7 +5817,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-desktop"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "mac-notification-sys",
@@ -5852,7 +5852,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-domain"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "hex",
  "pretty_assertions",
@@ -5866,7 +5866,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-fixtures"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "hex",
@@ -5888,7 +5888,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-git"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "pretty_assertions",
@@ -5903,7 +5903,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-grouping"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "futures",
@@ -5919,7 +5919,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-host-bitbucket"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "pretty_assertions",
@@ -5938,7 +5938,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-host-github"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "cynic",
@@ -5958,7 +5958,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-host-gitlab"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "hex",
@@ -5979,7 +5979,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-host-http"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "pretty_assertions",
@@ -5996,7 +5996,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-linear"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "pretty_assertions",
  "regex",
@@ -6011,7 +6011,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-mcp"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "axum",
@@ -6032,7 +6032,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-ports"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "serde",
@@ -6045,7 +6045,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-runtime"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6080,7 +6080,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-sandbox"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6099,7 +6099,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-secrets"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "serde_json",
  "theodore-ports",
@@ -6107,7 +6107,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-store"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -6117,7 +6117,7 @@ dependencies = [
 
 [[package]]
 name = "theodore-telemetry"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "chrono",
  "dirs 6.0.0",
