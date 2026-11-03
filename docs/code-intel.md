@@ -542,6 +542,10 @@ The eval decides each step: `theodore eval` for grouping, and review / space
 runs with the tools on and off, compared on findings, tokens, turns and time.
 A layer that does not improve them is not turned on by default.
 
+The agent-tools harness is `theodore eval-tools` (tasks with the code
+tools and without, docs/eval/agent-tools/README.md); the tools alone are
+`theodore code-tools-mcp`, a stdio MCP server over one worktree.
+
 ## 11. Open questions
 
 - tsgo's LSP maturity: resolved for the basics — a two-file fixture project

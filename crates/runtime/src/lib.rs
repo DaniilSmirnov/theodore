@@ -26,7 +26,7 @@ pub use hosts::Hosts;
 pub use identity::BuildEnv;
 pub use local_host::LocalHostAdapter;
 pub use token::HostToken;
-pub use tools::{CoreTools, McpRunTools};
+pub use tools::{CoreTools, McpRunTools, RootCodeTools};
 pub use worktree_gc::{WorktreeGuard, WorktreeLocks};
 
 /// How often the worktree GC sweep runs (`worktree_gc::spawn_periodic`).

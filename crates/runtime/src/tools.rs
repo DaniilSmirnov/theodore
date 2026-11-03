@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
-use theodore_app::{CodeEdits, CodeScope, Core, RunTools};
+use theodore_app::{CodeEdits, CodeRoot, CodeScope, Core, RunTools};
 use theodore_contract::FileRequest;
 use theodore_domain::{
     AgentId, Anchor, Finding, FindingId, FindingState, Fix, FixStatus, Patch, PrId, RunId, Side,
@@ -443,6 +443,103 @@ impl CodeToolsBackend for CoreTools {
                 .code_rename_symbol(&code_scope(run), path, at, new_name)
                 .await,
         )
+    }
+}
+
+/// The code tools on one fixed worktree (`theodore code-tools-mcp`, the
+/// agent-tools eval): the app's queries and edits (`CodeRoot`), whatever
+/// run calls. Edits only for a run that may make them.
+pub struct RootCodeTools {
+    root: CodeRoot,
+}
+
+impl RootCodeTools {
+    pub fn new(root: CodeRoot) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl CodeToolsBackend for RootCodeTools {
+    async fn find_symbol(
+        &self,
+        _: &RunContext,
+        name: &str,
+        kind: Option<CodeSymbolKind>,
+    ) -> Result<Answer<CodeSymbol>, BackendError> {
+        self.root.find_symbol(name, kind).await.map_err(code_error)
+    }
+
+    async fn get_symbol(
+        &self,
+        _: &RunContext,
+        path: &str,
+        name: &str,
+    ) -> Result<(CodeSymbol, String), BackendError> {
+        self.root.get_symbol(path, name).await.map_err(code_error)
+    }
+
+    async fn references(
+        &self,
+        _: &RunContext,
+        path: &str,
+        at: Position,
+    ) -> Result<Answer<CodeHit>, BackendError> {
+        self.root.references(path, at).await.map_err(code_error)
+    }
+
+    async fn definition(
+        &self,
+        _: &RunContext,
+        path: &str,
+        at: Position,
+    ) -> Result<Answer<CodeHit>, BackendError> {
+        self.root.definition(path, at).await.map_err(code_error)
+    }
+
+    async fn diagnostics(
+        &self,
+        _: &RunContext,
+        path: Option<&str>,
+    ) -> Result<Answer<Diagnostic>, BackendError> {
+        self.root.diagnostics(path).await.map_err(code_error)
+    }
+
+    async fn code_status(&self, _: &RunContext) -> Result<Vec<LanguageStatus>, BackendError> {
+        self.root.status().await.map_err(code_error)
+    }
+
+    async fn replace_symbol_body(
+        &self,
+        run: &RunContext,
+        path: &str,
+        name: &str,
+        body: &str,
+    ) -> Result<CodeEditOutcome, BackendError> {
+        may_edit(run)?;
+        edited(self.root.replace_symbol(path, name, body).await)
+    }
+
+    async fn insert_after_symbol(
+        &self,
+        run: &RunContext,
+        path: &str,
+        name: &str,
+        text: &str,
+    ) -> Result<CodeEditOutcome, BackendError> {
+        may_edit(run)?;
+        edited(self.root.insert_after_symbol(path, name, text).await)
+    }
+
+    async fn rename_symbol(
+        &self,
+        run: &RunContext,
+        path: &str,
+        at: Position,
+        new_name: &str,
+    ) -> Result<CodeEditOutcome, BackendError> {
+        may_edit(run)?;
+        edited(self.root.rename_symbol(path, at, new_name).await)
     }
 }
 

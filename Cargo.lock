@@ -5680,12 +5680,15 @@ dependencies = [
  "clap",
  "regex",
  "reqwest",
+ "rmcp",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "theodore-agents",
  "theodore-app",
  "theodore-code-intel",
+ "theodore-code-intel-toolchain",
  "theodore-contract",
  "theodore-domain",
  "theodore-git",
@@ -5699,6 +5702,8 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
+ "tree-sitter",
+ "tree-sitter-rust",
 ]
 
 [[package]]

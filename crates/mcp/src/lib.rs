@@ -7,10 +7,13 @@
 //! bearer token per agent run: the token decides whether the run sees
 //! `review-tools` or `space-tools`. `bridge` proxies a stdio MCP server to
 //! that endpoint, for agent CLIs without HTTP MCP (docs/plan.md §8.3).
+//! `code_server` serves the code tools alone for one run over any
+//! transport (`theodore code-tools-mcp`).
 
 pub mod approve;
 pub mod backend;
 pub mod bridge;
+pub mod code_server;
 pub mod server;
 pub mod space_agent;
 pub mod tools;
@@ -18,11 +21,12 @@ pub mod tools;
 pub use backend::{
     AppStatus, BackendError, BaseChange, CODE_EDIT_TOOL_NAMES, CODE_TOOL_NAMES, CheckOutcome,
     CodeEditOutcome, CodeTools, CodeToolsBackend, FileSummary, GroupSummary, GroupWithHunks,
-    LogTail, NewFinding, NewPatch, NewReviewComment, NoCodeTools, NoSpaceTools, PrContext,
-    ProgressStep, ProgressStepState, REVIEW_SPACE_TOOL_NAMES, REVIEW_TOOL_NAMES, ReviewItem,
-    ReviewToolsBackend, RunContext, SPACE_TOOL_NAMES, ShipOutcome, ShipToolAction,
+    LogTail, NewFinding, NewPatch, NewReviewComment, NoCodeTools, NoReviewTools, NoSpaceTools,
+    PrContext, ProgressStep, ProgressStepState, REVIEW_SPACE_TOOL_NAMES, REVIEW_TOOL_NAMES,
+    ReviewItem, ReviewToolsBackend, RunContext, SPACE_TOOL_NAMES, ShipOutcome, ShipToolAction,
     SpaceCommandName, SpaceDiff, SpaceInfo, SpaceToolError, SpaceToolsBackend, TerminalTail,
     ToolSet,
 };
 pub use bridge::{BridgeError, run_stdio_bridge};
+pub use code_server::{ServeError, code_run, serve_code_tools};
 pub use server::{McpHandle, McpServer};

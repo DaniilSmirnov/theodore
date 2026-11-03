@@ -3,7 +3,10 @@
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use theodore_cli::{deps, endpoint, eval, graph_check, group, links, mcp_bridge, sandbox};
+use theodore_cli::{
+    code_tools_mcp, deps, endpoint, eval, eval_tools, graph_check, group, links, mcp_bridge,
+    sandbox,
+};
 use theodore_domain::AgentId;
 use theodore_grouping::GroupingOptions;
 use theodore_ports::AgentPort;
@@ -23,6 +26,12 @@ enum Command {
     Eval(eval::EvalArgs),
     /// stdio↔HTTP bridge for agent CLIs without HTTP MCP.
     McpBridge(mcp_bridge::McpBridgeArgs),
+    /// The code tools (find_symbol, references, …) as a stdio MCP server
+    /// over one worktree (docs/code-intel.md §7).
+    CodeToolsMcp(code_tools_mcp::CodeToolsMcpArgs),
+    /// Agents with and without the code tools on a task suite
+    /// (docs/eval/agent-tools/README.md). Spends money: see --budget-usd.
+    EvalTools(eval_tools::EvalToolsArgs),
     /// Simulated host: write a scenario, drive a running sandbox
     /// (docs/sandbox.md).
     Sandbox(sandbox::SandboxArgs),
@@ -37,6 +46,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Group(args) => run_group(args).await,
         Command::Eval(args) => run_eval(args).await,
         Command::McpBridge(args) => mcp_bridge::run(&args).await,
+        Command::CodeToolsMcp(args) => code_tools_mcp::run(&args).await,
+        Command::EvalTools(args) => eval_tools::run(&args).await,
         Command::Sandbox(args) => tokio::task::spawn_blocking(move || sandbox::run(&args)).await?,
     }
 }
