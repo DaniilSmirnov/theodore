@@ -132,6 +132,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::resize_space_terminal,
             commands::close_space_terminal,
             commands::list_space_terminals,
+            commands::space_terminal_mention,
             commands::project_config,
             commands::code_intel_status,
             commands::code_intel_install,

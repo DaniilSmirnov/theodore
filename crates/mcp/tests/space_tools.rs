@@ -16,7 +16,7 @@ use theodore_domain::{AgentId, FindingId, PrId, RunId};
 use theodore_mcp::{
     AppStatus, BackendError, CheckOutcome, GroupWithHunks, LogTail, McpServer, NewFinding,
     NewPatch, PrContext, REVIEW_TOOL_NAMES, ReviewToolsBackend, RunContext, SPACE_TOOL_NAMES,
-    SpaceCommandName, SpaceInfo, SpaceToolError, SpaceToolsBackend, ToolSet,
+    SpaceCommandName, SpaceInfo, SpaceToolError, SpaceToolsBackend, TerminalTail, ToolSet,
 };
 use theodore_ports::{UserAnswer, UserQuestion};
 
@@ -131,6 +131,21 @@ impl SpaceToolsBackend for FakeSpaces {
             kind,
             lines: vec!["ready".into()],
             available: 1,
+        })
+    }
+    async fn read_terminal(
+        &self,
+        space: &str,
+        terminal: Option<&str>,
+        lines: usize,
+    ) -> Result<TerminalTail, SpaceToolError> {
+        self.record(format!("read_terminal {space} {terminal:?} {lines}"));
+        Ok(TerminalTail {
+            id: Some("t1".into()),
+            title: Some("Terminal 1".into()),
+            running: Some(true),
+            lines: vec!["$ ls".into(), "Cargo.toml".into()],
+            note: None,
         })
     }
     async fn space_info(&self, space: &str) -> Result<SpaceInfo, SpaceToolError> {
@@ -266,6 +281,9 @@ async fn a_space_turn_gets_only_the_space_tools() {
     assert_eq!(info["env"], json!(["THEODORE_PORT"]));
     let logs = json_of(&call(&client, "read_logs", json!({ "kind": "run" })).await);
     assert_eq!(logs["kind"], json!("run"));
+    let terminal = json_of(&call(&client, "read_terminal", json!({})).await);
+    assert_eq!(terminal["id"], json!("t1"));
+    assert_eq!(terminal["lines"], json!(["$ ls", "Cargo.toml"]));
 
     // The space is the token's, whatever the agent sends.
     assert_eq!(
@@ -277,6 +295,7 @@ async fn a_space_turn_gets_only_the_space_tools() {
             "app_status s1",
             "space_info s1",
             "read_logs s1 run 100",
+            "read_terminal s1 None 200",
         ]
     );
     drop(client);
@@ -316,6 +335,31 @@ async fn read_logs_tail_is_bounded() {
             "read_logs s1 check 400",
             "read_logs s1 check 1",
             "read_logs s1 check 7"
+        ]
+    );
+    drop(client);
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn read_terminal_lines_is_bounded_and_terminal_is_passed_through() {
+    let spaces = FakeSpaces::new(true);
+    let handle = McpServer::start_with_spaces(Arc::new(EmptyReview), spaces.clone())
+        .await
+        .unwrap();
+    let endpoint = handle.register_run(space_run());
+    let client = connect(&endpoint.url, &endpoint.token).await;
+    for lines in [json!(100000), json!(0), json!(7)] {
+        call(&client, "read_terminal", json!({ "lines": lines })).await;
+    }
+    call(&client, "read_terminal", json!({ "terminal": "t2" })).await;
+    assert_eq!(
+        spaces.calls(),
+        [
+            "read_terminal s1 None 2000",
+            "read_terminal s1 None 1",
+            "read_terminal s1 None 7",
+            "read_terminal s1 Some(\"t2\") 200",
         ]
     );
     drop(client);

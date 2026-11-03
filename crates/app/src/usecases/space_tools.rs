@@ -18,7 +18,7 @@ use theodore_contract::{
 use theodore_domain::{AgentId, PrId};
 use theodore_ports::{
     AppStatus, CheckOutcome, CommandInfo, LogTail, McpEndpoint, SpaceCommandName, SpaceInfo,
-    SpaceToolError, local_urls,
+    SpaceToolError, TerminalTail, local_urls,
 };
 
 use crate::core::Core;
@@ -220,6 +220,20 @@ impl Core {
             env,
             commands,
         })
+    }
+
+    /// `read_terminal`: `terminal` named, or else the space's most
+    /// recently active one, with its last `lines` lines. Read only — no
+    /// terminal is opened or closed by this call.
+    pub async fn space_tool_read_terminal(
+        &self,
+        space: &str,
+        terminal: Option<&str>,
+        lines: usize,
+    ) -> Result<TerminalTail, SpaceToolError> {
+        self.read_space_terminal(space, terminal, lines)
+            .await
+            .map_err(unavailable)
     }
 
     /// The space whose PR `pr` is (its branch review or its shipped PR).

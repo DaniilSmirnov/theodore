@@ -64,6 +64,7 @@ import { useAttachments } from '../attachments';
 import { ChatEmpty, ChatLive, ChatLog, ChatMessage } from '../ChatTurn';
 import { QueuedMessages } from './QueuedMessages';
 import { canSendNow, splitQueue } from './queue';
+import { attachTerminalMention, stripTerminalMention } from './terminalMention';
 import { latinKey, useViewKeys } from '../keys';
 import { AgentChip, ChipMenu, Composer } from './Composer';
 import { agentModel } from '../agentModel';
@@ -992,6 +993,20 @@ export const SpaceChat = observer(function SpaceChat({
   })
     ? () => send(true)
     : undefined;
+  // `@terminal ` attaches the space's most recently active terminal's
+  // tail (docs/spaces.md §3, §11) the way a dropped file would, instead
+  // of becoming literal message text.
+  const onComposerChange = (next: string) => {
+    const stripped = stripTerminalMention(next);
+    if (stripped.found) {
+      setText(stripped.text);
+      void attachTerminalMention(space.id, files, (text) =>
+        store.ephemeral.toast(text, 'info'),
+      );
+      return;
+    }
+    setText(next);
+  };
 
   return (
     <>
@@ -1097,7 +1112,7 @@ export const SpaceChat = observer(function SpaceChat({
           <Composer
             inputRef={input}
             value={text}
-            onChange={setText}
+            onChange={onComposerChange}
             onSubmit={() => send()}
             placeholder={
               space.status === 'archived'

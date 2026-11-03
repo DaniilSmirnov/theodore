@@ -2301,6 +2301,19 @@ export type TelemetryStatus = {
 	never_sent: string[],
 };
 
+/**
+ *  `@terminal` in the space composer (docs/spaces.md §3, §11): the space's
+ *  most recently active terminal's last lines, attached to the message as
+ *  a text file the way any other attachment is. `None` when the space has
+ *  no terminal open.
+ */
+export type TerminalMention = {
+	id: string,
+	title: string,
+	/**  Oldest first, ANSI stripped. */
+	lines: string[],
+};
+
 export type TerminalStatus = "running" |
 /**  The shell exited; `exit_code` says how. */
 "exited";

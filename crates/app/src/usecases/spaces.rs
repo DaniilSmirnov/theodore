@@ -1457,7 +1457,10 @@ pub(crate) const SPACE_TOOLS_PROMPT: &str = "Theodore's space-tools MCP server r
      space's configured commands for you: run_check (the project's check; use it after \
      changes), start_app / stop_app / app_status (the app, its ports and http://localhost \
      URLs; start_app to try it), read_logs (setup, run, check or archive output) and \
-     space_info. It also acts on the change: when the user asks you to push, open a PR \
+     space_info. read_terminal reads one of the space's open terminals (id, title, \
+     whether it still runs, its last lines) — leave `terminal` out for the most \
+     recently active one; a note, not an error, says so when none is open. It also \
+     acts on the change: when the user asks you to push, open a PR \
      (or a draft), merge or keep it as a branch, call ship and tell them what it returns \
      (the PR link, or why it was refused). get_space_diff shows your change against the \
      base, uncommitted edits included; get_review_comments reads the review's comments \

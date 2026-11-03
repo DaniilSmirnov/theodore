@@ -373,6 +373,7 @@ No tool runs a command the agent writes; there is no shell tool.
 | `stop_app` | stops `run`, waits up to 10 s for it to exit; returns the status |
 | `app_status` | `running`, `ports`, `urls` (`http://localhost:<port>` each), whether `run` is set and allowed, how the last run ended |
 | `read_logs` | the last `tail` lines (default 100, at most 400) of one `kind`: `setup`, `run`, `check` or `archive`; stderr lines start with `! ` |
+| `read_terminal` | one of the space's open terminals (docs/spaces.md §3 "Terminal"): `terminal?` (id, default the most recently active), `lines?` (default 200, at most 2000); returns `id`, `title`, `running`, `lines` (ANSI stripped), or a `note` when none is open |
 | `space_info` | name, branch, base, worktree, ports and URLs, the **names** of the variables a command gets (§4, `env`) — never their values — and which commands are set and allowed |
 
 ```

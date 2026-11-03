@@ -39,8 +39,8 @@ use crate::tools::{
     CodeAnswerResult, CodeEditResult, CodeStatusResult, DiagnosticItem, DiagnosticsParams,
     FindSymbolParams, GetBaseFileParams, GetGroupParams, GetSymbolParams, GroupResult, HitItem,
     InsertAfterSymbolParams, PositionParams, PrContextResult, ProposePatchParams,
-    ProposePatchResult, ReadLogsParams, RenameSymbolParams, ReplaceSymbolBodyParams,
-    SymbolBodyResult, SymbolItem,
+    ProposePatchResult, ReadLogsParams, ReadTerminalParams, RenameSymbolParams,
+    ReplaceSymbolBodyParams, SymbolBodyResult, SymbolItem,
 };
 
 /// Live run registrations: bearer token → run context. Shared between the auth
@@ -333,6 +333,23 @@ impl ReviewToolsServer {
         space_result(
             self.spaces
                 .read_logs(&space, params.kind.into(), tail)
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "One of the space's open terminals (docs/spaces.md \"Terminal\"): its id, title, whether its shell still runs, and its last lines, ANSI stripped. Leave `terminal` out for the most recently active one. A clear note, not an error, when no terminal is open."
+    )]
+    async fn read_terminal(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(params): Parameters<ReadTerminalParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (_, space) = run_space(&parts)?;
+        let lines = params.bounded_lines();
+        space_result(
+            self.spaces
+                .read_terminal(&space, params.terminal.as_deref(), lines)
                 .await,
         )
     }

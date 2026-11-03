@@ -79,6 +79,33 @@ pub struct LogTail {
     pub available: usize,
 }
 
+/// `read_terminal`: one terminal's id, title, whether its shell still
+/// runs, and its last lines (ANSI stripped). `id` is `None` when the space
+/// has no terminal open; `note` then says so.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TerminalTail {
+    pub id: Option<String>,
+    pub title: Option<String>,
+    pub running: Option<bool>,
+    /// Oldest first; empty when `id` is `None`.
+    pub lines: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl TerminalTail {
+    /// No terminal is open in the space.
+    pub fn none(note: impl Into<String>) -> Self {
+        TerminalTail {
+            id: None,
+            title: None,
+            running: None,
+            lines: vec![],
+            note: Some(note.into()),
+        }
+    }
+}
+
 /// One command in `space_info`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CommandInfo {

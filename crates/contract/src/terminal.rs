@@ -63,3 +63,15 @@ pub struct ResizeTerminalRequest {
     pub cols: u16,
     pub rows: u16,
 }
+
+/// `@terminal` in the space composer (docs/spaces.md §3, §11): the space's
+/// most recently active terminal's last lines, attached to the message as
+/// a text file the way any other attachment is. `None` when the space has
+/// no terminal open.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct TerminalMention {
+    pub id: String,
+    pub title: String,
+    /// Oldest first, ANSI stripped.
+    pub lines: Vec<String>,
+}

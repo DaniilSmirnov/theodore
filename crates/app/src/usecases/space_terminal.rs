@@ -13,8 +13,8 @@
 //!
 //! Output is kept twice: a bounded raw tail (ANSI intact, base64 on the
 //! wire) that seeds `xterm.js` when a tab is reattached, and a bounded
-//! ANSI-stripped line tail (`space_terminal_tail`) for a later agent tool
-//! to read as plain text — not wired up yet.
+//! ANSI-stripped line tail (`space_terminal_tail`) the `read_terminal`
+//! agent tool (docs/spaces.md "Tools the agent gets") reads as plain text.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex as SyncMutex};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use theodore_contract::{Ephemeral, SpaceStatus, SpaceTerminalInfo, TerminalStatus};
+use theodore_ports::TerminalTail;
 use theodore_ports::terminal::{TerminalEvent, TerminalSpec};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -39,6 +40,8 @@ const CLEAN_TAIL_LINES: usize = 2_000;
 /// How long `close_space_terminal` and the app-quit sweep wait for a killed
 /// shell to actually exit before giving up on it.
 const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Lines `@terminal` (`space_terminal_mention`) attaches.
+const TERMINAL_MENTION_LINES: usize = 200;
 
 /// One open terminal, keyed by its id in `Core::term_rt`.
 pub(crate) struct TerminalEntry {
@@ -69,6 +72,9 @@ struct LiveState {
     clean_tail: VecDeque<String>,
     /// The ANSI-stripped current line, not yet terminated by `\n`.
     clean_partial: String,
+    /// When this terminal last saw output or input — `read_terminal`'s
+    /// default (no `terminal` named) picks the space's latest.
+    last_active: theodore_domain::Millis,
 }
 
 impl Core {
@@ -123,6 +129,7 @@ impl Core {
             raw_tail: VecDeque::new(),
             clean_tail: VecDeque::new(),
             clean_partial: String::new(),
+            last_active: created_at,
         }));
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         {
@@ -170,13 +177,14 @@ impl Core {
     /// Bytes typed or pasted into the terminal, forwarded to its shell as
     /// is. A no-op once the shell has exited.
     pub async fn write_space_terminal(&self, terminal: &str, data: &str) -> AppResult<()> {
-        let input = {
+        let (input, live) = {
             let rt = self.0.term_rt.lock().unwrap_or_else(|p| p.into_inner());
-            rt.get(terminal)
-                .ok_or_else(|| AppError::NotFound(format!("terminal {terminal}")))?
-                .input
-                .clone()
+            let t = rt
+                .get(terminal)
+                .ok_or_else(|| AppError::NotFound(format!("terminal {terminal}")))?;
+            (t.input.clone(), t.live.clone())
         };
+        live.lock().unwrap_or_else(|p| p.into_inner()).last_active = self.0.deps.clock.now();
         let _ = input.send(data.as_bytes().to_vec());
         Ok(())
     }
@@ -233,8 +241,7 @@ impl Core {
         Ok(out.into_iter().map(|(_, info)| info).collect())
     }
 
-    /// The last `lines` of `terminal`'s output, ANSI stripped — for a later
-    /// agent tool to read as plain text (not wired up in this slice).
+    /// The last `lines` of `terminal`'s output, ANSI stripped.
     pub async fn space_terminal_tail(
         &self,
         terminal: &str,
@@ -250,6 +257,70 @@ impl Core {
         let st = live.lock().unwrap_or_else(|p| p.into_inner());
         let n = st.clean_tail.len().saturating_sub(lines);
         Ok(st.clean_tail.iter().skip(n).cloned().collect())
+    }
+
+    /// `read_terminal` (docs/spaces.md "Tools the agent gets"): `terminal`
+    /// named, or else `space`'s most recently active one (last input or
+    /// output); its id, title, whether its shell still runs, and its last
+    /// `lines` lines. A clear note, no error, when the space has no
+    /// terminal open.
+    pub async fn read_space_terminal(
+        &self,
+        space: &str,
+        terminal: Option<&str>,
+        lines: usize,
+    ) -> AppResult<TerminalTail> {
+        let rt = self.0.term_rt.lock().unwrap_or_else(|p| p.into_inner());
+        let id = match terminal {
+            Some(id) => {
+                rt.get(id)
+                    .filter(|t| t.space == space)
+                    .ok_or_else(|| AppError::NotFound(format!("terminal {id}")))?;
+                id.to_string()
+            }
+            None => {
+                let Some(id) = rt
+                    .iter()
+                    .filter(|(_, t)| t.space == space)
+                    .max_by_key(|(_, t)| {
+                        t.live.lock().unwrap_or_else(|p| p.into_inner()).last_active
+                    })
+                    .map(|(id, _)| id.clone())
+                else {
+                    return Ok(TerminalTail::none("no terminal is open in this space"));
+                };
+                id
+            }
+        };
+        let t = rt.get(&id).expect("id just resolved from term_rt");
+        let title = t.title.clone();
+        let st = t.live.lock().unwrap_or_else(|p| p.into_inner());
+        let n = st.clean_tail.len().saturating_sub(lines);
+        Ok(TerminalTail {
+            id: Some(id),
+            title: Some(title),
+            running: Some(st.status == TerminalStatus::Running),
+            lines: st.clean_tail.iter().skip(n).cloned().collect(),
+            note: None,
+        })
+    }
+
+    /// `@terminal` in the space composer (docs/spaces.md §3, §11): `space`'s
+    /// most recently active terminal's last [`TERMINAL_MENTION_LINES`]
+    /// lines, for the UI to attach as a text file the way any other
+    /// attachment goes. `None` when the space has no terminal open.
+    pub async fn space_terminal_mention(
+        &self,
+        space: &str,
+    ) -> AppResult<Option<theodore_contract::TerminalMention>> {
+        let tail = self
+            .read_space_terminal(space, None, TERMINAL_MENTION_LINES)
+            .await?;
+        Ok(tail.id.map(|id| theodore_contract::TerminalMention {
+            id,
+            title: tail.title.unwrap_or_default(),
+            lines: tail.lines,
+        }))
     }
 
     /// Kills every terminal of `space`, waiting briefly for each — archive
@@ -378,6 +449,7 @@ async fn forward_terminal_events(
                 let (seq, data) = {
                     let mut st = live.lock().unwrap_or_else(|p| p.into_inner());
                     st.seq += 1;
+                    st.last_active = core.0.deps.clock.now();
                     push_capped(&mut st.raw_tail, &bytes, RAW_TAIL_BYTES);
                     let st = &mut *st;
                     append_clean(

@@ -925,7 +925,8 @@ pub fn types() -> specta::Types {
         .register::<SpaceTerminalInfo>()
         .register::<OpenTerminalRequest>()
         .register::<WriteTerminalRequest>()
-        .register::<ResizeTerminalRequest>();
+        .register::<ResizeTerminalRequest>()
+        .register::<TerminalMention>();
     // JS numbers: ids, counts and unix-ms timestamps stay far below 2^53.
     use specta::datatype::Primitive as P;
     specta_util::Remapper::new()

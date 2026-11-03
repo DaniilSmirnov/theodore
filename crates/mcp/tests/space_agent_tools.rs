@@ -21,7 +21,7 @@ use theodore_mcp::{
     AppStatus, BackendError, BaseChange, CheckOutcome, GroupWithHunks, LogTail, McpServer,
     NewFinding, NewPatch, NewReviewComment, PrContext, ProgressStep, ReviewItem,
     ReviewToolsBackend, RunContext, ShipOutcome, ShipToolAction, SpaceCommandName, SpaceDiff,
-    SpaceInfo, SpaceToolError, SpaceToolsBackend, ToolSet,
+    SpaceInfo, SpaceToolError, SpaceToolsBackend, TerminalTail, ToolSet,
 };
 
 struct EmptyReview;
@@ -86,6 +86,14 @@ impl SpaceToolsBackend for FakeChange {
         _: SpaceCommandName,
         _: usize,
     ) -> Result<LogTail, SpaceToolError> {
+        Err(no(s))
+    }
+    async fn read_terminal(
+        &self,
+        s: &str,
+        _: Option<&str>,
+        _: usize,
+    ) -> Result<TerminalTail, SpaceToolError> {
         Err(no(s))
     }
     async fn space_info(&self, s: &str) -> Result<SpaceInfo, SpaceToolError> {

@@ -109,6 +109,7 @@ import type {
   TaskDecision,
   TelemetryChoice,
   TelemetryStatus,
+  TerminalMention,
   Transaction,
   TransactionResult,
   UiEvent,
@@ -387,6 +388,10 @@ export const api = {
   /** The space's open (or just-exited) terminals, with scrollback. */
   listSpaceTerminals: (space: string) =>
     call<SpaceTerminalInfo[]>('list_space_terminals', { space }),
+  /** `@terminal` in the composer: the space's most recently active
+   *  terminal's last lines, `null` when it has none open. */
+  spaceTerminalMention: (space: string) =>
+    call<TerminalMention | null>('space_terminal_mention', { space }),
   /** A project's merged config, read-only (Settings → Labs). */
   projectConfig: (project: string) =>
     call<EffectiveConfig>('project_config', { project }),

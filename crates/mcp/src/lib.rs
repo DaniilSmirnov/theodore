@@ -21,7 +21,8 @@ pub use backend::{
     LogTail, NewFinding, NewPatch, NewReviewComment, NoCodeTools, NoSpaceTools, PrContext,
     ProgressStep, ProgressStepState, REVIEW_SPACE_TOOL_NAMES, REVIEW_TOOL_NAMES, ReviewItem,
     ReviewToolsBackend, RunContext, SPACE_TOOL_NAMES, ShipOutcome, ShipToolAction,
-    SpaceCommandName, SpaceDiff, SpaceInfo, SpaceToolError, SpaceToolsBackend, ToolSet,
+    SpaceCommandName, SpaceDiff, SpaceInfo, SpaceToolError, SpaceToolsBackend, TerminalTail,
+    ToolSet,
 };
 pub use bridge::{BridgeError, run_stdio_bridge};
 pub use server::{McpHandle, McpServer};

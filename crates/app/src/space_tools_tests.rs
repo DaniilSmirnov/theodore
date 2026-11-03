@@ -1,7 +1,9 @@
 //! The space tools (docs/spaces.md "Tools the agent gets") against `Core`
 //! and the testkit fakes: the trust gate, the check's result, start, stop
-//! and status, the log tail, `space_info` without env values, and which
-//! runs get which tools registered.
+//! and status, the log tail, the terminal tail, `space_info` without env
+//! values, and which runs get which tools registered.
+
+use std::time::Duration;
 
 use theodore_contract::{AskRequest, RunSkillRequest, SpaceTrustRequest};
 use theodore_domain::AgentId;
@@ -206,6 +208,88 @@ async fn read_logs_returns_one_commands_tail() {
         .await
         .unwrap();
     assert!(run.lines.is_empty() && run.available == 0);
+}
+
+#[tokio::test]
+async fn read_terminal_defaults_to_the_most_recently_active_one() {
+    let e = start_env(false).await;
+    let s = e.create("").await;
+
+    // No terminal open yet: a note, not an error.
+    let none = e
+        .core
+        .space_tool_read_terminal(&s.id, None, 200)
+        .await
+        .unwrap();
+    assert_eq!(none.id, None);
+    assert_eq!(
+        none.note.as_deref(),
+        Some("no terminal is open in this space")
+    );
+    assert!(none.lines.is_empty());
+
+    let t1 = e.core.open_space_terminal(&s.id, 80, 24).await.unwrap();
+    e.f.clock.advance(1_000);
+    let t2 = e.core.open_space_terminal(&s.id, 80, 24).await.unwrap();
+    // t2 opened later, so it's the default until t1 is written to
+    // (`FakeTerminals` echoes input back as output).
+    let latest = e
+        .core
+        .space_tool_read_terminal(&s.id, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(latest.id, Some(t2.id.clone()));
+
+    e.f.clock.advance(1_000);
+    e.core
+        .write_space_terminal(&t1.id, "hello\n")
+        .await
+        .unwrap();
+    let mut tail = e
+        .core
+        .space_tool_read_terminal(&s.id, Some(t1.id.as_str()), 10)
+        .await
+        .unwrap();
+    for _ in 0..200 {
+        if tail.lines.iter().any(|l| l.contains("hello")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        tail = e
+            .core
+            .space_tool_read_terminal(&s.id, Some(t1.id.as_str()), 10)
+            .await
+            .unwrap();
+    }
+    assert_eq!(tail.id, Some(t1.id.clone()));
+    assert_eq!(tail.title, Some(t1.title.clone()));
+    assert_eq!(tail.running, Some(true));
+    assert!(tail.lines.iter().any(|l| l.contains("hello")), "{tail:?}");
+
+    // Writing to t1 made it the space's most recently active terminal.
+    let latest = e
+        .core
+        .space_tool_read_terminal(&s.id, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(latest.id, Some(t1.id.clone()));
+
+    // Naming a terminal overrides the default.
+    let named = e
+        .core
+        .space_tool_read_terminal(&s.id, Some(t2.id.as_str()), 10)
+        .await
+        .unwrap();
+    assert_eq!(named.id, Some(t2.id));
+    assert!(named.lines.is_empty());
+
+    // An unknown id is refused, not silently redirected to the default.
+    let err = e
+        .core
+        .space_tool_read_terminal(&s.id, Some("nope"), 10)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SpaceToolError::Unavailable(_)), "{err:?}");
 }
 
 #[tokio::test]

@@ -9,7 +9,7 @@ pub use theodore_ports::{
     Answer, AppStatus, BaseChange, CheckOutcome, CodeHit, CodeSymbol, CodeSymbolKind, Diagnostic,
     LanguageStatus, LogTail, NewReviewComment, Position, ProgressStep, ProgressStepState,
     ReviewItem, ShipOutcome, ShipToolAction, SpaceCommandName, SpaceDiff, SpaceInfo,
-    SpaceToolError, UserAnswer, UserQuestion,
+    SpaceToolError, TerminalTail, UserAnswer, UserQuestion,
 };
 
 /// Which server a run talks to, and so which tools it sees.
@@ -40,6 +40,7 @@ pub const SPACE_TOOL_NAMES: &[&str] = &[
     "stop_app",
     "app_status",
     "read_logs",
+    "read_terminal",
     "space_info",
     "ship",
     "get_space_diff",
@@ -255,6 +256,14 @@ pub trait SpaceToolsBackend: Send + Sync {
         kind: SpaceCommandName,
         tail: usize,
     ) -> Result<LogTail, SpaceToolError>;
+    /// `terminal` named, or else the space's most recently active one; its
+    /// last `lines` lines. The backend bounds `lines`.
+    async fn read_terminal(
+        &self,
+        space: &str,
+        terminal: Option<&str>,
+        lines: usize,
+    ) -> Result<TerminalTail, SpaceToolError>;
     async fn space_info(&self, space: &str) -> Result<SpaceInfo, SpaceToolError>;
 
     // ── the change itself (`space_agent`); unavailable unless implemented ──
@@ -354,6 +363,14 @@ impl SpaceToolsBackend for NoSpaceTools {
         _: SpaceCommandName,
         _: usize,
     ) -> Result<LogTail, SpaceToolError> {
+        Err(unavailable())
+    }
+    async fn read_terminal(
+        &self,
+        _: &str,
+        _: Option<&str>,
+        _: usize,
+    ) -> Result<TerminalTail, SpaceToolError> {
         Err(unavailable())
     }
     async fn space_info(&self, _: &str) -> Result<SpaceInfo, SpaceToolError> {

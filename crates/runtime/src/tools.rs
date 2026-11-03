@@ -16,7 +16,7 @@ use theodore_mcp::{
     CodeToolsBackend, FileSummary, GroupSummary, GroupWithHunks, LogTail, McpHandle, McpServer,
     NewFinding, NewPatch, NewReviewComment, PrContext, ProgressStep, ReviewItem,
     ReviewToolsBackend, RunContext, ShipOutcome, ShipToolAction, SpaceCommandName, SpaceDiff,
-    SpaceInfo, SpaceToolError, SpaceToolsBackend, ToolSet,
+    SpaceInfo, SpaceToolError, SpaceToolsBackend, TerminalTail, ToolSet,
 };
 use theodore_ports::{
     Answer, CodeHit, CodeSymbol, CodeSymbolKind, Diagnostic, LanguageStatus, McpEndpoint, Position,
@@ -205,6 +205,17 @@ impl SpaceToolsBackend for CoreTools {
         tail: usize,
     ) -> Result<LogTail, SpaceToolError> {
         self.space_core()?.space_tool_logs(space, kind, tail).await
+    }
+
+    async fn read_terminal(
+        &self,
+        space: &str,
+        terminal: Option<&str>,
+        lines: usize,
+    ) -> Result<TerminalTail, SpaceToolError> {
+        self.space_core()?
+            .space_tool_read_terminal(space, terminal, lines)
+            .await
     }
 
     async fn space_info(&self, space: &str) -> Result<SpaceInfo, SpaceToolError> {

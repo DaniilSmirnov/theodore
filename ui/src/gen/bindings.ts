@@ -160,6 +160,16 @@ export const commands = {
 	 *  `xterm.js`.
 	 */
 	listSpaceTerminals: (space: string) => typedError<SpaceTerminalInfo[], CommandError>(__TAURI_INVOKE("list_space_terminals", { space })),
+	/**
+	 *  `@terminal` in the composer (docs/spaces.md §3, §11): the space's most
+	 *  recently active terminal's last lines, `None` when it has none open.
+	 */
+	spaceTerminalMention: (space: string) => typedError<{
+	id: string,
+	title: string,
+	/**  Oldest first, ANSI stripped. */
+	lines: string[],
+} | null, CommandError>(__TAURI_INVOKE("space_terminal_mention", { space })),
 	/**  A project's merged config, with each value's file. */
 	projectConfig: (project: string) => typedError<EffectiveConfig, CommandError>(__TAURI_INVOKE("project_config", { project })),
 	/**
@@ -2210,6 +2220,19 @@ export type TelemetryStatus = {
 	events: TelemetryEventInfo[],
 	/**  What is never sent, one line each. */
 	never_sent: string[],
+};
+
+/**
+ *  `@terminal` in the space composer (docs/spaces.md §3, §11): the space's
+ *  most recently active terminal's last lines, attached to the message as
+ *  a text file the way any other attachment is. `None` when the space has
+ *  no terminal open.
+ */
+export type TerminalMention = {
+	id: string,
+	title: string,
+	/**  Oldest first, ANSI stripped. */
+	lines: string[],
 };
 
 export type TerminalStatus = "running" |

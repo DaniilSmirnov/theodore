@@ -866,6 +866,12 @@ impl CoreApi for AppCore {
     ) -> Result<Vec<theodore_contract::SpaceTerminalInfo>, CommandError> {
         self.core.list_space_terminals(&space).await.map_err(err)
     }
+    async fn space_terminal_mention(
+        &self,
+        space: String,
+    ) -> Result<Option<theodore_contract::TerminalMention>, CommandError> {
+        self.core.space_terminal_mention(&space).await.map_err(err)
+    }
     async fn project_config(
         &self,
         project: String,

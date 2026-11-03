@@ -1225,6 +1225,19 @@ pub async fn list_space_terminals(
         .await
 }
 
+/// `@terminal` in the composer (docs/spaces.md §3, §11): the space's most
+/// recently active terminal's last lines, `None` when it has none open.
+#[tauri::command]
+#[specta::specta]
+pub async fn space_terminal_mention(
+    op: crate::op::Op,
+    space: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<Option<theodore_contract::TerminalMention>, CommandError> {
+    op.run(async move { core.space_terminal_mention(space).await })
+        .await
+}
+
 /// A project's merged config, with each value's file.
 #[tauri::command]
 #[specta::specta]

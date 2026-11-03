@@ -19,7 +19,8 @@ use theodore_contract::{
     TriageRequest, UpdateInfo,
 };
 use theodore_contract::{
-    OpenTerminalRequest, ResizeTerminalRequest, SpaceTerminalInfo, WriteTerminalRequest,
+    OpenTerminalRequest, ResizeTerminalRequest, SpaceTerminalInfo, TerminalMention,
+    WriteTerminalRequest,
 };
 use theodore_contract::{SandboxFaultRequest, SandboxStatus};
 use theodore_domain::{AgentId, HostKind, HostRepo, Person, PrId, Revision};
@@ -467,6 +468,14 @@ pub trait CoreApi: Send + Sync {
         &self,
         _space: String,
     ) -> Result<Vec<SpaceTerminalInfo>, CommandError> {
+        Err(not_ready())
+    }
+    /// `@terminal` in the composer: the space's most recently active
+    /// terminal's last lines, `None` when it has none open.
+    async fn space_terminal_mention(
+        &self,
+        _space: String,
+    ) -> Result<Option<TerminalMention>, CommandError> {
         Err(not_ready())
     }
     /// A project's merged config, with each value's file.

@@ -310,6 +310,31 @@ impl ReadLogsParams {
     }
 }
 
+// ── read_terminal (space-tools; read-only in every mode) ───────────────────
+
+/// Lines `read_terminal` returns when `lines` is left out.
+pub const DEFAULT_TERMINAL_TAIL: usize = 200;
+/// The most lines one `read_terminal` call returns.
+pub const MAX_TERMINAL_TAIL: usize = 2_000;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadTerminalParams {
+    /// A terminal id, as returned by this tool or seen in the space's
+    /// Terminal tab. Left out: the space's most recently active terminal.
+    pub terminal: Option<String>,
+    /// How many of the last lines (default 200, at most 2000).
+    pub lines: Option<u32>,
+}
+
+impl ReadTerminalParams {
+    /// `lines`, bounded to `1..=MAX_TERMINAL_TAIL`.
+    pub fn bounded_lines(&self) -> usize {
+        self.lines
+            .map_or(DEFAULT_TERMINAL_TAIL, |l| l as usize)
+            .clamp(1, MAX_TERMINAL_TAIL)
+    }
+}
+
 // ── code tools (docs/code-intel.md §7) ──────────────────────────────────────
 
 /// Items one code tool call returns, at most: an agent never gets a huge

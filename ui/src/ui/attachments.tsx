@@ -24,6 +24,9 @@ export type Pending = {
 export type Attachments = {
   items: Pending[];
   add: (files: FileList | File[]) => void;
+  /** Already saved by the caller (e.g. `@terminal`'s tail) — straight into
+   *  the strip, no upload round trip. */
+  addSaved: (a: Attachment) => void;
   remove: (key: string) => void;
   clear: () => void;
   /** Saved ones' ids, for the request. */
@@ -96,6 +99,14 @@ export function useAttachments(): Attachments {
     }
   };
 
+  const addSaved = (a: Attachment) => {
+    const key = `att-${++seq}`;
+    setItems((list) => [
+      ...list,
+      { key, name: a.name, mime: a.mime, preview: null, saved: a, error: null },
+    ]);
+  };
+
   const remove = (key: string) =>
     setItems((list) => {
       const gone = list.find((p) => p.key === key);
@@ -113,6 +124,7 @@ export function useAttachments(): Attachments {
   return {
     items,
     add,
+    addSaved,
     remove,
     clear,
     ids: saved.map((a) => a.id),
