@@ -6,10 +6,11 @@
 //! the others — a `Triggers::author_push` moves the head `FixtureGit` serves
 //! and the PR `FixtureHost` serves, in the same state.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use theodore_domain::{AgentId, PrDetail, PrId, PrRef, Revision, Sha};
+use theodore_ports::HostError;
 
 use crate::error::FixtureError;
 use crate::host::HostCall;
@@ -29,6 +30,16 @@ pub(crate) struct SharedState {
     pub change_log: Vec<PrRef>,
     /// Agents whose next `run()` must fail, set by `Triggers::agent_crash`.
     pub crash_next: HashSet<AgentId>,
+    /// Errors the host returns for the next calls of a method, oldest first;
+    /// set by `Triggers::fail_host`.
+    pub host_faults: HashMap<String, VecDeque<HostError>>,
+}
+
+impl SharedState {
+    /// Pops the next injected error for `method`, if any.
+    pub fn take_fault(&mut self, method: &str) -> Option<HostError> {
+        self.host_faults.get_mut(method)?.pop_front()
+    }
 }
 
 impl SharedState {
@@ -87,6 +98,7 @@ impl SharedState {
             calls: Vec::new(),
             change_log: Vec::new(),
             crash_next: HashSet::new(),
+            host_faults: HashMap::new(),
         })
     }
 }

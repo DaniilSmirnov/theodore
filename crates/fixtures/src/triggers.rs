@@ -8,6 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use theodore_domain::{AgentId, CheckRollup, CheckStatus, PrRef, Sha};
+use theodore_ports::HostError;
 
 use crate::state::SharedState;
 
@@ -89,5 +90,18 @@ impl Triggers {
     /// The next `run()` of `agent` fails instead of playing its script.
     pub fn agent_crash(&self, agent: AgentId) {
         self.state.lock().unwrap().crash_next.insert(agent);
+    }
+
+    /// The next calls of host `method` (e.g. `"submit_review"`) fail with
+    /// `errors`, one per call, oldest first; later calls succeed again. The
+    /// call is still recorded in `FixtureHost::calls`.
+    pub fn fail_host(&self, method: &str, errors: Vec<HostError>) {
+        self.state
+            .lock()
+            .unwrap()
+            .host_faults
+            .entry(method.to_string())
+            .or_default()
+            .extend(errors);
     }
 }

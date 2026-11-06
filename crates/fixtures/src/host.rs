@@ -302,6 +302,9 @@ impl HostAdapter for FixtureHost {
             pr_id: Some(pr_id.to_string()),
             details: format!("path={path}, viewed={viewed}"),
         });
+        if let Some(fault) = state.take_fault("set_viewed") {
+            return Err(fault);
+        }
 
         let detail = state
             .prs
@@ -338,6 +341,9 @@ impl HostAdapter for FixtureHost {
                 review.comments.len()
             ),
         });
+        if let Some(fault) = state.take_fault("submit_review") {
+            return Err(fault);
+        }
 
         let detail = state
             .prs
@@ -376,6 +382,9 @@ impl HostAdapter for FixtureHost {
             pr_id: Some(pr.id().to_string()),
             details: format!("marker={marker}"),
         });
+        if let Some(fault) = state.take_fault("find_marker") {
+            return Err(fault);
+        }
         Ok(None)
     }
 
