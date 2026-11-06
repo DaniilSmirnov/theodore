@@ -165,20 +165,25 @@ describe('Submit review modal', () => {
     expect(submits()).toHaveLength(0);
   });
 
-  it('keeps the drafts in the pool when submit_review rejects', async () => {
+  it('stays open on a failed submit, keeping drafts, comment and verdict', async () => {
     store.sync.pool.put('draft', 'd1', draft({ id: 'd1' }));
     transport.onCall('submit_review', () => {
       throw new Error('boom');
     });
     await open();
+    await click(radio('Approve'));
+    await typeInto(document.querySelector('textarea'), 'my verdict');
     await click(btn('Submit'));
     await settle();
     expect(submits()).toHaveLength(1);
     expect(store.models.drafts.byPr(PR_ID).map((d) => d.id)).toEqual(['d1']);
-    expect(store.ui.modal).toBeNull();
+    expect(store.ui.modal).not.toBeNull();
+    expect(store.ui.route).toEqual({ name: 'review', pr: PR_ID });
+    expect(document.querySelector('textarea')?.value).toBe('my verdict');
+    expect(btn('Submit')?.hasAttribute('disabled')).toBe(false);
   });
 
-  it('shows Sending… while pending (pending state)', async () => {
+  it('shows Sending… and stays open until the host answers', async () => {
     let release!: () => void;
     transport.onCall(
       'submit_review',
@@ -189,11 +194,12 @@ describe('Submit review modal', () => {
     );
     await open();
     await click(btn('Submit'));
-    // The modal closes at once, so the in-flight state is not on screen.
     expect(submits()).toHaveLength(1);
-    expect(store.ui.modal).toBeNull();
-    expect(btn('Sending…')).toBeUndefined();
+    expect(store.ui.modal).not.toBeNull();
+    expect(btn('Sending…')?.hasAttribute('disabled')).toBe(true);
     release();
     await settle();
+    expect(store.ui.modal).toBeNull();
+    expect(store.ui.route.name).not.toBe('review');
   });
 });

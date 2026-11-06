@@ -155,13 +155,17 @@ const SubmitReviewModal = observer(function SubmitReviewModal() {
           isDisabled={sending}
           onPress={() => {
             setSending(true);
+            // Close only once the host accepted it: on a failure the modal
+            // stays open (the toast comes from api.ts) so the overall
+            // comment and verdict aren't lost.
             void submitReview(store, pr, local ? 'COMMENT' : event, body.trim())
-              .catch(() => {
-                // toasted by api.ts
+              .then(() => {
+                ui.closeModal();
+                ui.goBack();
               })
-              .finally(() => setSending(false));
-            ui.closeModal();
-            ui.goBack();
+              .catch(() => {
+                setSending(false);
+              });
           }}
         >
           {sending ? 'Sending…' : local ? 'Done' : 'Submit'}
