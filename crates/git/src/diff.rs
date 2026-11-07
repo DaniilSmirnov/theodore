@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use theodore_domain::{FileFlag, Revision, Sha};
-use theodore_ports::{DiffOptions, GitError, GitResult};
+use theodore_ports::{DiffOptions, GitError, GitPort, GitResult};
 
 use crate::GitCli;
 use crate::generated::GitAttributes;
@@ -34,15 +34,30 @@ impl GitCli {
         numstat_args.push("--numstat");
         numstat_args.push("-z");
         numstat_args.push(&range);
-        let numstat_bytes = GitProc {
+        let numstat_bytes = match (GitProc {
             cwd: repo,
             askpass: &askpass,
             args: &numstat_args,
             token: None,
             stdin: None,
-        }
+        })
         .run()
-        .await?;
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(e @ GitError::Command { .. }) => {
+                // A stale sha (a last-seen head force-pushed away) is "commit
+                // not found", which callers fall back from; anything else
+                // stays git's own failure.
+                for sha in [base, head] {
+                    if !self.has_commit(repo, sha).await.unwrap_or(true) {
+                        return Err(GitError::MissingCommit(sha.as_str().to_string()));
+                    }
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         let numstat = parse::parse_numstat(&numstat_bytes);
 
         let mut full_args = common;
@@ -79,6 +94,42 @@ impl GitCli {
             head: head.clone(),
             files,
         })
+    }
+
+    pub(crate) async fn numstat_op(
+        &self,
+        repo: &Path,
+        from: &Sha,
+        to: &Sha,
+    ) -> GitResult<Vec<theodore_ports::FileStat>> {
+        let askpass = self.ensure_askpass()?;
+        let args = [
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--find-renames",
+            "--numstat",
+            "-z",
+            from.as_str(),
+            to.as_str(),
+        ];
+        let bytes = GitProc {
+            cwd: repo,
+            askpass: &askpass,
+            args: &args,
+            token: None,
+            stdin: None,
+        }
+        .run()
+        .await?;
+        Ok(parse::parse_numstat(&bytes)
+            .into_iter()
+            .map(|n| theodore_ports::FileStat {
+                path: n.path,
+                additions: n.additions.unwrap_or(0),
+                deletions: n.deletions.unwrap_or(0),
+            })
+            .collect())
     }
 
     pub(crate) async fn show_op(

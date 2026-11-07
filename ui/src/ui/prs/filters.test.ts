@@ -176,3 +176,34 @@ describe('isPrFilter', () => {
     expect(isPrFilter(null)).toBe(false);
   });
 });
+
+describe('the Pull requests number', () => {
+  it('leaves out a branch or space review stored under a host repo', () => {
+    // A review of a GitHub project's branch keeps its host in the id, with
+    // the branch's hash as its number and a commit's email as its author.
+    const review = pr({
+      id: 'github:acme/web#2681023619',
+      url: '',
+      author: { login: 'me@example.com', name: null, avatar_url: null },
+      pr: { repo: web, number: 2681023619, host_id: 'feature' },
+    });
+    expect(openPrCount([review])).toBe(0);
+    expect(filterCount([review], 'all', 'me')).toBe(0);
+  });
+
+  it('counts drafts and other people\'s PRs, as the list under it shows them', () => {
+    const rows = [
+      pr({ id: 'mine', author: me }),
+      pr({ id: 'theirs', author: them }),
+      pr({ id: 'draft', state: 'draft', author: them }),
+      pr({ id: 'merged', state: 'merged' }),
+      pr({ id: 'closed', state: 'closed' }),
+      branchReview('review'),
+    ];
+    const listed = prGroups(rows, 'all', 'me')
+      .filter((g) => g.id !== 'branches')
+      .flatMap((g) => g.items);
+    expect(openPrCount(rows)).toBe(3);
+    expect(listed.map((p) => p.id).sort()).toEqual(['draft', 'mine', 'theirs']);
+  });
+});

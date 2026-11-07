@@ -127,6 +127,14 @@ export function newOpId(): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+/** The host can't do this at all (no issues on it, say): said in place,
+ *  not toasted. */
+export const HOST_UNSUPPORTED = 'host.unsupported';
+
+/** A commit asked for isn't in the repo (a stale last-seen sha, a head
+ *  force-pushed away): the caller forgets it, no toast. */
+export const COMMIT_NOT_FOUND = 'commit_not_found';
+
 /** A command rejected; carries the core's error code, not just a message. */
 export class CommandFailure extends Error {
   readonly code: string;
@@ -164,8 +172,9 @@ export function setAccountRequiredHandler(fn: () => void): void {
 async function call<T>(
   cmd: string,
   args?: Record<string, unknown>,
-  /** The caller shows the failure itself (the sign-in dialog): no toast. */
-  quiet = false,
+  /** The caller shows the failure itself (the sign-in dialog): no toast.
+   *  A function: only the failures it picks are the caller's to show. */
+  quiet: boolean | ((f: CommandFailure) => boolean) = false,
 ): Promise<T> {
   const opId = newOpId();
   try {
@@ -174,7 +183,8 @@ async function call<T>(
     if (e && typeof e === 'object' && 'code' in e && 'message' in e) {
       const failure = new CommandFailure(e as CommandError, opId);
       if (failure.code === ACCOUNT_REQUIRED) onAccountRequired?.();
-      else if (!quiet) onFailure?.(failure);
+      else if (!(typeof quiet === 'function' ? quiet(failure) : quiet))
+        onFailure?.(failure);
       throw failure;
     }
     throw e;
@@ -201,8 +211,9 @@ export const api = {
   catchUp: (since: number) => call<SyncFrame>('catch_up', { since }),
   transact: (tx: Transaction) => call<TransactionResult>('transact', { tx }),
   openPr: (req: OpenPrRequest) => call<OpenPrResponse>('open_pr', { req }),
-  getRevision: (req: RevisionRequest) =>
-    call<Revision>('get_revision', { req }),
+  /** `quiet`: the caller handles a failure itself (a baseline that's gone). */
+  getRevision: (req: RevisionRequest, quiet = false) =>
+    call<Revision>('get_revision', { req }, quiet),
   getFile: (req: FileRequest) => call<string | null>('get_file', { req }),
   regroup: (pr: PrId) => call<null>('regroup', { pr }),
   runSkill: (req: RunSkillRequest) => call<string>('run_skill', { req }),
@@ -271,8 +282,14 @@ export const api = {
     call<SkillBody>('get_skill', { id, pr }),
   saveSkill: (req: SaveSkillRequest) => call<SkillInfo>('save_skill', { req }),
   pickFolder: () => call<string | null>('pick_folder'),
+  /** A last-seen sha that's gone (`commit_not_found`) isn't toasted: the
+   *  review forgets it and compares with nothing. */
   interdiff: (req: InterdiffRequest) =>
-    call<InterdiffEntry[]>('interdiff', { req }),
+    call<InterdiffEntry[]>(
+      'interdiff',
+      { req },
+      (f) => f.code === COMMIT_NOT_FOUND,
+    ),
   loginStart: () => call<DeviceLogin>('login_start'),
   loginPoll: () => call<LoginState>('login_poll'),
   rerunCheck: (req: RerunCheckRequest) => call<null>('rerun_check', { req }),
@@ -292,11 +309,14 @@ export const api = {
   sandboxFireEvent: (id: string) =>
     call<SandboxStatus>('sandbox_fire_event', { id }),
   // ── spaces (docs/spaces.md; hidden behind build mode) ──
+  /** A host without issues turns "start from #12" away with
+   *  `host.unsupported`: New space says that in the issue field. */
   createSpace: (req: CreateSpaceRequest) =>
-    call<Space>('create_space', { req }),
-  /** New space's "From an issue" picker. */
-  projectIssues: (req: ProjectIssuesRequest) =>
-    call<SpaceIssue[]>('project_issues', { req }),
+    call<Space>('create_space', { req }, (f) => f.code === HOST_UNSUPPORTED),
+  /** New space's "From an issue" picker. `quiet`: the picker says what
+   *  failed itself (a host without issues). */
+  projectIssues: (req: ProjectIssuesRequest, quiet = false) =>
+    call<SpaceIssue[]>('project_issues', { req }, quiet),
   listSpaces: (project: string | null) =>
     call<Space[]>('list_spaces', { project }),
   spaceSend: (req: SpaceSendRequest) => call<string>('space_send', { req }),
@@ -318,6 +338,9 @@ export const api = {
     call<MergeSpaceResult>('merge_space', { req }),
   /** Continue after merge: a new branch on the base's fresh tip (§7). */
   continueSpace: (space: string) => call<Space>('continue_space', { space }),
+  /** The space page's poll of its PR's checks: quiet, it's passive. */
+  refreshSpacePr: (space: string) =>
+    call<null>('refresh_space_pr', { space }, true),
   /** "Back to here": later turns undone (docs/spaces.md §3). */
   rewindSpace: (req: RewindSpaceRequest) =>
     call<Space>('rewind_space', { req }),
@@ -395,7 +418,7 @@ export const api = {
   /** A project's merged config, read-only (Settings → Labs). */
   projectConfig: (project: string) =>
     call<EffectiveConfig>('project_config', { project }),
-  /** Settings → Projects → Config: each layer's file and YAML generated
+  /** Project settings → Config: each layer's file and YAML generated
    *  from the project's settings. */
   configDraft: (project: string) =>
     call<ConfigDraft>('config_draft', { project }),

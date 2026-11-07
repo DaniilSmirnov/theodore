@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use theodore_code_intel::{CodeIntel, CodeIntelOptions, GrammarSource};
 use theodore_code_intel_lsp::SessionOptions;
-use theodore_code_intel_toolchain::{LoadedGrammar, Manifest, Toolchain};
+use theodore_code_intel_toolchain::{JavaLookup, LoadedGrammar, Manifest, Toolchain};
 use theodore_ports::code_intel::{
     CodeIntelError, CodeIntelPort, CodeIntelResult, InstallState, LanguageId, LanguageStatus,
     LspPolicy, ServerState, TrustMode, Workspace,
@@ -133,6 +133,7 @@ pub fn workspace(root: &Path, trust: TrustMode) -> Workspace {
         languages: vec![],
         focus_paths: vec![],
         lsp: None,
+        servers: Default::default(),
     }
 }
 
@@ -168,6 +169,7 @@ impl Env {
     pub fn facade(&self, grammars: Arc<StaticGrammars>) -> CodeIntel {
         let tc = Toolchain::builder(&self.data)
             .search_path(self.bin.clone().into_os_string())
+            .java_lookup(JavaLookup::none())
             .build();
         CodeIntel::builder(self.options(LspPolicy::default()))
             .toolchain(tc)
@@ -180,17 +182,7 @@ impl Env {
     /// Rust served by `fake-lsp`, found on this env's `$PATH`. Every start
     /// appends the server's cwd (the worktree) to [`Self::launch_log`].
     pub fn fake_lsp_facade(&self, lsp: LspPolicy) -> CodeIntel {
-        let real = env!("CARGO_BIN_EXE_code-intel-fake-lsp");
-        let script = self.bin.join("fake-lsp");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\necho \"$PWD\" >> '{}'\nexec '{real}' \"$@\"\n",
-                self.launch_log().display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        self.fake_server("fake-lsp");
         let yaml = r#"
 servers:
   - name: fake-lsp
@@ -205,12 +197,44 @@ languages:
   - id: go
     globs: ["*.go"]
 "#;
-        let manifest = Manifest::parse(yaml, r#"{"schema":1,"grammars":[]}"#)
-            .unwrap()
-            .0;
+        self.facade_with(yaml, lsp)
+    }
+
+    /// A `fake-lsp` on this env's `$PATH` under `name`. Every start appends
+    /// `<cwd> <$JAVA_HOME>` to [`Self::launch_log`], trimmed when unset.
+    pub fn fake_server(&self, name: &str) {
+        let real = env!("CARGO_BIN_EXE_code-intel-fake-lsp");
+        self.script(
+            name,
+            &format!(
+                "echo \"$PWD\" >> '{}'\necho \"$JAVA_HOME\" > '{}'\nexec '{real}' \"$@\"",
+                self.launch_log().display(),
+                self.java_home_log().display(),
+            ),
+        );
+    }
+
+    /// An executable on this env's `$PATH`.
+    pub fn script(&self, name: &str, body: &str) {
+        let script = self.bin.join(name);
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// What the last start of a fake server had as `$JAVA_HOME`.
+    pub fn java_home_log(&self) -> PathBuf {
+        self.tmp.path().join("java-home.log")
+    }
+
+    /// The facade over a manifest of `yaml`, servers found on this env's
+    /// `$PATH`, and no Java but what is on it.
+    pub fn facade_with(&self, yaml: &str, lsp: LspPolicy) -> CodeIntel {
+        let (manifest, warnings) = Manifest::parse(yaml, r#"{"schema":1,"grammars":[]}"#).unwrap();
+        assert_eq!(warnings, Vec::<String>::new());
         let tc = Toolchain::builder(&self.data)
             .manifest(manifest)
             .search_path(self.bin.clone().into_os_string())
+            .java_lookup(JavaLookup::none())
             .build();
         CodeIntel::builder(self.options(lsp))
             .toolchain(tc)

@@ -116,18 +116,18 @@ describe('nextEffort', () => {
 });
 
 describe('AgentMenu', () => {
-  let picked: AgentId[] = [];
+  let picked: AgentId | null = null;
 
   beforeEach(() => {
     resetAgentModels();
-    picked = [];
+    picked = null;
     const transport = new FakeTransport();
     setTransport(transport);
     transport.onCall('transact', () => ({ status: 'ok', last_sync_id: 1 }));
     transport.onCall('agent_models', (a) => CATALOG[String(a?.agent)] ?? []);
   });
 
-  async function render(store: RootStore, selected: AgentId[]) {
+  async function render(store: RootStore, selected: AgentId) {
     m = await mount(
       <RootStoreProvider store={store}>
         <div>
@@ -136,7 +136,6 @@ describe('AgentMenu', () => {
             agents={['claude', 'codex']}
             selected={selected}
             onSelect={(next) => (picked = next)}
-            multiple
           />
         </div>
       </RootStoreProvider>,
@@ -155,14 +154,18 @@ describe('AgentMenu', () => {
     const store = new RootStore();
     setAgentModel(store, 'claude', 'claude-fable-5-1');
     setAgentEffort(store, 'claude', 'max');
-    const chip = await render(store, ['claude']);
+    const chip = await render(store, 'claude');
     expect(chip.textContent).toBe('Fable 5.1 Max');
+    // A running turn's Stop / Queue / Send now squeeze it, never to a bare
+    // chevron: it keeps room for a short name (layout itself is CSS).
+    expect(chip.className).toContain('min-w-[6.5rem]');
+    expect(chip.parentElement!.className).toContain('min-w-[6.5rem]');
   });
 
   it("never shows a default: an unset agent runs, and keeps, its first model and that model's effort", async () => {
     const store = new RootStore();
-    const chip = await render(store, ['claude', 'codex']);
-    expect(chip.textContent).toBe('Opus 5.5 Medium + Codex');
+    const chip = await render(store, 'claude');
+    expect(chip.textContent).toBe('Opus 5.5 Medium');
     expect(agentModel(store, 'claude')).toBe('claude-opus-5-5');
     expect(agentEffort(store, 'claude')).toBe('medium');
     expect(agentModel(store, 'codex')).toBe('gpt-6-sol');
@@ -171,7 +174,7 @@ describe('AgentMenu', () => {
 
   it('a row per agent with what it runs; a row switches to that agent', async () => {
     const store = new RootStore();
-    const chip = await render(store, ['claude']);
+    const chip = await render(store, 'claude');
     await click(chip);
     await settle();
     expect(item('Opus 5.5')?.textContent).toContain('Medium');
@@ -179,12 +182,12 @@ describe('AgentMenu', () => {
     expect(document.body.textContent).not.toContain('Default');
     await click(item('GPT-6-Sol')!);
     await settle();
-    expect(picked).toEqual(['codex']);
+    expect(picked).toBe('codex');
   });
 
   it("Models lists every CLI's models, earlier versions one level down", async () => {
     const store = new RootStore();
-    const chip = await render(store, ['claude']);
+    const chip = await render(store, 'claude');
     await click(chip);
     await settle();
     await click(item('Models')!);
@@ -209,7 +212,7 @@ describe('AgentMenu', () => {
 
   it("picking another CLI's model switches to that agent", async () => {
     const store = new RootStore();
-    const chip = await render(store, ['claude']);
+    const chip = await render(store, 'claude');
     await click(chip);
     await settle();
     await click(item('Models')!);
@@ -217,13 +220,13 @@ describe('AgentMenu', () => {
     await click(item('GPT-6-Luna')!);
     await settle();
     expect(agentModel(store, 'codex')).toBe('gpt-6-luna');
-    expect(picked).toEqual(['codex']);
+    expect(picked).toBe('codex');
   });
 
   it("Effort offers the current model's own levels", async () => {
     const store = new RootStore();
     setAgentModel(store, 'codex', 'gpt-6-sol');
-    const chip = await render(store, ['codex']);
+    const chip = await render(store, 'codex');
     await click(chip);
     await settle();
     await click(item('Effort')!);
@@ -242,7 +245,7 @@ describe('AgentMenu', () => {
       <RootStoreProvider store={store}>
         <AgentMenu
           agents={['claude']}
-          selected={['claude']}
+          selected="claude"
           onSelect={() => {}}
           ultracode
         />
@@ -259,7 +262,7 @@ describe('AgentMenu', () => {
     expect(agentEffort(store, 'claude')).toBe('ultracode');
     m.unmount();
     // Outside a space: not offered, but not reset either.
-    const chip = await render(store, ['claude']);
+    const chip = await render(store, 'claude');
     expect(chip.textContent).toBe('Opus 5.5 Ultracode');
     await click(chip);
     await settle();
@@ -273,7 +276,7 @@ describe('AgentMenu', () => {
     const store = new RootStore();
     setAgentModel(store, 'claude', 'claude-opus-5-5');
     setAgentEffort(store, 'claude', 'high');
-    await render(store, ['claude']);
+    await render(store, 'claude');
     const box = m!.host.querySelector('textarea')!;
     const press = () =>
       window.dispatchEvent(

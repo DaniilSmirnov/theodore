@@ -63,6 +63,16 @@ pub struct LaunchConfig {
     /// The languages it serves: manifest id, LSP `languageId`
     /// (`"typescriptreact"`) and the file extensions, without the dot.
     pub language_ids: Vec<(LanguageId, String, Vec<String>)>,
+    /// How long this server may take to start: replaces both
+    /// [`SessionOptions::init_timeout`] and
+    /// [`SessionOptions::ready_max_wait`]. A JVM importing a build takes
+    /// minutes.
+    #[serde(default)]
+    pub start_timeout_secs: Option<u64>,
+    /// Replaces [`SessionOptions::ready_settle`], for a server that takes a
+    /// while to announce its work.
+    #[serde(default)]
+    pub ready_settle_secs: Option<u64>,
 }
 
 impl LaunchConfig {

@@ -50,20 +50,24 @@ export const SendAllToAgentFooter = observer(function SendAllToAgentFooter({
   const openFindings = store.models.findings
     .byPr(pr)
     .filter((f) => f.state === 'open' || f.state === 'maybe_fixed');
-  const drafts = unsent<Draft>('draft', store.models.drafts.byPr(pr), isSent);
+  const allDrafts = store.models.drafts.byPr(pr);
+  const drafts = unsent<Draft>('draft', allDrafts, isSent);
   const findings = unsent<Finding>('finding', openFindings, isSent);
   // Unresolved threads count only once the space has a real PR: its own
   // branch review (drafting) has none of its own.
-  const threads =
+  const openThreads =
     space.pr === pr
-      ? unsent<Thread>(
-          'thread',
-          (store.models.prDetails.get(pr)?.threads ?? []).filter(
-            (t) => !t.resolved,
-          ),
-          isSent,
+      ? (store.models.prDetails.get(pr)?.threads ?? []).filter(
+          (t) => !t.resolved,
         )
       : [];
+  const threads = unsent<Thread>('thread', openThreads, isSent);
+  // Sent already, by this footer or an item's own "Send to agent".
+  const sentCount =
+    allDrafts.length -
+    drafts.length +
+    (openFindings.length - findings.length) +
+    (openThreads.length - threads.length);
   const items: SpaceFeedback[] = [
     ...drafts.map((d): SpaceFeedback => ({ kind: 'draft', id: d.id })),
     ...findings.map((f): SpaceFeedback => ({ kind: 'finding', id: f.id })),
@@ -77,7 +81,7 @@ export const SendAllToAgentFooter = observer(function SendAllToAgentFooter({
     return turn != null && sentTurnDone(space, turn);
   });
 
-  if (!items.length && !addressed.length) return null;
+  if (!items.length && !addressed.length && !sentCount) return null;
   const running = space.status === 'running';
 
   const send = async () => {
@@ -103,12 +107,15 @@ export const SendAllToAgentFooter = observer(function SendAllToAgentFooter({
     drafts.length ? plural(drafts.length, 'draft') : null,
     findings.length ? plural(findings.length, 'finding') : null,
     threads.length ? plural(threads.length, 'thread') : null,
+    sentCount ? `${sentCount} sent` : null,
   ].filter((p): p is string => p != null);
 
   return (
     <div className="send-all-to-agent flex min-h-10 items-center justify-between gap-3 border-t border-separator px-4 py-2 text-sm">
       <span className="min-w-0 truncate text-muted">
-        {parts.length ? parts.join(' · ') : 'Nothing new to send'}
+        {[items.length ? null : 'Nothing new to send', ...parts]
+          .filter(Boolean)
+          .join(' · ')}
       </span>
       <div className="flex shrink-0 items-center gap-2">
         {addressed.length > 0 && (

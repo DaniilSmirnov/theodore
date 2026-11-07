@@ -16,7 +16,6 @@ import { Alert, Button, Chip, Dropdown, Tabs, Tooltip } from '@heroui/react';
 import { observer } from 'mobx-react-lite';
 import type {
   ConflictFile,
-  MergeInfo,
   MergeMethod,
   PrId,
   PrSummary,
@@ -32,11 +31,14 @@ import {
   MergeDialog,
   STATE_LABEL,
 } from '../Merge';
+import { useMergeInfo } from '../mergeInfo';
 import { Threads } from '../SidePanel';
 import {
   autoArchiveDays,
   canContinue,
   defaultMergeMethod,
+  mergeLine,
+  prPollMs,
   prTint,
   spaceMerge,
   type PrTint,
@@ -65,25 +67,6 @@ export function PrGlyph({ pr }: { pr: PrSummary | undefined }) {
   );
 }
 
-/** `merge_info` of an open PR, asked again whenever `version` changes
- *  (the PR row's head and update time); the last answer stays meanwhile.
- *  Quiet: the caller says what's unknown. */
-function useMergeInfo(pr: PrId | null, version: string): MergeInfo | null {
-  const [got, setGot] = useState<{ pr: PrId; info: MergeInfo } | null>(null);
-  useEffect(() => {
-    if (!pr) return;
-    let live = true;
-    void api
-      .mergeInfo(pr, true)
-      .then((info) => live && setGot({ pr, info }))
-      .catch(() => {});
-    return () => {
-      live = false;
-    };
-  }, [pr, version]);
-  return got && got.pr === pr ? got.info : null;
-}
-
 /** The conflicting files of `pr` at `head` (`conflicts`, computed
  *  locally), when the host says it conflicts; `null` until known. */
 function useConflicts(
@@ -107,26 +90,49 @@ function useConflicts(
   return on && got?.key === key ? got.files : null;
 }
 
+/** Asks for the space's PR now and every `ms` while the page is open
+ *  (`refresh_space_pr`: a conditional fetch, so an unchanged PR costs a
+ *  304). The PR's review tab isn't needed for its checks to move. */
+function usePrPoll(space: string, ms: number | null) {
+  useEffect(() => {
+    if (ms == null) return;
+    const ask = () => void api.refreshSpacePr(space).catch(() => {});
+    ask();
+    const timer = window.setInterval(ask, ms);
+    return () => window.clearInterval(timer);
+  }, [space, ms]);
+}
+
 const isOpen = (s: PrSummary | undefined) =>
   s?.state === 'open' || s?.state === 'draft';
 
 /** The right pane once the space has a PR: its diff, the PR's threads
  *  (Reply · Resolve · Send to agent) and its checks. */
 export const SpacePrPane = observer(function SpacePrPane({
+  space,
   pr,
   changes,
+  showChanges,
 }: {
+  /** The space whose PR it is: polled while this pane is open. */
+  space: string;
   pr: PrId;
   /** The Changes tab: the space's live diff. */
   changes: ReactNode;
+  /** Set when something asks for that tab, from the chat. */
+  showChanges?: object;
 }) {
   const store = useRootStore();
   const [tab, setTab] = useState<Tab>('changes');
+  useEffect(() => {
+    if (showChanges) setTab('changes');
+  }, [showChanges]);
   // Threads and checks live on the PR's detail row.
   useEffect(() => {
     void store.sync.openPr(pr).catch(() => {});
   }, [store, pr]);
   const summary = store.models.prSummaries.get(pr);
+  usePrPoll(space, prPollMs(summary));
   const threads = store.models.prDetails.get(pr)?.threads ?? [];
   const unresolved = threads.filter((t) => !t.resolved).length;
   return (
@@ -136,13 +142,13 @@ export const SpacePrPane = observer(function SpacePrPane({
       onSelectionChange={(k) => setTab(k as Tab)}
       className="space-pr-tabs flex min-h-0 flex-1 flex-col [&>[role=tabpanel]]:border-t [&>[role=tabpanel]]:border-separator"
     >
-      <Tabs.ListContainer className="mx-5 my-2">
+      <Tabs.ListContainer className="mx-3 my-2">
         <Tabs.List aria-label="Space pane" className="w-fit">
-          <Tabs.Tab id="changes">
+          <Tabs.Tab id="changes" className="px-2.5">
             Changes
             <Tabs.Indicator />
           </Tabs.Tab>
-          <Tabs.Tab id="threads">
+          <Tabs.Tab id="threads" className="px-2.5">
             Threads
             {unresolved > 0 && (
               <Chip size="sm" variant="soft" color="warning" className="ml-1">
@@ -151,7 +157,7 @@ export const SpacePrPane = observer(function SpacePrPane({
             )}
             <Tabs.Indicator />
           </Tabs.Tab>
-          <Tabs.Tab id="checks" className="gap-1.5">
+          <Tabs.Tab id="checks" className="gap-1.5 px-2.5">
             <span className="grid size-3.5 place-items-center [&>svg]:size-3.5">
               <PrGlyph pr={summary} />
             </span>
@@ -231,10 +237,11 @@ const SpaceChecks = observer(function SpaceChecks({ pr }: { pr: PrId }) {
     open && !!summary?.conflicts,
   );
   const [updating, setUpdating] = useState(false);
+  const line = summary ? mergeLine(summary, info, STATE_LABEL) : null;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-auto">
-      {summary && (
+      {summary && line && (
         <section className="space-pr-status flex flex-col gap-2 border-b border-separator px-6 py-4 text-sm">
           <StatusRow
             ok={
@@ -249,23 +256,8 @@ const SpaceChecks = observer(function SpaceChecks({ pr }: { pr: PrId }) {
             <span className="shrink-0">{reviewLabel(summary)}</span>
             {detail && <ReviewerStrip reviewers={detail.reviewers} />}
           </StatusRow>
-          <StatusRow
-            ok={
-              !open
-                ? summary.state === 'merged'
-                : info
-                  ? info.state === 'clean'
-                  : null
-            }
-            label="Merge"
-          >
-            {!open
-              ? summary.state === 'merged'
-                ? 'Merged'
-                : 'Closed without merging'
-              : info
-                ? `${STATE_LABEL[info.state]}${info.auto_merge_enabled ? ' · auto-merge on' : ''}${info.in_queue ? ' · in the merge queue' : ''}`
-                : 'Checking…'}
+          <StatusRow ok={line.ok} label="Merge">
+            {line.text}
           </StatusRow>
           {open && summary.conflicts && (
             <StatusRow ok={false} label="Conflicts">
@@ -329,10 +321,7 @@ export const SpaceMergeButton = observer(function SpaceMergeButton({
   const [dialog, setDialog] = useState(false);
   if (!pr || !summary || !open) return null;
 
-  const action =
-    summary.state === 'draft'
-      ? { kind: 'none' as const, reason: 'A draft: mark it ready first' }
-      : spaceMerge(info, space);
+  const action = spaceMerge(info, space, summary);
   const method = info ? defaultMergeMethod(info) : 'squash';
   const methods: MergeMethod[] = info?.allowed_methods.length
     ? info.allowed_methods
@@ -433,8 +422,11 @@ export const MergedBanner = observer(function MergedBanner({
   const days = autoArchiveDays(store.models.settings.all());
   const number = summary ? `#${summary.pr.number}` : 'The PR';
   return (
-    <Alert status="success" className="space-merged m-3 items-center">
-      <Alert.Content>
+    <Alert
+      status="success"
+      className="space-merged m-3 w-auto shrink-0 items-center"
+    >
+      <Alert.Content className="min-w-0">
         <Alert.Description>
           {number} merged into {space.base}. Continue here on a new branch from
           the updated {space.base}; the chat and turns stay.

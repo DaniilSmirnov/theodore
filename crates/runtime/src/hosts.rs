@@ -10,7 +10,7 @@ use theodore_domain::{
 };
 use theodore_ports::{
     Capabilities, Changes, Fetched, HostAdapter, HostError, HostResult, InboxSection, MergeMethod,
-    MergeStatus, NewPr, ReviewSubmission, SubmittedReview,
+    MergeStatus, NewPr, ReviewSubmission, Searched, SubmittedReview, TrackedIssue,
 };
 
 pub struct Hosts {
@@ -55,6 +55,15 @@ impl Hosts {
                 .as_ref()
                 .ok_or(HostError::Unsupported("bitbucket")),
             _ => Ok(&self.primary),
+        }
+    }
+
+    /// `for_repo`, except a local folder's issues are the local adapter's
+    /// (none), never a GitHub lookup of its made-up owner/name.
+    fn for_issues(&self, repo: &RepoRef) -> HostResult<&Arc<dyn HostAdapter>> {
+        match repo.host {
+            HostKind::Local => Ok(&self.local),
+            _ => self.for_repo(repo),
         }
     }
 }
@@ -102,6 +111,16 @@ impl HostAdapter for Hosts {
     ) -> HostResult<Vec<PrSummary>> {
         self.for_repo(repo)?.search(section).await
     }
+    async fn search_checked(
+        &self,
+        repo: Option<&RepoRef>,
+        section: &InboxSection,
+    ) -> HostResult<Searched> {
+        match repo {
+            Some(repo) => self.for_repo(repo)?.search_checked(None, section).await,
+            None => self.primary.search_checked(None, section).await,
+        }
+    }
     async fn list_repos(&self) -> HostResult<Vec<HostRepo>> {
         self.primary.list_repos().await
     }
@@ -113,6 +132,12 @@ impl HostAdapter for Hosts {
     }
     async fn create_pr(&self, repo: &RepoRef, pr: &NewPr) -> HostResult<PrRef> {
         self.for_repo(repo)?.create_pr(repo, pr).await
+    }
+    async fn open_issues(&self, repo: &RepoRef) -> HostResult<Vec<TrackedIssue>> {
+        self.for_issues(repo)?.open_issues(repo).await
+    }
+    async fn get_issue(&self, repo: &RepoRef, number: u64) -> HostResult<TrackedIssue> {
+        self.for_issues(repo)?.get_issue(repo, number).await
     }
     async fn set_viewed(&self, pr: &PrRef, path: &str, viewed: bool) -> HostResult<()> {
         self.for_pr(pr)?.set_viewed(pr, path, viewed).await
@@ -129,6 +154,24 @@ impl HostAdapter for Hosts {
     }
     async fn reply(&self, pr: &PrRef, thread: &ThreadId, body: &str) -> HostResult<CommentId> {
         self.for_pr(pr)?.reply(pr, thread, body).await
+    }
+    async fn reply_with_marker(
+        &self,
+        pr: &PrRef,
+        thread: &ThreadId,
+        body: &str,
+        marker: &str,
+    ) -> HostResult<CommentId> {
+        self.for_pr(pr)?
+            .reply_with_marker(pr, thread, body, marker)
+            .await
+    }
+    async fn find_markers(
+        &self,
+        pr: &PrRef,
+        markers: &[String],
+    ) -> HostResult<std::collections::HashSet<String>> {
+        self.for_pr(pr)?.find_markers(pr, markers).await
     }
     async fn resolve(&self, pr: &PrRef, thread: &ThreadId, resolved: bool) -> HostResult<()> {
         self.for_pr(pr)?.resolve(pr, thread, resolved).await
@@ -286,6 +329,79 @@ mod tests {
         async fn delete_comment(&self, _pr: &PrRef, _comment: &CommentId) -> HostResult<()> {
             Err(HostError::Unsupported("delete_comment"))
         }
+        async fn open_issues(&self, _repo: &RepoRef) -> HostResult<Vec<TrackedIssue>> {
+            self.1.lock().unwrap().push("open_issues".into());
+            Ok(vec![])
+        }
+        async fn get_issue(&self, _repo: &RepoRef, number: u64) -> HostResult<TrackedIssue> {
+            self.1.lock().unwrap().push(format!("get_issue {number}"));
+            Ok(TrackedIssue {
+                number,
+                title: "t".into(),
+                body: String::new(),
+                url: String::new(),
+                closed: false,
+            })
+        }
+    }
+
+    /// The names of the `fn`s between `start` and the next line that is
+    /// only `}`.
+    fn fns_in(source: &str, start: &str) -> std::collections::BTreeSet<String> {
+        let from = source.find(start).expect("block present");
+        source[from..]
+            .lines()
+            .skip(1)
+            .take_while(|l| *l != "}")
+            .filter_map(|l| {
+                let l = l.trim_start();
+                let rest = l
+                    .strip_prefix("async fn ")
+                    .or_else(|| l.strip_prefix("fn "))?;
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                (!name.is_empty()).then_some(name)
+            })
+            .collect()
+    }
+
+    /// A trait method the router doesn't forward falls through to the
+    /// trait's default `Unsupported` for every host (how start-from-issue
+    /// broke): each must be forwarded here.
+    #[test]
+    fn the_router_forwards_every_host_adapter_method() {
+        let ports = include_str!("../../ports/src/host.rs");
+        let wanted = fns_in(ports, "pub trait HostAdapter: Send + Sync {");
+        assert!(wanted.contains("get_issue"), "{wanted:?}");
+        let have = fns_in(include_str!("hosts.rs"), "impl HostAdapter for Hosts {");
+        let missing: Vec<_> = wanted.difference(&have).collect();
+        assert!(missing.is_empty(), "Hosts doesn't forward {missing:?}");
+    }
+
+    #[tokio::test]
+    async fn issues_go_to_the_repos_own_host() {
+        let github = Arc::new(TaggedHost::new(HostKind::Github));
+        let gitlab = Arc::new(TaggedHost::new(HostKind::Gitlab));
+        let local = Arc::new(TaggedHost::new(HostKind::Local));
+        let hosts = Hosts::new(github.clone(), Some(gitlab.clone()), None, local.clone());
+
+        hosts
+            .open_issues(&repo(HostKind::Github, "a"))
+            .await
+            .unwrap();
+        hosts
+            .get_issue(&repo(HostKind::Gitlab, "b"), 12)
+            .await
+            .unwrap();
+        hosts
+            .open_issues(&repo(HostKind::Local, "c"))
+            .await
+            .unwrap();
+        assert_eq!(github.1.lock().unwrap().as_slice(), ["open_issues"]);
+        assert_eq!(gitlab.1.lock().unwrap().as_slice(), ["get_issue 12"]);
+        assert_eq!(local.1.lock().unwrap().as_slice(), ["open_issues"]);
     }
 
     fn repo(host: HostKind, name: &str) -> RepoRef {
@@ -294,6 +410,33 @@ mod tests {
             owner: "o".into(),
             name: name.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn search_checked_routes_by_repo_and_without_one_to_the_primary() {
+        let github = Arc::new(TaggedHost::new(HostKind::Github));
+        let gitlab = Arc::new(TaggedHost::new(HostKind::Gitlab));
+        let local = Arc::new(TaggedHost::new(HostKind::Local));
+        let hosts = Hosts::new(github.clone(), Some(gitlab.clone()), None, local);
+
+        let query = InboxSection::Query("q".into());
+        let found = hosts
+            .search_checked(Some(&repo(HostKind::Gitlab, "b")), &query)
+            .await
+            .unwrap();
+        assert_eq!(gitlab.1.lock().unwrap().len(), 1);
+        assert_eq!(github.1.lock().unwrap().len(), 0);
+        assert!(!found.complete, "a raw query isn't trusted by default");
+
+        hosts.search_checked(None, &query).await.unwrap();
+        assert_eq!(gitlab.1.lock().unwrap().len(), 1);
+        assert_eq!(github.1.lock().unwrap().len(), 1);
+
+        let found = hosts
+            .search_checked(None, &InboxSection::Authored)
+            .await
+            .unwrap();
+        assert!(found.complete, "an inbox section is read to its last page");
     }
 
     #[tokio::test]

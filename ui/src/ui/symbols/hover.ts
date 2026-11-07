@@ -7,12 +7,13 @@
  * pointer on an identifier ─▶ same one as before? ── yes ─▶ nothing
  *                                    └─ no ─▶ hide ─▶ wait HOVER_DELAY_MS (⌘: META_HOVER_DELAY_MS)
  *                                                    ─▶ cache[pr@head:path:line:col] ── hit ─▶ show
- *                                                                                   └─ miss ─▶ code_intel_hover ─▶ cache ─▶ show
+ *                                                                                   └─ miss ─▶ code_intel_hover ─▶ show
+ *                                                                                              └─ lsp answer ─▶ cache
  * pointer leaves / scroll / click / Esc ─▶ cancel, hide
  * ```
  */
 import type { CodeHover, CodeHoverRequest, PrId } from '../../gen/contract';
-import { identifierSpan } from './extract';
+import { identifierColAt } from './extract';
 
 export const HOVER_DELAY_MS = 500;
 export const META_HOVER_DELAY_MS = 80;
@@ -29,26 +30,26 @@ export interface HoverTarget {
   name: string;
 }
 
-/** The hover target at `offset` of a line's text: the column counts chars
- *  (code points), as the core does, not UTF-16 units. */
+/** The hover target at `offset` of a line's text (`identifierColAt`). */
 export function hoverTargetAt(
   text: string,
   offset: number,
   path: string,
   line: number,
 ): HoverTarget | null {
-  const span = identifierSpan(text, offset);
-  if (!span) return null;
-  const col = Array.from(text.slice(0, span.start)).length + 1;
-  return { path, line, col, name: span.name };
+  const at = identifierColAt(text, offset);
+  return at && { path, line, ...at };
 }
 
 export function hoverKey(pr: PrId, rev: string, t: HoverTarget): string {
   return `${pr}@${rev}:${t.path}:${t.line}:${t.col}`;
 }
 
-/** One answer per position: a request in flight is shared, an answer
- *  (`null` included) is kept, a failure is not. */
+/** One answer per position: a request in flight is shared, the language
+ *  server's answer is kept. No answer, a by-name one (`syntax`, `text`:
+ *  the server may still be warming) or a failure is not, so the next hover
+ *  asks again. The key holds the PR's head (`hoverKey`), so a new head
+ *  never reuses an old answer. */
 export class HoverCache {
   private readonly map = new Map<string, Promise<CodeHover | null>>();
 
@@ -71,10 +72,19 @@ export class HoverCache {
       this.map.set(key, hit);
       return hit;
     }
-    const p = this.fetch(req).catch(() => {
+    const forget = () => {
       if (this.map.get(key) === p) this.map.delete(key);
-      return null;
-    });
+    };
+    const p = this.fetch(req).then(
+      (hover) => {
+        if (hover?.source !== 'lsp') forget();
+        return hover;
+      },
+      () => {
+        forget();
+        return null;
+      },
+    );
     this.map.set(key, p);
     while (this.map.size > this.max) {
       this.map.delete(this.map.keys().next().value!);

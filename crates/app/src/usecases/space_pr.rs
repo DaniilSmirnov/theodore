@@ -44,6 +44,17 @@ const FILL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Files listed in the fill prompt's diff summary.
 const FILL_FILES: usize = 60;
 
+/// What the PR already has of the space's work: the last push, or for a
+/// branch or PR the space adopted, the tip it started on.
+fn pushed_head(space: &Space) -> Option<&Sha> {
+    space
+        .shipped
+        .as_ref()
+        .filter(|s| s.how == ShipKind::Pr)
+        .map(|s| &s.head)
+        .or(space.fork_sha.as_ref())
+}
+
 impl Core {
     /// The scheme of the PR footer's link back to the space: this build's
     /// (`theodore-staging`, …); `None` keeps `theodore`.
@@ -178,11 +189,7 @@ impl Core {
                 "the agent is still working; let the turn end and push it first".into(),
             ));
         }
-        if space
-            .shipped
-            .as_ref()
-            .is_some_and(|s| s.how == ShipKind::Pr && s.head != space.head_sha)
-        {
+        if pushed_head(&space).is_some_and(|pushed| pushed != &space.head_sha) {
             return Err(AppError::Invalid(
                 "some turns aren't pushed yet; push them first so the merge has them".into(),
             ));
@@ -207,6 +214,21 @@ impl Core {
             auto,
             queue,
         })
+    }
+
+    /// The space page's poll of its PR (docs/spaces.md "Space page — in
+    /// review"): one conditional fetch (ETag), applied when the host says it
+    /// changed, so checks show without the PR's review open. Nothing to do
+    /// without a PR.
+    pub async fn refresh_space_pr(&self, id: &str) -> AppResult<()> {
+        let space = self.space_row(id).await?;
+        let Some(pr) = space.pr else {
+            return Ok(());
+        };
+        if let Some(pr_ref) = self.pr_ref(&pr).await {
+            self.refresh_pr(&pr, &pr_ref).await;
+        }
+        Ok(())
     }
 
     /// Continue after merge (docs/spaces.md §7): the space moves to a new
@@ -270,11 +292,7 @@ impl Core {
             )
             .await?
             .sha;
-        let pushed = space
-            .shipped
-            .as_ref()
-            .filter(|s| s.how == ShipKind::Pr)
-            .map(|s| s.head.clone());
+        let pushed = pushed_head(&space).cloned();
         let start = match pushed {
             // Turns after the last push weren't merged: replayed onto the
             // new tip (three-way, no worktree).
@@ -313,6 +331,7 @@ impl Core {
             head: tip.clone(),
         };
         git.space_reset(&wt.path, &space.id, &to).await?;
+        self.spawn_space_code_changed(wt.path.clone(), head.clone(), start.clone());
 
         let branch = self.continued_branch(&space, &repo_path).await?;
         let now = self.0.deps.clock.now();
@@ -340,6 +359,8 @@ impl Core {
                 "worktree": wt.path.display().to_string(),
                 "pr": null,
                 "shipped": null,
+                // The new branch starts on the tip, not on the adopted one.
+                "fork_sha": null,
                 "done_at": null,
                 "status": SpaceStatus::Idle,
                 "error": null,

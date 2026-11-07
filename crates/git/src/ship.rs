@@ -27,6 +27,32 @@ fn proc<'a>(cwd: &'a Path, askpass: &'a Path, args: &'a [&'a str]) -> GitProc<'a
     }
 }
 
+/// `ancestor` is in `of`'s history.
+async fn is_ancestor(repo: &Path, askpass: &Path, ancestor: &Sha, of: &Sha) -> GitResult<bool> {
+    let out = proc(
+        repo,
+        askpass,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            END_OF_OPTIONS,
+            ancestor.as_str(),
+            of.as_str(),
+        ],
+    )
+    .run_raw()
+    .await?;
+    match out.status {
+        0 => Ok(true),
+        1 => Ok(false),
+        code => Err(GitError::Command {
+            args: "merge-base --is-ancestor".into(),
+            code,
+            stderr: stderr_of(&out),
+        }),
+    }
+}
+
 fn stderr_of(out: &RawOutput) -> String {
     String::from_utf8_lossy(&out.stderr).trim().to_string()
 }
@@ -53,6 +79,27 @@ fn check_space(id: &str) -> GitResult<()> {
 }
 
 /// The `Refused` text for a folder whose checkout can't take a merge.
+/// What a push refused for a missing `workflow` scope tells the user.
+pub(crate) const WORKFLOW_SCOPE_REFUSAL: &str = "GitHub needs the workflow permission to push \
+    changes under .github/workflows. Sign in to GitHub again in Theodore to grant it (with the \
+    gh CLI: gh auth refresh -s workflow), or push that file yourself.";
+
+/// A push the host turned away for a reason the user can act on, from git's
+/// stderr: the branch moved, or GitHub wants the `workflow` scope for a file
+/// under `.github/workflows/` ("refusing to allow an OAuth App to create or
+/// update workflow … without `workflow` scope").
+pub(crate) fn push_refusal(stderr: &str, branch: &str) -> Option<String> {
+    if stderr.contains("without `workflow` scope")
+        || (stderr.contains("refusing to allow") && stderr.contains("workflow"))
+    {
+        return Some(WORKFLOW_SCOPE_REFUSAL.to_string());
+    }
+    (stderr.contains("non-fast-forward")
+        || stderr.contains("fetch first")
+        || stderr.contains("[rejected]"))
+    .then(|| format!("{branch} changed on the host since the last push; nothing was overwritten"))
+}
+
 pub(crate) fn folder_refusal(state: &WorkingState) -> Option<String> {
     if state.current_branch.is_none() {
         return Some("the folder has a detached HEAD; check out a branch first".into());
@@ -195,33 +242,17 @@ impl GitCli {
             return Err(GitError::Parse("no tree for the shipped commit".into()));
         }
         // The base merged in since (Update from base) as a second parent,
-        // unless `parent`'s history already has it.
+        // unless `parent`'s history already has it. A head that never merged
+        // it (a branch adopted behind its base) must not claim it: the tree
+        // has none of the base's changes, so the host would show them as
+        // removed.
         let merge_parent = match &c.merge_parent {
-            Some(base) if base != &c.parent => {
-                let has = proc(
-                    repo,
-                    &askpass,
-                    &[
-                        "merge-base",
-                        "--is-ancestor",
-                        END_OF_OPTIONS,
-                        base.as_str(),
-                        c.parent.as_str(),
-                    ],
-                )
-                .run_raw()
-                .await?;
-                match has.status {
-                    0 => None,
-                    1 => Some(base.as_str()),
-                    code => {
-                        return Err(GitError::Command {
-                            args: "merge-base --is-ancestor".into(),
-                            code,
-                            stderr: stderr_of(&has),
-                        });
-                    }
-                }
+            Some(base)
+                if base != &c.parent
+                    && is_ancestor(repo, &askpass, base, &c.head).await?
+                    && !is_ancestor(repo, &askpass, base, &c.parent).await? =>
+            {
+                Some(base.as_str())
             }
             _ => None,
         };
@@ -333,15 +364,14 @@ impl GitCli {
         .run()
         .await;
         match out {
-            Err(GitError::Command { stderr, .. })
-                if stderr.contains("non-fast-forward")
-                    || stderr.contains("fetch first")
-                    || stderr.contains("[rejected]") =>
-            {
-                Err(GitError::Refused(format!(
-                    "{branch} changed on the host since the last push; nothing was overwritten"
-                )))
-            }
+            Err(GitError::Command { args, code, stderr }) => match push_refusal(&stderr, branch) {
+                Some(why) => {
+                    // The raw text stays in the log; the user gets the reason.
+                    tracing::info!(stderr = %stderr, branch, "push refused by the host");
+                    Err(GitError::Refused(why))
+                }
+                None => Err(GitError::Command { args, code, stderr }),
+            },
             other => other.map(|_| ()),
         }
     }
@@ -504,6 +534,24 @@ mod tests {
                 .unwrap()
                 .contains("2 uncommitted changes")
         );
+    }
+
+    #[test]
+    fn a_push_refused_for_the_workflow_scope_says_so() {
+        let stderr = "To https://github.com/o/r.git\n ! [remote rejected] abc -> ada/x \
+            (refusing to allow an OAuth App to create or update workflow \
+            `.github/workflows/ci.yml` without `workflow` scope)\n\
+            error: failed to push some refs to 'https://github.com/o/r.git'";
+        assert_eq!(
+            push_refusal(stderr, "ada/x").as_deref(),
+            Some(WORKFLOW_SCOPE_REFUSAL)
+        );
+        assert!(
+            push_refusal(" ! [rejected] abc -> ada/x (non-fast-forward)", "ada/x")
+                .unwrap()
+                .contains("changed on the host")
+        );
+        assert_eq!(push_refusal("fatal: unable to access", "ada/x"), None);
     }
 
     #[test]

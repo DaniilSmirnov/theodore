@@ -33,6 +33,38 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// Between two commits, not from their merge base; a binary file counts 0.
+#[tokio::test]
+async fn numstat_counts_lines_between_two_commits() {
+    let tmp = TempDir::new().unwrap();
+    let work = tmp.path();
+    git(work, &["init", "-q", "-b", "main"]);
+    git(work, &["config", "user.email", "a@b.com"]);
+    git(work, &["config", "user.name", "test"]);
+    std::fs::write(work.join("a.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(work.join("gone.txt"), "x\ny\n").unwrap();
+    git(work, &["add", "-A"]);
+    git(work, &["-c", "commit.gpgsign=false", "commit", "-qm", "1"]);
+    let before = theodore_domain::Sha::new(git(work, &["rev-parse", "HEAD"]));
+    std::fs::write(work.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+    std::fs::remove_file(work.join("gone.txt")).unwrap();
+    std::fs::write(work.join("pic.bin"), [0u8, 1, 2, 0]).unwrap();
+    git(work, &["add", "-A"]);
+    git(work, &["-c", "commit.gpgsign=false", "commit", "-qm", "2"]);
+    let after = theodore_domain::Sha::new(git(work, &["rev-parse", "HEAD"]));
+
+    let cli = GitCli::new(tmp.path().join("root"), Arc::new(NoAuth));
+    let stats = cli.numstat(work, &before, &after).await.unwrap();
+    let got: Vec<_> = stats
+        .iter()
+        .map(|s| (s.path.as_str(), s.additions, s.deletions))
+        .collect();
+    assert_eq!(
+        got,
+        [("a.txt", 2, 1), ("gone.txt", 0, 2), ("pic.bin", 0, 0)]
+    );
+}
+
 #[tokio::test]
 async fn a_snapshot_holds_uncommitted_edits_and_moves_nothing() {
     let tmp = TempDir::new().unwrap();

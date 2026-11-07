@@ -47,10 +47,7 @@ const MAX_NOTE: usize = 280;
 /// The error text without the "invalid request:" prefix: the agent passes
 /// it on to the user.
 fn refusal(e: AppError) -> SpaceToolError {
-    SpaceToolError::Unavailable(match e {
-        AppError::Invalid(m) => m,
-        other => other.to_string(),
-    })
+    SpaceToolError::Unavailable(e.user_message())
 }
 
 fn unavailable(m: impl Into<String>) -> SpaceToolError {
@@ -199,10 +196,15 @@ impl Core {
             .into_iter()
             .filter(|f| file.is_none_or(|p| f.path == p || f.old_path.as_deref() == Some(p)))
             .collect();
+        // A snapshot and a checkpoint of the same files are different commits.
+        let uncommitted = !git
+            .same_tree(&repo, &head, &row.head_sha)
+            .await
+            .map_err(|e| unavailable(e.to_string()))?;
         Ok(SpaceDiff {
             base: row.base.clone(),
             base_sha: row.base_sha.clone(),
-            uncommitted: head != row.head_sha,
+            uncommitted,
             head,
             files,
         })

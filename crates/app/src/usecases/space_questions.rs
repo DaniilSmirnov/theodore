@@ -198,14 +198,16 @@ impl Core {
     }
 
     async fn patch_question(&self, space: &str, q: Option<&SpaceQuestion>) -> AppResult<()> {
+        let now = self.0.deps.clock.now();
+        let mut data = serde_json::json!({ "question": q, "updated_at": now });
+        if q.is_some() {
+            data["attention_at"] = serde_json::json!(now);
+        }
         self.apply(vec![NewAction {
             model: models::SPACE.into(),
             model_id: space.to_string(),
             action: SyncActionCode::C,
-            data: Some(serde_json::json!({
-                "question": q,
-                "updated_at": self.0.deps.clock.now(),
-            })),
+            data: Some(data),
         }])
         .await?;
         Ok(())

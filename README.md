@@ -90,7 +90,9 @@ All screenshots: [docs/screenshots](docs/screenshots/README.md).
 - Add, browse and remove projects from any configured host, or a local folder.
 - The sidebar's switcher scopes the app to *All projects* or one project.
 - Each keeps its own tabs, filters and position, restored on switch.
-- ⌃0 / ⌃1…9 switch directly; drag projects in Settings → Projects to set the order.
+- A project's own settings — General (effective settings, remove), Languages, Config — open from the
+  switcher's *Project settings*; *Manage projects…* lists them all (add, drag to reorder, open one).
+- ⌃0 / ⌃1…9 switch directly; drag projects in the switcher's *Manage projects…* list to set the order.
 - A local review of a branch against its project's base: no hosted PR, no host actions, not in PR counts.
 
 ### The review screen
@@ -100,8 +102,9 @@ All screenshots: [docs/screenshots](docs/screenshots/README.md).
 - Groupings are versioned: one from an older algorithm is redone on open; ↻ regroups from scratch.
 - Interdiff: after a push only new or changed hunks are flagged, with a "what changed" view.
 - Markdown diffs get a rendered Preview; image diffs show side by side, swipe or onion skin.
-- ⌘-click an identifier for definitions and references across the worktree (`git grep` plus
-  per-language patterns, not a language server).
+- ⌘-click an identifier for definitions and references across the worktree: code intelligence
+  for that exact symbol when it is on, else `git grep` plus per-language patterns; the peek says
+  which answered.
 - The header is two rows: number, title, status and actions, then the Overview / Checks / Commits /
   Code tabs. Overview holds the full title, branches, reviewers and approvals, labels and the
   description.
@@ -224,7 +227,7 @@ local folder:  Merge locally  ·  Keep as branch
 - A review reads `review:` from the base branch, so a PR can't change how it is itself reviewed.
 - `spaces:` sets up a space: files to copy, free ports, env, and the `setup` / `run` / `check` /
   `archive` commands. Commands from a repo run only after you allow them.
-- Settings → Projects → ⟨project⟩ → Config creates the file from your current settings, checks it as
+- Project settings → Config (the switcher's menu, under a project) creates the file from your current settings, checks it as
   you type, and saves it to the repo (a PR for a host project), your local file or the global one.
 
 ### Updates

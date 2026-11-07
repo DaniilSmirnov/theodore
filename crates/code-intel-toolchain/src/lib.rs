@@ -8,8 +8,11 @@
 //!
 //! ensure_grammar(lang) ─▶ memory? ─▶ disk + sha ok? ─▶ download ─▶ dlopen ─▶ ABI ─▶ LoadedGrammar
 //!
-//! server_for(lang) ─▶ resolve_server: PATH · rustup · xcrun · node_modules (Trusted) · downloaded
-//!                  └─ none ─▶ (spec, Missing) ─▶ consent ─▶ install_server ─▶ launch_config
+//! server_for(lang) ─▶ each server: trusted_only and Review? ─▶ skip
+//!                    ─▶ requires: runs, and new enough? ── no ─▶ skip (remembered)
+//!                    ─▶ resolve_server: PATH · rustup · xcrun · node_modules (Trusted) · downloaded
+//!                  └─ none ─▶ first with a download: (spec, Missing) ─▶ consent ─▶ install_server ─▶ launch_config
+//!                  └─ no download ─▶ NeedsRuntime · TrustedOnly · Unavailable
 //! ```
 //!
 //! On disk, under `<data dir>/code-intel/`:
@@ -18,6 +21,7 @@
 //! grammars/<package>-<version>/   grammar.dylib, <language>.tags.scm
 //! servers/<name>/<version>/       the unpacked server
 //! servers/<name>/<version>.partial  an install in progress (renamed when done)
+//! server-data/<name>/<hash>/      a server's `{data}`: one per worktree and trust mode
 //! tmp/                            downloads in flight
 //! ```
 
@@ -25,6 +29,7 @@ mod detect;
 mod download;
 mod grammar;
 mod manifest;
+mod runtime;
 mod server;
 mod unpack;
 
@@ -42,13 +47,23 @@ pub use detect::git_ls_files;
 pub use download::{OnBytes, http_client};
 pub use grammar::{LoadedGrammar, check_abi, supported_abi};
 pub use manifest::{
-    ArchiveFormat, Artifact, BIN_PLACEHOLDER, GRAMMARS_SCHEMA, GrammarLanguage, GrammarSpec,
-    LanguageSpec, Manifest, ServerDownload, ServerSpec,
+    ArchiveFormat, Artifact, BIN_PLACEHOLDER, DATA_PLACEHOLDER, DIR_PLACEHOLDER, GRAMMARS_SCHEMA,
+    GrammarLanguage, GrammarSpec, LanguageSpec, Manifest, RUNTIME_PLACEHOLDER, ServerDownload,
+    ServerSpec,
 };
+pub use runtime::{JavaLookup, MinVersion, Runtime, RuntimeRequirement};
 pub use server::{LaunchConfig, PROBE_TIMEOUT, ResolvedServer, ServerOrigin, launch_config};
 
 use crate::download::{fetch_verified, io_err};
-use crate::server::ProbeEnv;
+use crate::runtime::RuntimeCheck;
+use crate::server::{LaunchVars, ProbeEnv};
+
+/// A `{data}` directory nothing launched from for this long goes the next
+/// time its server starts: worktrees come and go, their indexes should not
+/// pile up.
+const DATA_DIR_TTL: Duration = Duration::from_secs(14 * 24 * 3600);
+/// Touched at every launch, for [`DATA_DIR_TTL`].
+const DATA_DIR_MARK: &str = ".last-used";
 
 /// This machine's manifest platform key: `darwin-arm64`, `darwin-x64`,
 /// `linux-x64`, `linux-arm64`, `windows-x64`.
@@ -93,6 +108,7 @@ pub struct ToolchainBuilder {
     http: Option<reqwest::Client>,
     path: Option<OsString>,
     probe_timeout: Duration,
+    java: Option<JavaLookup>,
 }
 
 impl ToolchainBuilder {
@@ -127,6 +143,12 @@ impl ToolchainBuilder {
         self
     }
 
+    /// Where Java lives besides `PATH`. Default: [`JavaLookup::system`].
+    pub fn java_lookup(mut self, java: JavaLookup) -> Self {
+        self.java = Some(java);
+        self
+    }
+
     pub fn build(self) -> Toolchain {
         Toolchain {
             inner: Arc::new(Inner {
@@ -138,6 +160,7 @@ impl ToolchainBuilder {
                     path: self.path,
                     timeout: self.probe_timeout,
                     neutral_dir: std::env::temp_dir(),
+                    java: self.java.unwrap_or_else(JavaLookup::system),
                 },
                 grammars: Mutex::default(),
                 locks: Mutex::default(),
@@ -162,6 +185,7 @@ impl Toolchain {
             http: None,
             path: None,
             probe_timeout: PROBE_TIMEOUT,
+            java: None,
         }
     }
 
@@ -307,10 +331,18 @@ impl Toolchain {
 
     // ── servers ───────────────────────────────────────────────────────────
 
-    /// The server that would serve `language`, and its state: the first
-    /// (preferred, then manifest order) found on the machine or downloaded;
-    /// else the first with a download for this platform; else the first,
-    /// `Unavailable`. `None` when the manifest lists no server.
+    /// The server that would serve `language` in `worktree`, and its state:
+    ///
+    /// 1. the first (preferred, then manifest order) whose runtime is there
+    ///    and that is found on the machine or downloaded;
+    /// 2. else the first with a runtime and a download for this platform;
+    /// 3. else `NeedsRuntime` for the first whose runtime is missing or too
+    ///    old (`Unavailable` would send you looking for the wrong thing);
+    /// 4. else, in a review run, `TrustedOnly` for the first one that never
+    ///    serves one;
+    /// 5. else the first, `Unavailable`.
+    ///
+    /// `None` when the manifest lists no server. Probes; downloads nothing.
     pub async fn server_for(
         &self,
         language: &LanguageId,
@@ -318,41 +350,151 @@ impl Toolchain {
         worktree: &Path,
         trust: TrustMode,
     ) -> Option<(ServerSpec, InstallState)> {
+        self.choose(
+            language,
+            prefer,
+            worktree,
+            trust,
+            trust == TrustMode::Review,
+        )
+        .await
+    }
+
+    /// What a yes to "download a server for `language`" is about, from
+    /// outside any worktree, so a worktree's own binaries are never what
+    /// gets installed: [`server_for`](Self::server_for) for a machine rather
+    /// than a run, so a server that only serves spaces counts too. Nothing
+    /// to download unless the state is `Missing` or `Failed`.
+    pub async fn server_to_install(
+        &self,
+        language: &LanguageId,
+        prefer: Option<&str>,
+    ) -> Option<(ServerSpec, InstallState)> {
+        let neutral = self.inner.root.clone();
+        self.choose(language, prefer, &neutral, TrustMode::Review, false)
+            .await
+    }
+
+    async fn choose(
+        &self,
+        language: &LanguageId,
+        prefer: Option<&str>,
+        worktree: &Path,
+        trust: TrustMode,
+        skip_trusted_only: bool,
+    ) -> Option<(ServerSpec, InstallState)> {
         let lang = self.inner.manifest.language(language)?;
         let mut order: Vec<&ServerSpec> = lang.servers.iter().collect();
         if let Some(i) = prefer.and_then(|p| order.iter().position(|s| s.name == p)) {
             let preferred = order.remove(i);
             order.insert(0, preferred);
         }
-        for spec in &order {
-            if let Some(r) = self.resolve_server(spec, worktree, trust).await {
-                return Some(((*spec).clone(), r.install_state()));
+        let (usable, gated): (Vec<&ServerSpec>, Vec<&ServerSpec>) = order
+            .iter()
+            .partition(|s| !(skip_trusted_only && s.trusted_only));
+
+        let mut runnable: Vec<&ServerSpec> = Vec::new();
+        let mut needs: Option<(&ServerSpec, InstallState)> = None;
+        for spec in &usable {
+            match self.runtime_of(spec, worktree, trust).await {
+                Ok(runtime) => {
+                    if let Some(r) = self
+                        .resolve_with(spec, runtime.as_ref(), worktree, trust)
+                        .await
+                    {
+                        return Some(((*spec).clone(), r.install_state()));
+                    }
+                    runnable.push(*spec);
+                }
+                Err(state) => {
+                    needs.get_or_insert((*spec, state));
+                }
             }
         }
-        if let Some(spec) = order
+        if let Some(spec) = runnable
             .iter()
             .find(|s| s.download_for(&self.inner.platform).is_some())
         {
             return Some(((*spec).clone(), self.download_state(spec)));
         }
-        order
+        if let Some((spec, state)) = needs {
+            return Some((spec.clone(), state));
+        }
+        if let Some(spec) = gated.first() {
+            return Some(((*spec).clone(), InstallState::TrustedOnly));
+        }
+        usable
             .first()
             .map(|s| ((*s).clone(), InstallState::Unavailable))
     }
 
-    /// The binary to run for `spec`: on the machine first (docs §4.3), then
-    /// Theodore's download. `worktree`'s own binaries count only when
-    /// `trust` is `Trusted`.
+    /// The runtime `spec` runs on: `Ok(None)` when it needs none,
+    /// `Err(NeedsRuntime)` when it is missing or too old.
+    async fn runtime_of(
+        &self,
+        spec: &ServerSpec,
+        worktree: &Path,
+        trust: TrustMode,
+    ) -> Result<Option<Runtime>, InstallState> {
+        let Some(req) = &spec.requires else {
+            return Ok(None);
+        };
+        let needs = |found: Option<String>| InstallState::NeedsRuntime {
+            runtime: req.runtime.clone(),
+            min: req.min.to_string(),
+            found,
+        };
+        match runtime::check(req, worktree, trust, &self.inner.probe).await {
+            RuntimeCheck::Found(r) => Ok(Some(r)),
+            RuntimeCheck::TooOld { found } => {
+                tracing::info!(target: "code_intel", server = %spec.name, runtime = %req.runtime, %found, "runtime too old; server skipped");
+                Err(needs(Some(found)))
+            }
+            RuntimeCheck::Missing => {
+                tracing::info!(target: "code_intel", server = %spec.name, runtime = %req.runtime, "runtime missing; server skipped");
+                Err(needs(None))
+            }
+        }
+    }
+
+    /// The command to run `spec` with in `worktree`: on the machine first
+    /// (docs §4.3), then Theodore's download. `None` when neither is there,
+    /// or its runtime is not: a binary is no use without one. `worktree`'s
+    /// own binaries count only when `trust` is `Trusted`.
     pub async fn resolve_server(
         &self,
         spec: &ServerSpec,
         worktree: &Path,
         trust: TrustMode,
     ) -> Option<ResolvedServer> {
-        if let Some(found) = server::find_system(spec, worktree, trust, &self.inner.probe).await {
+        let runtime = self.runtime_of(spec, worktree, trust).await.ok()?;
+        self.resolve_with(spec, runtime.as_ref(), worktree, trust)
+            .await
+    }
+
+    async fn resolve_with(
+        &self,
+        spec: &ServerSpec,
+        runtime: Option<&Runtime>,
+        worktree: &Path,
+        trust: TrustMode,
+    ) -> Option<ResolvedServer> {
+        let data = spec
+            .uses_data_dir()
+            .then(|| self.data_dir(&spec.name, worktree, trust));
+        if let Some(found) = server::find_system(
+            spec,
+            runtime,
+            data.as_deref(),
+            worktree,
+            trust,
+            &self.inner.probe,
+        )
+        .await
+        {
             return Some(found);
         }
-        self.downloaded(spec)
+        self.downloaded(spec, runtime, data)
     }
 
     /// Download, verify and unpack `spec` for this platform. Already
@@ -376,10 +518,32 @@ impl Toolchain {
                 spec.name
             )));
         };
+        // Nothing is downloaded for a server that can't run.
+        let neutral = self.inner.root.clone();
+        let runtime = self
+            .runtime_of(spec, &neutral, TrustMode::Review)
+            .await
+            .map_err(|state| {
+                CodeIntelError::Unsupported(match state {
+                    InstallState::NeedsRuntime {
+                        runtime,
+                        min,
+                        found,
+                    } => format!(
+                        "{} needs {runtime} {min} or newer{}",
+                        spec.name,
+                        found.map(|f| format!(" (found {f})")).unwrap_or_default()
+                    ),
+                    _ => format!("{}: no runtime", spec.name),
+                })
+            })?;
+        let data = spec
+            .uses_data_dir()
+            .then(|| self.data_dir(&spec.name, &neutral, TrustMode::Review));
         let key = server_key(&spec.name, version);
         let flight = self.flight(&key);
         let _flight = flight.lock().await;
-        if let Some(found) = self.downloaded(spec) {
+        if let Some(found) = self.downloaded(spec, runtime.as_ref(), data.clone()) {
             return Ok(found);
         }
 
@@ -397,9 +561,10 @@ impl Toolchain {
             tokio::task::spawn_blocking(move || install_unpacked(tmp, format, &dir, &bin))
                 .await
                 .map_err(|e| CodeIntelError::Other(format!("server install: {e}")))??;
-            self.downloaded(spec).ok_or_else(|| {
-                CodeIntelError::Other(format!("{}: installed but not found", spec.name))
-            })
+            self.downloaded(spec, runtime.as_ref(), data.clone())
+                .ok_or_else(|| {
+                    CodeIntelError::Other(format!("{}: installed but not found", spec.name))
+                })
         }
         .await;
         self.record(&key, &result);
@@ -410,27 +575,94 @@ impl Toolchain {
     }
 
     /// Command line and init options for a resolved server under `trust`.
+    /// Its `{data}` directory exists afterwards; others of the server that
+    /// no launch touched in [`DATA_DIR_TTL`] are gone.
     pub fn launch_config(
         &self,
         resolved: &ResolvedServer,
         spec: &ServerSpec,
         trust: TrustMode,
     ) -> LaunchConfig {
+        if let Some(data) = &resolved.data_dir {
+            self.prepare_data_dir(data);
+        }
         launch_config(resolved, spec, trust)
     }
 
-    fn downloaded(&self, spec: &ServerSpec) -> Option<ResolvedServer> {
+    fn downloaded(
+        &self,
+        spec: &ServerSpec,
+        runtime: Option<&Runtime>,
+        data: Option<PathBuf>,
+    ) -> Option<ResolvedServer> {
         let dl = spec.download_for(&self.inner.platform)?;
         let version = spec.version.as_deref()?;
-        let bin = self.server_dir(&spec.name, version).join(&dl.bin);
+        let dir = self.server_dir(&spec.name, version);
+        let bin = dir.join(&dl.bin);
         bin.is_file().then(|| ResolvedServer {
             name: spec.name.clone(),
-            argv: server::launch_argv(spec, &bin),
+            argv: server::launch_argv(
+                spec,
+                LaunchVars {
+                    bin: Some(&bin),
+                    dir: Some(&dir),
+                    data: data.as_deref(),
+                    runtime: runtime.map(|r| r.exe.as_path()),
+                },
+            ),
+            env: server::server_env(runtime, &self.inner.probe),
+            data_dir: data,
             bin,
             origin: ServerOrigin::Downloaded {
                 version: version.to_string(),
             },
         })
+    }
+
+    /// `{data}` of `server` for `worktree`, by path and trust mode: a review
+    /// session never reads what a trusted one imported.
+    fn data_dir(&self, server: &str, worktree: &Path, trust: TrustMode) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        let canon = worktree
+            .canonicalize()
+            .unwrap_or_else(|_| worktree.to_path_buf());
+        let mut hash = Sha256::new();
+        hash.update(canon.as_os_str().as_encoded_bytes());
+        hash.update(match trust {
+            TrustMode::Trusted => b"\0trusted".as_slice(),
+            TrustMode::Review => b"\0review".as_slice(),
+        });
+        let hash = hex::encode(hash.finalize());
+        self.data_root(server).join(&hash[..16])
+    }
+
+    fn data_root(&self, server: &str) -> PathBuf {
+        self.inner.root.join("server-data").join(server)
+    }
+
+    /// Create `dir`, mark it used, and drop its stale siblings. Best effort:
+    /// a server that needs it complains in its own words.
+    fn prepare_data_dir(&self, dir: &Path) {
+        if let Err(e) =
+            std::fs::create_dir_all(dir).and_then(|()| std::fs::write(dir.join(DATA_DIR_MARK), b""))
+        {
+            tracing::warn!(target: "code_intel", dir = %dir.display(), error = %e, "server data directory");
+            return;
+        }
+        let Some(root) = dir.parent() else {
+            return;
+        };
+        let Some(cutoff) = SystemTime::now().checked_sub(DATA_DIR_TTL) else {
+            return;
+        };
+        for sibling in read_dirs(root) {
+            let stale = std::fs::metadata(sibling.join(DATA_DIR_MARK))
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t < cutoff);
+            if stale && sibling != dir {
+                remove_logged(&sibling);
+            }
+        }
     }
 
     fn download_state(&self, spec: &ServerSpec) -> InstallState {
@@ -452,9 +684,10 @@ impl Toolchain {
 
     // ── cleanup ───────────────────────────────────────────────────────────
 
-    /// Deletes every downloaded version of server `name`
-    /// (`servers/<name>/`); one found on the machine is not ours and stays.
-    /// Refused while it downloads. Its state is `Missing` again. Blocking
+    /// Deletes every downloaded version of server `name` (`servers/<name>/`)
+    /// and its `{data}` directories; one found on the machine is not ours
+    /// and stays. Refused while it downloads. Its state is `Missing` again.
+    /// Blocking
     /// (file system only); stopping its processes first is the caller's.
     /// `true`: something was deleted.
     pub fn remove_server(&self, name: &str) -> CodeIntelResult<bool> {
@@ -468,13 +701,20 @@ impl Toolchain {
             )));
         }
         lock(&self.inner.failed).retain(|k, _| !k.starts_with(&prefix));
-        let dir = self.inner.root.join("servers").join(name);
-        if !dir.exists() {
-            return Ok(false);
+        let mut deleted = false;
+        for dir in [
+            self.inner.root.join("servers").join(name),
+            self.data_root(name),
+        ] {
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir).map_err(|e| io_err(&dir, e))?;
+                deleted = true;
+            }
         }
-        std::fs::remove_dir_all(&dir).map_err(|e| io_err(&dir, e))?;
-        tracing::info!(target: "code_intel", server = name, "server removed");
-        Ok(true)
+        if deleted {
+            tracing::info!(target: "code_intel", server = name, "server removed");
+        }
+        Ok(deleted)
     }
 
     /// Deletes the grammar package of `language` (with every language it

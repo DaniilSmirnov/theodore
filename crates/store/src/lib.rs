@@ -401,6 +401,27 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    fn outbox_has_pending(&self, op: &str, payload: &serde_json::Value) -> StoreResult<bool> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT payload FROM outbox WHERE status = 'pending' AND op = ?1")
+            .map_err(de)?;
+        let rows = stmt
+            .query_map(params![op], |r| r.get::<_, String>(0))
+            .map_err(de)?;
+        for row in rows {
+            let text = row.map_err(de)?;
+            if serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .as_ref()
+                == Some(payload)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn outbox_pending_count(&self) -> StoreResult<u64> {
         let conn = self.lock()?;
         let n: i64 = conn

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ChatMessage } from '../gen/contract';
-import { feedOf, hiddenFindingsNote, priorQuestion } from './SidePanel';
+import { aiTurns, feedOf, hiddenFindingsNote } from './SidePanel';
 
 function msg(id: string, partial: Partial<ChatMessage>): ChatMessage {
   return {
@@ -15,35 +15,59 @@ function msg(id: string, partial: Partial<ChatMessage>): ChatMessage {
   };
 }
 
-describe('priorQuestion', () => {
-  it('finds the user message immediately before an agent reply', () => {
-    const messages = [
-      msg('m1', { author: { kind: 'me' }, text: 'why?' }),
-      msg('m2', {
-        author: { kind: 'agent', agent: 'claude' },
-        text: 'because',
-      }),
-    ];
-    expect(priorQuestion(messages, messages[1]!)).toBe('why?');
+describe('aiTurns', () => {
+  const agent = (id: string, at: number, over: Partial<ChatMessage> = {}) =>
+    msg(id, { author: { kind: 'agent', agent: 'claude' }, at, ...over });
+  const run = (id: string, started_at: number) =>
+    ({ id, started_at }) as unknown as Parameters<typeof aiTurns>[0][number];
+
+  it('pairs each question with the replies under it', () => {
+    const turns = aiTurns(
+      [],
+      [
+        msg('q1', { text: 'why?', at: 1 }),
+        agent('a1', 2),
+        msg('q2', { text: 'and?', at: 3 }),
+        agent('a2', 4),
+        agent('a3', 5),
+      ],
+    );
+    expect(turns.map((t) => [t.key, t.items.length])).toEqual([
+      ['q1', 2],
+      ['q2', 3],
+    ]);
   });
 
-  it('skips past other agent replies to find the nearest question', () => {
-    const messages = [
-      msg('m1', { author: { kind: 'me' }, text: 'why?' }),
-      msg('m2', {
-        author: { kind: 'agent', agent: 'claude' },
-        text: 'because',
-      }),
-      msg('m3', { author: { kind: 'agent', agent: 'codex' }, failed: 'boom' }),
-    ];
-    expect(priorQuestion(messages, messages[2]!)).toBe('why?');
+  it('gives a reply the last question of yours before it', () => {
+    const [turn] = aiTurns(
+      [],
+      [msg('q1', { text: 'why?', at: 1 }), agent('a1', 2), agent('a2', 3)],
+    );
+    const asked = turn!.items.map((i) =>
+      i.kind === 'message' ? i.question : null,
+    );
+    expect(asked).toEqual(['', 'why?', 'why?']);
   });
 
-  it('returns an empty string when there is no prior question', () => {
-    const messages = [
-      msg('m1', { author: { kind: 'agent', agent: 'claude' }, failed: 'boom' }),
-    ];
-    expect(priorQuestion(messages, messages[0]!)).toBe('');
+  it('a reply with no question before it asks nothing again', () => {
+    const [turn] = aiTurns([], [agent('a1', 1, { failed: 'boom' })]);
+    expect(turn!.items[0]).toMatchObject({ question: '' });
+  });
+
+  it('a skill run starts its own turn, in time order', () => {
+    const turns = aiTurns(
+      [run('r1', 2)],
+      [msg('q1', { at: 1 }), agent('a1', 3), msg('q2', { at: 4 })],
+    );
+    expect(turns.map((t) => t.key)).toEqual(['q1', 'r1', 'q2']);
+    // The reply that landed after the run stays with the run's turn.
+    expect(turns[1]!.items.map((i) => i.kind)).toEqual(['run', 'message']);
+  });
+
+  it('keys a turn by its first message, so it keeps its row', () => {
+    const before = aiTurns([], [msg('q1', { at: 1 })]);
+    const after = aiTurns([], [msg('q1', { at: 1 }), agent('a1', 2)]);
+    expect(after[0]!.key).toBe(before[0]!.key);
   });
 });
 

@@ -8,6 +8,7 @@ import {
   notifyOn,
   spaceOfReview,
   lastAgentTurn,
+  liveTurns,
   rewindState,
   undoState,
   undoneMessages,
@@ -151,6 +152,14 @@ describe('undo last turn', () => {
     });
     expect([...undoneMessages(s)].sort()).toEqual(['m2', 'r2']);
     expect(undoneMessages(space({ id: 'x' })).size).toBe(0);
+  });
+
+  it('counts only live turns: Undo of turn 2 is "after turn 1"', () => {
+    const undone = { ...twoTurns[1]!, undone: true };
+    expect(liveTurns(space({ id: 's', turns: 2, turn_log: twoTurns }))).toBe(2);
+    expect(
+      liveTurns(space({ id: 's', turns: 2, turn_log: [twoTurns[0]!, undone] })),
+    ).toBe(1);
   });
 });
 

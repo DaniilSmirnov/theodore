@@ -6,6 +6,7 @@ const host = (overrides: Partial<HostStatus> = {}): HostStatus => ({
   online: true,
   rateLimitedUntil: null,
   authOk: true,
+  serverTrouble: false,
   ...overrides,
 });
 

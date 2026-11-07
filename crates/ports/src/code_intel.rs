@@ -13,6 +13,7 @@
 //! values (chars) in the line, not bytes and not UTF-16 units. Each layer
 //! converts at its edge (tree-sitter bytes, LSP UTF-16 or UTF-8).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -142,6 +143,11 @@ pub struct TextEdit {
     pub path: String,
     pub range: Range,
     pub new_text: String,
+    /// What `range` held in the text the edit was computed from (a
+    /// server's copy of the file): applying it refuses a file that no
+    /// longer has that there. `None`: not checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<String>,
 }
 
 /// What a query returns: its items and how complete they are.
@@ -223,6 +229,10 @@ pub struct Workspace {
     /// layers). `None`: the facade's default policy.
     #[serde(default)]
     pub lsp: Option<LspPolicy>,
+    /// `code_intel.servers`: language id → the server to try first. The
+    /// repo's layer is read at the base (docs/code-intel.md §3.1).
+    #[serde(default)]
+    pub servers: BTreeMap<String, String>,
 }
 
 /// State of one installable thing (a grammar or a server).
@@ -244,6 +254,20 @@ pub enum InstallState {
     /// The manifest has no download for this platform and nothing is
     /// installed.
     Unavailable,
+    /// The server needs a runtime that is missing or too old. No server of
+    /// the language can run, and nothing is downloaded for this one.
+    NeedsRuntime {
+        /// A manifest runtime id: `java`, `node`, `dotnet-sdk`, …
+        runtime: String,
+        /// The oldest that works: `21`, `8.2`.
+        min: String,
+        /// What is on the machine, if one ran.
+        found: Option<String>,
+    },
+    /// The server runs the project's code with no way to turn that off, and
+    /// this worktree is a review (docs/code-intel.md §8): never started
+    /// here. A space can use it.
+    TrustedOnly,
     /// The user said no (`code_intel.install: ask`).
     Declined,
     Failed {
@@ -254,6 +278,8 @@ pub enum InstallState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerState {
+    /// The policy does not let a server run here (`code_intel.lsp`).
+    Off,
     NotRunning,
     Warming,
     Ready,
@@ -265,6 +291,8 @@ pub struct ServerStatus {
     pub name: String,
     pub install: InstallState,
     pub state: ServerState,
+    /// How to get it when Theodore can't (`gem install ruby-lsp`).
+    pub hint: Option<String>,
 }
 
 /// One language of a workspace, for `status()` and project settings → Languages.
@@ -367,6 +395,12 @@ pub enum CodeIntelError {
     NoSymbol { path: String, name: String },
     #[error("{0}")]
     Unsupported(String),
+    /// Remove refused: open worktrees (`roots`) have files of `language`.
+    #[error("{language} is in use by {} open worktree(s); close them, or remove it later", roots.len())]
+    InUse {
+        language: String,
+        roots: Vec<PathBuf>,
+    },
     #[error("download failed: {0}")]
     Download(String),
     #[error("checksum mismatch for {0}")]
@@ -457,5 +491,12 @@ pub trait CodeIntelPort: Send + Sync {
 
     /// A file in the worktree changed on disk (spaces' watcher).
     async fn file_changed(&self, root: &Path, path: &str);
+    /// Start the servers the policy allows and that are on disk, as far as
+    /// the cap has room: one stopped for being idle comes back. Running
+    /// ones are left alone; nothing is downloaded.
+    async fn warm(&self, root: &Path);
+    /// This worktree's own switch, live: off stops its servers, on starts
+    /// those on disk.
+    async fn set_lsp(&self, root: &Path, on: bool);
     async fn status(&self, root: &Path) -> CodeIntelResult<Vec<LanguageStatus>>;
 }

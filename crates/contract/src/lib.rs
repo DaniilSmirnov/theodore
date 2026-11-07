@@ -55,6 +55,8 @@ pub mod models {
     pub const GROUPING: &str = "grouping";
     pub const HUNK_READ: &str = "hunk_read";
     pub const FILE_VIEWED: &str = "file_viewed";
+    /// A ticked "What to check" item of one group; no row is unticked.
+    pub const CHECK_TICK: &str = "check_tick";
     pub const THREAD: &str = "thread";
     pub const DRAFT: &str = "draft";
     pub const FINDING: &str = "finding";
@@ -73,6 +75,7 @@ pub mod models {
         GROUPING,
         HUNK_READ,
         FILE_VIEWED,
+        CHECK_TICK,
         THREAD,
         DRAFT,
         FINDING,
@@ -568,6 +571,27 @@ pub enum Ephemeral {
         agent: AgentId,
         line: String,
     },
+    /// A new row of a run's timeline: a tool call, thinking, or a subagent's
+    /// text. The run's own text comes as `AgentDelta`.
+    RunStep {
+        run: String,
+        step: TurnStep,
+    },
+    /// The tool call `id` of `run` ended, or (`ok` none) learned its summary.
+    RunStepDone {
+        run: String,
+        id: String,
+        ok: Option<bool>,
+        summary: Option<String>,
+        /// The call was a subagent launched in the background: its result
+        /// only says it started.
+        #[serde(default)]
+        background: bool,
+    },
+    /// The next `AgentDelta` of `run` starts a new text row.
+    RunTextBreak {
+        run: String,
+    },
     /// No output for `agents.stall_after_ms` while `run` is still alive.
     /// The run keeps going (this isn't terminal) — the UI offers Retry
     /// (cancel + resend) or Cancel instead of waiting silently.
@@ -589,6 +613,10 @@ pub enum Ephemeral {
         online: bool,
         rate_limited_until: Option<Millis>,
         auth_ok: bool,
+        /// Reachable, but answering with server errors (5xx): the host is
+        /// having trouble, which is not being offline.
+        #[serde(default)]
+        server_trouble: bool,
     },
     /// The Theodore account signed in, signed out, or its session ended.
     AccountStatus {
@@ -681,6 +709,17 @@ pub struct FileViewedRow {
     pub state: ViewedState,
 }
 
+/// One ticked item of a group's "What to check" list, kept like a read mark
+/// so it survives a tab switch or a restart. `scope` names the group within
+/// a revision (`<base>:<head>:<group id>`): a regroup or a push starts the
+/// list over. `item` is the item's key within the group.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct CheckTick {
+    pub pr: PrId,
+    pub scope: String,
+    pub item: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -706,6 +745,64 @@ pub struct SkillRun {
     pub hidden_findings: u32,
 }
 
+/// One thing an agent did in a space turn, kept on the reply in the order it
+/// happened (`ChatMessage::activity`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum TurnStep {
+    /// What it wrote on the way; the reply's own text isn't repeated here.
+    Text {
+        text: String,
+        /// The `Agent`/`Task` call whose subagent wrote it.
+        #[serde(default)]
+        parent: Option<String>,
+    },
+    Thinking {
+        text: String,
+        #[serde(default)]
+        parent: Option<String>,
+    },
+    Tool {
+        /// Its label: `Bash`, or what Theodore's own tools do (`ship the change`).
+        name: String,
+        /// The command or file it was about.
+        target: Option<String>,
+        /// `None`: no result came (the turn ended first).
+        ok: Option<bool>,
+        /// The call's id, for its result and its subagent's steps to find.
+        #[serde(default)]
+        id: Option<String>,
+        /// The `Agent`/`Task` call whose subagent made this call.
+        #[serde(default)]
+        parent: Option<String>,
+        /// What the agent said it is: a command's or a subagent's description,
+        /// a search's pattern, the question asked. Capped.
+        #[serde(default)]
+        detail: Option<String>,
+        /// What its result says: `120 lines`, `5 matches`, a subagent's
+        /// report. Capped.
+        #[serde(default)]
+        summary: Option<String>,
+        /// Lines an edit adds and removes, from its input.
+        #[serde(default)]
+        added: Option<u32>,
+        #[serde(default)]
+        removed: Option<u32>,
+        /// A subagent launched in the background: its result only says it
+        /// started, its report (`summary`) comes later, or never.
+        #[serde(default)]
+        background: bool,
+    },
+}
+
+/// A file a space turn changed (`ChatMessage::changed_files`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct TurnFile {
+    pub path: String,
+    pub additions: u32,
+    pub deletions: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 pub struct ChatMessage {
     pub id: String,
@@ -726,6 +823,24 @@ pub struct ChatMessage {
     /// A space message waiting for its turn (docs/spaces.md §8).
     #[serde(default)]
     pub queued: Option<QueuedSend>,
+    /// A space reply's turn, in order (docs/spaces.md §3); empty elsewhere
+    /// and on older rows. Never part of a prompt.
+    #[serde(default)]
+    pub activity: Vec<TurnStep>,
+    /// How long a space reply's turn ran.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    /// What a space reply's turn changed, from git between its checkpoints.
+    /// At most 200; empty when it changed nothing or git couldn't tell.
+    #[serde(default)]
+    pub changed_files: Vec<TurnFile>,
+    /// The model a space reply's turn asked for; none: the CLI's default.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// A space reply with no final text: `text` is the text steps in
+    /// `activity` joined, and only those show, in the order they came.
+    #[serde(default)]
+    pub text_in_steps: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -761,8 +876,11 @@ pub fn types() -> specta::Types {
         .register::<InboxState>()
         .register::<HunkRead>()
         .register::<FileViewedRow>()
+        .register::<CheckTick>()
         .register::<SkillRun>()
         .register::<ChatMessage>()
+        .register::<TurnStep>()
+        .register::<TurnFile>()
         .register::<Attachment>()
         .register::<SaveAttachmentRequest>()
         .register::<Setting>()

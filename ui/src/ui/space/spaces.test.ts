@@ -10,6 +10,7 @@ import {
   canMarkUnread,
   defaultReviewSkill,
   defaultTitle,
+  shipTitle,
   reviewAgentDefault,
   reviewRunning,
   sentTurnDone,
@@ -21,15 +22,20 @@ import {
   labsVisible,
   spaceChatKey,
   spaceGlyph,
+  waitingSpaces,
   spacesIn,
   spaceTitle,
   nextMode,
   spaceKeyAction,
   turnEnded,
+  withPrNumber,
   prTint,
   defaultMergeMethod,
   spaceMerge,
+  mergeLine,
+  prPollMs,
   canContinue,
+  toggleDrawer,
 } from './spaces';
 import type { MergeInfo } from '../../gen/contract';
 
@@ -125,6 +131,31 @@ describe('spaces', () => {
     expect(spaceGlyph({ ...s, status: 'failed' }, 99)).toBe('failed');
   });
 
+  it('reads only news as unread, not every write that bumps updated_at', () => {
+    // Seen after the turn ended; a PR opened or the base moved since.
+    const s = space({ id: 's', turns: 1, attention_at: 10, updated_at: 30 });
+    expect(spaceGlyph(s, 20)).toBe('idle');
+    expect(waitingSpaces([s], () => 20)).toBe(0);
+    // A newer turn is news again; the page's seen mark (`updated_at`) covers it.
+    const next = { ...s, attention_at: 40, updated_at: 40 };
+    expect(spaceGlyph(next, 30)).toBe('unseen');
+    expect(waitingSpaces([next], () => 30)).toBe(1);
+    expect(spaceGlyph(next, next.updated_at)).toBe('idle');
+  });
+
+  it('"Mark as unread" works off the news time, whatever bumped updated_at', () => {
+    const s = space({ id: 's', turns: 1, attention_at: 10, updated_at: 30 });
+    expect(canMarkUnread(s, 20)).toBe(true);
+    expect(spaceGlyph(s, undefined)).toBe('unseen');
+    expect(waitingSpaces([s], () => undefined)).toBe(1);
+  });
+
+  it('a space with no news time yet falls back to updated_at', () => {
+    const s = space({ id: 's', turns: 1, attention_at: null, updated_at: 10 });
+    expect(spaceGlyph(s, 9)).toBe('unseen');
+    expect(spaceGlyph(s, 10)).toBe('idle');
+  });
+
   it('sorts pinned spaces first, newest activity first within each group', () => {
     const all = [
       space({ id: 'old', updated_at: 1 }),
@@ -179,6 +210,23 @@ describe('spaces', () => {
     ).toEqual({ level: 'error', text: 'Fix it: turn failed — boom' });
     expect(turnEnded({ status: 'idle' }, next)).toBeNull();
     expect(turnEnded(undefined, next)).toBeNull();
+    // Conflicts left by an Update from base: the update waits on you, and
+    // the reason reads without the core's "invalid request:".
+    expect(
+      turnEnded(
+        { status: 'running' },
+        {
+          ...next,
+          status: 'failed',
+          error:
+            'invalid request: conflicts left in notes.md; abort the update',
+          updating: { from: 'a', base: 'b', conflicts: ['notes.md'] } as never,
+        },
+      ),
+    ).toEqual({
+      level: 'error',
+      text: 'Fix it: update has conflicts left — conflicts left in notes.md; abort the update',
+    });
     expect(
       turnEnded({ status: 'running' }, { ...next, status: 'running' }),
     ).toBeNull();
@@ -241,6 +289,41 @@ describe('shipping', () => {
       'Retry on 429s',
     );
     expect(defaultTitle({ goal: '', name: 'tidy' })).toBe('tidy');
+    // a space started from a branch with no note: the branch, not "space"
+    expect(
+      defaultTitle({ goal: '', name: 'space', branch: 'alice/fix-login' }),
+    ).toBe('alice/fix-login');
+    expect(
+      defaultTitle({ goal: 'Do it', name: 'space', branch: 'alice/x' }),
+    ).toBe('Do it');
+    // a real name wins over the branch
+    expect(defaultTitle({ goal: '', name: 'tidy', branch: 'alice/x' })).toBe(
+      'tidy',
+    );
+    expect(defaultTitle({ goal: '', name: 'space-2', branch: 'alice/x' })).toBe(
+      'alice/x',
+    );
+  });
+
+  it('after a Continue, leaves the title to the core’s net-change summary', () => {
+    const s = {
+      goal: 'Initialize a tiny static tamagotchi',
+      name: 'tama',
+      rounds: [
+        {
+          pr: 'github:o/r#10',
+          branch: 'me/tama',
+          base_sha: 'x',
+          head_sha: 'y',
+          at: 100,
+        },
+      ],
+    };
+    // Never a sentence copied from the chat: empty, the core proposes it.
+    expect(shipTitle(s)).toBe('');
+    expect(shipTitle({ ...s, rounds: [] })).toBe(
+      'Initialize a tiny static tamagotchi',
+    );
   });
 });
 
@@ -291,6 +374,13 @@ describe('space keys', () => {
 });
 
 describe('spaceTitle', () => {
+  it('shows the branch of a noteless space, a stored title first', () => {
+    const base = { name: 'space', goal: '', branch: 'alice/fix-login' };
+    expect(spaceTitle(base)).toBe('alice/fix-login');
+    expect(spaceTitle({ ...base, title: '#118 Fix login' })).toBe(
+      '#118 Fix login',
+    );
+  });
   it('is the first line of the goal, without a trailing period', () => {
     expect(spaceTitle({ name: 'x', goal: 'Fix the login.\nMore text' })).toBe(
       'Fix the login',
@@ -453,11 +543,100 @@ describe('a space in review', () => {
     });
   });
 
+  it('a draft or a conflict blocks Merge, whatever the host last said', () => {
+    const s = space({ id: 'a', status: 'idle' });
+    expect(spaceMerge(info(), s, { state: 'draft', conflicts: false })).toEqual(
+      { kind: 'none', reason: 'A draft: mark it ready for review first' },
+    );
+    expect(spaceMerge(info(), s, { state: 'open', conflicts: true })).toEqual({
+      kind: 'none',
+      reason: 'Conflicts with the base branch',
+    });
+  });
+
+  it('the merge line says what blocks, never "Ready" beside a blocker', () => {
+    const open = { state: 'open' as const, conflicts: false };
+    const labels = {
+      clean: 'Ready to merge',
+      blocked: 'Blocked',
+      behind: 'Behind',
+      dirty: 'Has merge conflicts',
+      unstable: 'Checks running',
+      unknown: 'Unknown',
+    };
+    expect(mergeLine(open, info(), labels)).toEqual({
+      ok: true,
+      text: 'Ready to merge',
+    });
+    expect(mergeLine({ ...open, conflicts: true }, info(), labels)).toEqual({
+      ok: false,
+      text: 'Has merge conflicts',
+    });
+    expect(mergeLine({ ...open, state: 'draft' }, info(), labels)).toEqual({
+      ok: false,
+      text: 'A draft: mark it ready for review first',
+    });
+    expect(mergeLine(open, null, labels)).toEqual({
+      ok: null,
+      text: 'Checking…',
+    });
+    expect(mergeLine({ ...open, state: 'merged' }, info(), labels)).toEqual({
+      ok: true,
+      text: 'Merged',
+    });
+  });
+
+  it('polls its PR while the page is open, faster while checks run', () => {
+    expect(prPollMs({ state: 'open', checks: 'pending' })).toBe(10_000);
+    expect(prPollMs({ state: 'draft', checks: 'fail' })).toBe(30_000);
+    expect(prPollMs({ state: 'merged', checks: 'pass' })).toBeNull();
+    expect(prPollMs(undefined)).toBe(10_000);
+  });
+
+  it("counts an adopted PR's new turns as not pushed", () => {
+    const adopted = space({
+      id: 'b',
+      pr: 'github:o/r#2',
+      fork_sha: 'tip',
+      head_sha: 'turn1',
+    });
+    expect(unshipped(adopted)).toBe(true);
+    expect(spaceMerge(info(), adopted)).toEqual({
+      kind: 'none',
+      reason: 'Push the new turns first',
+    });
+    expect(unshipped({ ...adopted, head_sha: 'tip' })).toBe(false);
+    expect(spaceMerge(info(), { ...adopted, head_sha: 'tip' })).toEqual({
+      kind: 'merge',
+    });
+  });
+
   it('offers Continue once the PR merged', () => {
     const s = space({ id: 'a', pr: 'github:o/r#1' });
     expect(canContinue(s, 'merged')).toBe(true);
     expect(canContinue(s, 'open')).toBe(false);
     expect(canContinue({ ...s, status: 'archived' }, 'merged')).toBe(false);
     expect(canContinue({ ...s, pr: null }, 'merged')).toBe(false);
+  });
+});
+
+describe('withPrNumber', () => {
+  it("doesn't repeat a number the title already opens with", () => {
+    expect(withPrNumber(113, '#113 ABC-190 Retry')).toBe('#113 ABC-190 Retry');
+    expect(withPrNumber(113, 'Retry failed charges')).toBe(
+      '#113 Retry failed charges',
+    );
+    // #1130 is another number.
+    expect(withPrNumber(113, '#1130 other')).toBe('#113 #1130 other');
+    expect(withPrNumber(undefined, 'Draft')).toBe('Draft');
+  });
+});
+
+describe('the drawers under a space page', () => {
+  it('are one at a time: opening one closes the other', () => {
+    expect(toggleDrawer(null, 'logs')).toBe('logs');
+    expect(toggleDrawer('logs', 'terminal')).toBe('terminal');
+    expect(toggleDrawer('terminal', 'logs')).toBe('logs');
+    expect(toggleDrawer('logs', 'logs')).toBeNull();
   });
 });

@@ -16,6 +16,7 @@ import type {
   AgentId,
   Anchor,
   AppInfo,
+  Attachment,
   CommentId,
   Ephemeral,
   Person,
@@ -24,6 +25,7 @@ import type {
   Side,
   SpaceLogLine,
   ToastLevel,
+  TurnStep,
   UpdateInfo,
 } from '../gen/contract';
 import { appendLogs, seedLogs } from '../ui/space/commands';
@@ -31,6 +33,7 @@ import { appendChunk, type TerminalChunk } from '../ui/space/terminalBuffer';
 import { configPrToast } from '../ui/project/configFile';
 import {
   suggestText,
+  suggestManyText,
   withProgress,
   type InstallProgressMap,
 } from '../ui/project/languages';
@@ -39,6 +42,10 @@ import { openExternal } from '../core/openExternal';
 import { accountGate, type AccountGate } from '../core/accountGate';
 
 const LOG_LIMIT = 500;
+/** As many as the core keeps on the reply. */
+const STEP_LIMIT = 500;
+/** Of one subagent, the same. */
+const NESTED_STEP_LIMIT = 100;
 
 export interface ToastAction {
   label: string;
@@ -56,7 +63,12 @@ export interface Toast {
   /** A second choice next to `action` ("Not now"); either one closes the
    *  toast, which then stays up longer. */
   secondary?: ToastAction;
+  /** Only one toast of a group stays open: a new one closes the older. */
+  group?: string;
 }
+
+/** The group of install suggestions (`code_intel_suggest`). */
+export const SUGGEST_GROUP = 'code_intel_suggest';
 
 /** A question asked about one diff line, shown on the line itself while it
  *  runs and until its answer is opened or dismissed. */
@@ -127,11 +139,42 @@ export interface HostStatus {
   online: boolean;
   rateLimitedUntil: number | null;
   authOk: boolean;
+  /** Reachable, but answering with server errors (5xx). */
+  serverTrouble: boolean;
+}
+
+/** A message you just sent to a space, until the core stored it. */
+export interface SpaceSend {
+  /** The chat row's key, from now on. */
+  key: string;
+  text: string;
+  attachments: Attachment[];
+  agent: AgentId;
+  at: number;
+  /** Shows in the queue: a turn runs or is about to. */
+  queued: boolean;
+}
+
+/** The next frame, or soon when there is none: a hidden window gets no
+ *  frames, and its text must not wait for one. */
+function nextFrame(run: () => void): void {
+  let done = false;
+  const once = () => {
+    if (done) return;
+    done = true;
+    run();
+  };
+  requestAnimationFrame(once);
+  setTimeout(once, 100);
 }
 
 export class EphemeralStore {
+  /** Pieces that came since the last frame, by run: at most one update of
+   *  a streaming view per frame, however fast the agent writes. */
+  private readonly heldText = new Map<string, string>();
+  private frameWaiting = false;
   /** Streaming text per run id, appended as `agent_delta` events arrive
-   *  (a piece at a time while the agent writes). Observable per key: a
+   *  (one update per frame while the agent writes). Observable per key: a
    *  view reading one run re-renders only when that run grows. */
   readonly agentText: ObservableMap<string, string> = observable.map(
     {},
@@ -139,6 +182,34 @@ export class EphemeralStore {
   );
   /** Last lines of a run's log (its tool calls), per run id. */
   readonly runLog: ObservableMap<string, string[]> = observable.map(
+    {},
+    { deep: false },
+  );
+  /** A run's text, tool calls and thinking in the order they came: what a
+   *  space's running turn shows, until its stored reply takes over. */
+  readonly runSteps: ObservableMap<string, TurnStep[]> = observable.map(
+    {},
+    { deep: false },
+  );
+  /** Runs whose next piece of text starts a new row. */
+  private readonly textBreaks = new Set<string>();
+  /** A file's chip was clicked: the Changes pane opens on `path` (`null`: just
+   *  the pane), per space, until it has. */
+  readonly spaceChangesFocus: ObservableMap<string, { path: string | null }> =
+    observable.map({}, { deep: false });
+  /** Sent and not stored yet, per space, in the order you sent them. */
+  readonly spaceSends: ObservableMap<string, SpaceSend[]> = observable.map(
+    {},
+    { deep: false },
+  );
+  /** A stored message's id → the key its chat row got while it was being
+   *  sent: the row stays the same one when the message arrives. */
+  readonly turnKeys: ObservableMap<string, string> = observable.map(
+    {},
+    { deep: false },
+  );
+  /** Runs you pressed Stop on, until their reply replaces them. */
+  readonly stoppingRuns: ObservableMap<string, true> = observable.map(
     {},
     { deep: false },
   );
@@ -157,6 +228,7 @@ export class EphemeralStore {
     online: true,
     rateLimitedUntil: null,
     authOk: true,
+    serverTrouble: false,
   };
   /** `refresh_inbox` in flight. */
   inboxLoading = false;
@@ -230,6 +302,8 @@ export class EphemeralStore {
    *  its last event: project settings → Languages draws the bars from it
    *  and reads the status again once an item settles. */
   installProgress: InstallProgressMap = new Map();
+  /** Install suggestions not answered yet (not observed). */
+  private suggested: { language: string; server: string }[] = [];
 
   private nextToastId = 1;
   private nextFocusSeq = 1;
@@ -529,7 +603,7 @@ export class EphemeralStore {
     runInAction(() => {
       switch (e.type) {
         case 'agent_delta':
-          this.agentText.set(e.run, (this.agentText.get(e.run) ?? '') + e.text);
+          this.addDelta(e.run, e.text);
           this.clearStalled(e.run);
           return;
         case 'run_log': {
@@ -538,6 +612,21 @@ export class EphemeralStore {
           this.clearStalled(e.run);
           return;
         }
+        case 'run_step':
+          // What it wrote before this comes before it in the steps.
+          this.flushRun(e.run);
+          this.addStep(e.run, e.step);
+          this.clearStalled(e.run);
+          return;
+        case 'run_step_done':
+          this.flushRun(e.run);
+          this.markStep(e.run, e.id, e.ok, e.summary, e.background);
+          this.clearStalled(e.run);
+          return;
+        case 'run_text_break':
+          this.flushRun(e.run);
+          this.textBreaks.add(e.run);
+          return;
         case 'run_stalled': {
           const next = new Set(this.stalled);
           next.add(e.run);
@@ -561,6 +650,7 @@ export class EphemeralStore {
             online: e.online,
             rateLimitedUntil: e.rate_limited_until,
             authOk: e.auth_ok,
+            serverTrouble: e.server_trouble ?? false,
           };
           return;
         case 'account_status':
@@ -602,33 +692,113 @@ export class EphemeralStore {
           this.installProgress = withProgress(this.installProgress, e);
           return;
         case 'code_intel_suggest': {
-          // The core asks once per language per session (§5.1).
-          const { language } = e;
+          // The core asks once per language per session (§5.1), so a project
+          // with several languages asks several times. One toast stays up
+          // and asks for all of them, instead of a stack over the page.
+          const asked = this.suggested.filter((a) => a.language !== e.language);
+          asked.push({ language: e.language, server: e.server });
+          this.suggested = asked;
+          const each = (fn: (language: string) => Promise<unknown>) => () => {
+            this.suggested = [];
+            for (const { language } of asked) {
+              void fn(language).catch(() => {
+                // toasted by api.ts
+              });
+            }
+          };
           this.toasts = [
             ...this.toasts,
             {
               id: this.nextToastId++,
               level: 'info',
-              text: suggestText(language, e.server),
+              group: SUGGEST_GROUP,
+              text:
+                asked.length === 1
+                  ? suggestText(e.language, e.server)
+                  : suggestManyText(asked.map((a) => a.language)),
               action: {
                 label: 'Download',
-                onAction: () =>
-                  void api.codeIntelInstall(language).catch(() => {
-                    // toasted by api.ts
-                  }),
+                onAction: each((l) => api.codeIntelInstall(l)),
               },
               secondary: {
                 label: 'Not now',
-                onAction: () =>
-                  void api.codeIntelDecline(language).catch(() => {
-                    // toasted by api.ts
-                  }),
+                onAction: each((l) => api.codeIntelDecline(l)),
               },
             },
           ];
           return;
         }
       }
+    });
+  }
+
+  addSpaceSend(space: string, send: SpaceSend): void {
+    runInAction(() => {
+      this.spaceSends.set(space, [...(this.spaceSends.get(space) ?? []), send]);
+    });
+  }
+
+  dropSpaceSend(space: string, key: string): void {
+    runInAction(() => {
+      const left = (this.spaceSends.get(space) ?? []).filter(
+        (s) => s.key !== key,
+      );
+      if (left.length) this.spaceSends.set(space, left);
+      else this.spaceSends.delete(space);
+    });
+  }
+
+  /** Its row arrived, as `id`: that row keeps the key it was shown under. */
+  landSpaceSend(space: string, key: string, id: string): void {
+    runInAction(() => {
+      this.turnKeys.set(id, key);
+      this.dropSpaceSend(space, key);
+    });
+  }
+
+  markStopping(run: string, on: boolean): void {
+    runInAction(() => {
+      if (on) this.stoppingRuns.set(run, true);
+      else this.stoppingRuns.delete(run);
+    });
+  }
+
+  /** The first piece shows at once; the rest wait for the next frame. */
+  private addDelta(run: string, text: string): void {
+    if (!this.frameWaiting) {
+      this.showText(run, text);
+      this.waitForFrame();
+      return;
+    }
+    this.heldText.set(run, (this.heldText.get(run) ?? '') + text);
+  }
+
+  private showText(run: string, text: string): void {
+    this.agentText.set(run, (this.agentText.get(run) ?? '') + text);
+    this.addStepText(run, text);
+  }
+
+  private flushRun(run: string): void {
+    const text = this.heldText.get(run);
+    if (text === undefined) return;
+    this.heldText.delete(run);
+    this.showText(run, text);
+  }
+
+  private waitForFrame(): void {
+    this.frameWaiting = true;
+    nextFrame(() => {
+      this.frameWaiting = false;
+      if (this.heldText.size === 0) return;
+      this.flushDeltas();
+      this.waitForFrame();
+    });
+  }
+
+  /** Shows every piece still waiting for a frame. */
+  flushDeltas(): void {
+    runInAction(() => {
+      for (const run of [...this.heldText.keys()]) this.flushRun(run);
     });
   }
 
@@ -662,10 +832,21 @@ export class EphemeralStore {
   /** A run is done (or cancelled/failed): its streaming text and log no longer grow. */
   clearRun(run: string): void {
     runInAction(() => {
+      this.heldText.delete(run);
       this.agentText.delete(run);
       this.runLog.delete(run);
+      this.runSteps.delete(run);
+      this.textBreaks.delete(run);
       this.clearStalled(run);
     });
+  }
+
+  openSpaceChanges(space: string, path: string | null): void {
+    runInAction(() => this.spaceChangesFocus.set(space, { path }));
+  }
+
+  spaceChangesOpened(space: string): void {
+    runInAction(() => this.spaceChangesFocus.delete(space));
   }
 
   /** A terminal tab is closed: its buffered output and exit no longer
@@ -685,6 +866,62 @@ export class EphemeralStore {
       if (prev && prev !== run) this.clearRun(prev);
       this.taskRuns.set(task, run);
     });
+  }
+
+  private addStep(run: string, step: TurnStep): void {
+    let steps = this.runSteps.get(run) ?? [];
+    // A long subagent gives way to itself, not to the turn's own rows.
+    if (step.parent) {
+      const of = step.parent;
+      const mine = steps.filter((s) => s.parent === of);
+      if (mine.length >= NESTED_STEP_LIMIT) {
+        steps = steps.filter((s) => s !== mine[0]);
+      }
+    }
+    this.runSteps.set(run, [...steps, step].slice(-STEP_LIMIT));
+  }
+
+  /** A piece of text goes on the run's own text being written, past what a
+   *  subagent did meanwhile, or starts the next: after anything else of the
+   *  run's, or at a block's start. */
+  private addStepText(run: string, text: string): void {
+    const steps = this.runSteps.get(run) ?? [];
+    const starts = this.textBreaks.delete(run);
+    let at = steps.length - 1;
+    while (at >= 0 && steps[at]?.parent) at -= 1;
+    const last = steps[at];
+    if (!starts && last?.kind === 'text') {
+      const next = [...steps];
+      next[at] = { ...last, text: last.text + text };
+      this.runSteps.set(run, next);
+    } else {
+      this.addStep(run, { kind: 'text', text });
+    }
+  }
+
+  /** Marks the call `id`, and no other: parallel calls end in any order. */
+  private markStep(
+    run: string,
+    id: string,
+    ok: boolean | null,
+    summary: string | null,
+    background?: boolean,
+  ): void {
+    const steps = this.runSteps.get(run);
+    if (!steps) return;
+    for (let i = steps.length - 1; i >= 0; i -= 1) {
+      const step = steps[i];
+      if (step?.kind !== 'tool' || step.id !== id) continue;
+      const next = [...steps];
+      next[i] = {
+        ...step,
+        ok: ok ?? step.ok,
+        summary: summary ?? step.summary,
+        ...(background ? { background: true } : {}),
+      };
+      this.runSteps.set(run, next);
+      return;
+    }
   }
 
   private clearStalled(run: string): void {

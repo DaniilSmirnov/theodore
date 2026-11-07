@@ -8,6 +8,20 @@ export function identifierAt(text: string, offset: number): string | null {
   return identifierSpan(text, offset)?.name ?? null;
 }
 
+/** The identifier at `offset` and its 1-based column: the column counts
+ *  chars (code points), as the core does, not UTF-16 units. */
+export function identifierColAt(
+  text: string,
+  offset: number,
+): { name: string; col: number } | null {
+  const span = identifierSpan(text, offset);
+  if (!span) return null;
+  return {
+    name: span.name,
+    col: Array.from(text.slice(0, span.start)).length + 1,
+  };
+}
+
 /** `identifierAt` with the identifier's UTF-16 bounds in `text`. */
 export function identifierSpan(
   text: string,

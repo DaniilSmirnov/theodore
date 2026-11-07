@@ -326,5 +326,43 @@ async fn a_restart_clears_a_waiting_question() {
         crate::usecases::space_hooks::interrupted_patch(&space(&f, &s.id), 0, false).unwrap();
     assert_eq!(patch["question"], serde_json::Value::Null);
     assert_eq!(patch["status"], json!("failed"));
+    // The interrupted turn is news; `updated_at` moves with it for the seen mark.
+    assert_eq!(patch["attention_at"], json!(0));
+    assert_eq!(patch["updated_at"], json!(0));
+    core.space_stop(&s.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_question_is_unread_news_and_its_answer_is_not() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    let (s, run) = running(&f, &core, &project).await;
+    assert_eq!(space(&f, &s.id).attention_at, None);
+
+    f.clock.advance(1_000);
+    let asking = tokio::spawn({
+        let (core, id, run) = (core.clone(), s.id.clone(), run.clone());
+        async move { core.space_tool_ask(&id, &run, question()).await }
+    });
+    wait_until(|| space(&f, &s.id).question.is_some()).await;
+    let asked = space(&f, &s.id);
+    assert_eq!(asked.attention_at, Some(asked.updated_at));
+
+    f.clock.advance(1_000);
+    let q = asked.question.unwrap();
+    core.answer_space_question(SpaceAnswerRequest {
+        space: s.id.clone(),
+        question: q.id,
+        answers: vec![SpaceAnswerItem {
+            selected: vec!["SQLite".into()],
+            other: None,
+        }],
+    })
+    .await
+    .unwrap();
+    asking.await.unwrap().unwrap();
+    let answered = space(&f, &s.id);
+    assert_eq!(answered.attention_at, asked.attention_at);
+    assert!(answered.updated_at > asked.updated_at);
     core.space_stop(&s.id).await.unwrap();
 }

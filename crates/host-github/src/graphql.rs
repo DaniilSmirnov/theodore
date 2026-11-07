@@ -975,6 +975,7 @@ pub(crate) async fn add_review_thread_reply(
 const SEARCH_PRS_QUERY: &str = r#"
 query($q: String!, $after: String) {
   search(query: $q, type: ISSUE, first: 50, after: $after) {
+    issueCount
     pageInfo { hasNextPage endCursor }
     nodes {
       __typename
@@ -1050,11 +1051,28 @@ pub(crate) struct GqlOwner {
     pub login: String,
 }
 
-pub(crate) async fn search_prs(http: &HttpClient, query: &str) -> HostResult<Vec<GqlSearchPr>> {
+pub(crate) struct SearchedPrs {
+    pub nodes: Vec<GqlSearchPr>,
+    /// How many PRs match, as the host counts them. More than `nodes` when
+    /// the list was cut: search stops at 1000 results, and a node it can't
+    /// show (a SAML-protected repo) comes back null.
+    pub total: Option<u64>,
+}
+
+pub(crate) async fn search_prs(http: &HttpClient, query: &str) -> HostResult<SearchedPrs> {
+    #[derive(Debug, Deserialize)]
+    struct Search {
+        #[serde(rename = "issueCount", default)]
+        issue_count: Option<u64>,
+        #[serde(flatten)]
+        prs: Connection<GqlSearchPr>,
+    }
     #[derive(Debug, Deserialize)]
     struct Data {
-        search: Connection<GqlSearchPr>,
+        search: Search,
     }
+    let total = std::sync::Mutex::new(None);
+    let total_ref = &total;
     let nodes = crate::pagination::paginate_all(|after| async move {
         let data: Data = graphql(
             http,
@@ -1062,13 +1080,18 @@ pub(crate) async fn search_prs(http: &HttpClient, query: &str) -> HostResult<Vec
             json!({ "q": query, "after": after }),
         )
         .await?;
-        Ok(data.search)
+        *total_ref.lock().unwrap_or_else(|p| p.into_inner()) = data.search.issue_count;
+        Ok(data.search.prs)
     })
     .await?;
-    Ok(nodes
-        .into_iter()
-        .filter(|n| n.typename == "PullRequest")
-        .collect())
+    let total = *total.lock().unwrap_or_else(|p| p.into_inner());
+    Ok(SearchedPrs {
+        nodes: nodes
+            .into_iter()
+            .filter(|n| n.typename == "PullRequest")
+            .collect(),
+        total,
+    })
 }
 
 // ── list_repos ──────────────────────────────────────────────────────────
@@ -1318,18 +1341,22 @@ pub(crate) async fn convert_to_draft(http: &HttpClient, pull_request_id: &str) -
 const UPDATE_PULL_REQUEST_BRANCH: &str = r#"
 mutation($pullRequestId: ID!) {
   updatePullRequestBranch(input: { pullRequestId: $pullRequestId }) {
-    success
+    pullRequest { id }
   }
 }
 "#;
 
+/// `UpdatePullRequestBranchPayload` has only `clientMutationId` and
+/// `pullRequest`; a refusal (conflicts, branch already up to date with a
+/// protected base…) comes back as a GraphQL error, which `graphql` maps.
 pub(crate) async fn update_pull_request_branch(
     http: &HttpClient,
     pull_request_id: &str,
 ) -> HostResult<()> {
     #[derive(Debug, Deserialize)]
     struct Payload {
-        success: Option<bool>,
+        #[serde(rename = "pullRequest")]
+        pull_request: Option<serde_json::Value>,
     }
     #[derive(Debug, Deserialize)]
     struct Data {
@@ -1342,9 +1369,9 @@ pub(crate) async fn update_pull_request_branch(
         json!({ "pullRequestId": pull_request_id }),
     )
     .await?;
-    match data.payload.and_then(|p| p.success) {
-        Some(true) => Ok(()),
-        _ => Err(HostError::Conflict(
+    match data.payload.and_then(|p| p.pull_request) {
+        Some(_) => Ok(()),
+        None => Err(HostError::Conflict(
             "could not update the pull request branch".into(),
         )),
     }

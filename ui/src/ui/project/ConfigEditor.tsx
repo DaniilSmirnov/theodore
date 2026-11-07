@@ -1,5 +1,5 @@
 /**
- * Settings → Projects → ⟨project⟩ → Config: create the project's config
+ * Project settings → Config: create the project's config
  * from what is already set (or open the file that exists), edit it with
  * live checking and the effective-config preview, and save it to the repo
  * (a PR for a host project), your local file, or the global file

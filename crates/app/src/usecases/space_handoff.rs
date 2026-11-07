@@ -117,6 +117,11 @@ mod tests {
             failed: None,
             attachments: vec![],
             queued: None,
+            activity: vec![],
+            duration_ms: None,
+            changed_files: vec![],
+            model: None,
+            text_in_steps: false,
         }
     }
 

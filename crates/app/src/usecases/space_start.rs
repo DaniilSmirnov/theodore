@@ -36,6 +36,10 @@ pub(crate) struct StartResolution {
     /// `ship_space`'s PR body can say "Closes #<n>".
     pub issue: Option<u64>,
     pub adopt: Option<Adopted>,
+    /// What an adopted branch or PR is called until the user says more: the
+    /// PR's "#<n> <title>", or the branch's own name. A space started this
+    /// way often has no goal to title it by.
+    pub title: Option<String>,
 }
 
 impl Core {
@@ -57,12 +61,15 @@ impl Core {
                     AppError::Invalid(format!("not an issue url or number: {raw:?}"))
                 })?;
                 let issue = self.0.deps.host.get_issue(&project.repo, number).await?;
-                if req.goal.trim().is_empty() {
-                    req.goal = issue_goal(&issue);
-                }
+                // A typed note goes on top of the issue, it doesn't replace it.
+                req.goal = match req.goal.trim() {
+                    "" => issue_goal(&issue),
+                    note => format!("{note}\n\n{}", issue_goal(&issue)),
+                };
                 Ok(StartResolution {
                     issue: Some(number),
                     adopt: None,
+                    title: None,
                 })
             }
             SpaceStart::Branch(branch) => {
@@ -87,6 +94,7 @@ impl Core {
                     .map(|r| (r, None));
                 Ok(StartResolution {
                     issue: None,
+                    title: Some(branch.clone()),
                     adopt: Some(Adopted {
                         branch,
                         pr,
@@ -106,8 +114,12 @@ impl Core {
                         return Err(AppError::Invalid(format!("PR #{number} not found")));
                     }
                 };
+                // The diff and Update go against what the PR targets.
+                req.base
+                    .get_or_insert_with(|| detail.summary.base_ref.clone());
                 Ok(StartResolution {
                     issue: None,
+                    title: Some(pr_title(number, &detail.summary.title)),
                     adopt: Some(Adopted {
                         branch: detail.summary.head_ref.clone(),
                         fork_sha: detail.summary.head_sha.clone(),
@@ -118,14 +130,14 @@ impl Core {
         }
     }
 
-    /// New space's "From an issue" picker: the project's own open issues
-    /// assigned to the viewer.
+    /// New space's "From an issue" picker: the project's open issues,
+    /// the viewer's own first.
     pub async fn project_issues(&self, req: ProjectIssuesRequest) -> AppResult<Vec<SpaceIssue>> {
         let project = self
             .project_row(&req.project)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("project {}", req.project)))?;
-        let issues = self.0.deps.host.my_open_issues(&project.repo).await?;
+        let issues = self.0.deps.host.open_issues(&project.repo).await?;
         Ok(issues.into_iter().map(tracked_to_wire).collect())
     }
 }
@@ -151,6 +163,14 @@ fn issue_goal(issue: &TrackedIssue) -> String {
     out.push_str("\n\n");
     out.push_str(&issue.url);
     out
+}
+
+/// "#118 Fix the login redirect": a PR's number and title in one line.
+fn pr_title(number: u64, title: &str) -> String {
+    match title.trim() {
+        "" => format!("#{number}"),
+        t => format!("#{number} {t}"),
+    }
 }
 
 /// The issue number out of a pasted URL (`.../issues/123`, any host's
@@ -195,6 +215,7 @@ mod tests {
             title: "Fix the login redirect".into(),
             body: "It sends people to /undefined.".into(),
             url: "https://github.com/acme/widgets/issues/123".into(),
+            closed: false,
         };
         assert_eq!(
             issue_goal(&issue),
@@ -204,12 +225,19 @@ mod tests {
     }
 
     #[test]
+    fn a_pr_is_titled_by_its_number_and_title() {
+        assert_eq!(pr_title(118, " Fix login "), "#118 Fix login");
+        assert_eq!(pr_title(118, "  "), "#118");
+    }
+
+    #[test]
     fn a_bodyless_issue_skips_the_blank_paragraph() {
         let issue = TrackedIssue {
             number: 7,
             title: "Typo".into(),
             body: String::new(),
             url: "https://github.com/acme/widgets/issues/7".into(),
+            closed: false,
         };
         assert_eq!(
             issue_goal(&issue),

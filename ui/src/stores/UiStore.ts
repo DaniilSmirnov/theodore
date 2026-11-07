@@ -30,9 +30,7 @@ export type SettingsPage =
   | 'appearance'
   | 'agents'
   | 'integrations'
-  | 'projects'
-  /** Old id: languages moved into each project's settings (Projects). */
-  | 'languages'
+  /** Old id: it is the same page as `about`. */
   | 'updates'
   | 'about'
   /** Listed only in sandbox mode (`AppInfo.sandbox`). */
@@ -41,6 +39,9 @@ export type SettingsPage =
   | 'labs'
   /** Settings → Labs: switches for features in progress (`settings/labs.ts`). */
   | 'experiments';
+
+/** A project's own settings: its own menu, outside Settings. */
+export type ProjectSettingsSection = 'general' | 'languages' | 'config';
 
 export interface ContextMenuState {
   x: number;
@@ -61,6 +62,13 @@ export type Route =
    *  one isn't scoped to a PR. */
   | { name: 'skills' }
   | { name: 'settings'; page: SettingsPage }
+  /** One project's settings (a `Project::id`), reached from the workspace
+   *  switcher; its own left menu, as Settings has. */
+  | {
+      name: 'project-settings';
+      project: string;
+      section: ProjectSettingsSection;
+    }
   | { name: 'review'; pr: PrId }
   /** A blank tab: paste a PR link to turn it into a review. */
   | { name: 'new'; id: string }
@@ -75,6 +83,9 @@ export type ModalName =
   | 'assign'
   | 'cmdk'
   | 'add-project'
+  /** The projects as a plain list: drag to reorder, open one's settings,
+   *  Add project… */
+  | 'manage-projects'
   /** Theodore account sign-in (only when it's configured). */
   | 'sign-in'
   /** Help → Report a Problem…: a local zip of logs to review and attach. */
@@ -384,6 +395,15 @@ export class UiStore {
     localStorage.removeItem(wsKey(ws));
   }
 
+  /** A removed project: close its settings tabs, wherever they are open
+   *  in this workspace, so none is left pointing at it. */
+  closeProjectSettings(project: string): void {
+    for (const t of [...this.tabs]) {
+      if (t.name === 'project-settings' && t.project === project)
+        this.closeTab(t);
+    }
+  }
+
   setReviewPos(pr: PrId, pos: ReviewPos): void {
     const prev = this.reviewPos[pr];
     const same =
@@ -465,8 +485,9 @@ export class UiStore {
       let tabs = this.tabs;
       // Settings is one place: going to any of its pages reuses an open
       // Settings tab (moving it to that page) instead of opening another.
-      if (route.name === 'settings') {
-        const at = tabs.findIndex((t) => t.name === 'settings');
+      // A project's settings are the same: one tab, whichever project.
+      if (route.name === 'settings' || route.name === 'project-settings') {
+        const at = tabs.findIndex((t) => t.name === route.name);
         if (at >= 0) tabs = tabs.map((t, i) => (i === at ? route : t));
       }
       if (!tabs.some((t) => sameRoute(t, route))) {
@@ -482,9 +503,11 @@ export class UiStore {
           : tabs.map((t, i) => (i === cur ? route : t));
       }
       // Back means "where you were before this view": reviews don't count,
-      // and moving between Settings pages keeps pointing out of Settings.
+      // and moving between Settings pages (or a project's sections) keeps
+      // pointing out of Settings.
       const withinSettings =
-        this.route.name === 'settings' && route.name === 'settings';
+        this.route.name === route.name &&
+        (route.name === 'settings' || route.name === 'project-settings');
       this.back =
         this.route.name === 'review' || withinSettings ? this.back : this.route;
       this.tabs = tabs;
@@ -739,6 +762,8 @@ export function toggleTheme(): void {
 export function initialTheme(): void {
   applyTheme(themePref());
   darkQuery()?.addEventListener('change', () => {
-    if (themePref() === 'system') applyTheme('system');
+    if (themePref() !== 'system') return;
+    applyTheme('system');
+    window.dispatchEvent(new Event(THEME_EVENT));
   });
 }

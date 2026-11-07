@@ -197,3 +197,34 @@ describe('migration of the pre-workspace tab set', () => {
     expect(localStorage.getItem('theodore-tabs')).toBeNull();
   });
 });
+
+describe('an old saved Projects tab', () => {
+  it('loads without crashing, as the project’s settings', () => {
+    localStorage.setItem(
+      wsKey(WEB),
+      JSON.stringify({
+        tabs: [{ name: 'prs' }, { name: 'settings', page: 'projects' }],
+        route: { name: 'settings', page: 'projects' },
+        back: { name: 'prs' },
+      }),
+    );
+    const s = loadSnapshot(WEB)!;
+    const gone = { name: 'project-settings', project: WEB, section: 'general' };
+    expect(s.route).toEqual(gone);
+    expect(s.tabs).toEqual([{ name: 'prs' }, gone]);
+  });
+
+  it('under All it lands on Settings', () => {
+    localStorage.setItem(
+      wsKey(ALL),
+      JSON.stringify({
+        tabs: [{ name: 'settings', page: 'languages' }],
+        route: { name: 'settings', page: 'languages' },
+      }),
+    );
+    expect(loadSnapshot(ALL)!.route).toEqual({
+      name: 'settings',
+      page: 'agents',
+    });
+  });
+});

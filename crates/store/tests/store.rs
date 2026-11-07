@@ -326,6 +326,32 @@ fn outbox_respects_not_before() {
 }
 
 #[test]
+fn outbox_has_pending_matches_op_and_payload_until_taken() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let payload = json!({"pr": "p", "path": "a.rs"});
+    assert!(!store.outbox_has_pending("set_viewed", &payload).unwrap());
+    let id = store.outbox_push("set_viewed", payload.clone()).unwrap();
+    assert!(store.outbox_has_pending("set_viewed", &payload).unwrap());
+    assert!(
+        !store
+            .outbox_has_pending("set_viewed", &json!({"pr": "p", "path": "b.rs"}))
+            .unwrap()
+    );
+    assert!(!store.outbox_has_pending("react", &payload).unwrap());
+
+    store.outbox_take(0).unwrap();
+    assert!(
+        !store.outbox_has_pending("set_viewed", &payload).unwrap(),
+        "in flight: its state is already read"
+    );
+    store.outbox_retry(id, 5_000, "x").unwrap();
+    assert!(
+        store.outbox_has_pending("set_viewed", &payload).unwrap(),
+        "backing off counts as pending"
+    );
+}
+
+#[test]
 fn outbox_fail_stops_retries() {
     let store = SqliteStore::open_in_memory().unwrap();
     let id = store.outbox_push("op", json!({})).unwrap();

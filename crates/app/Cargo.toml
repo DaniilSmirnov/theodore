@@ -36,6 +36,7 @@ tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 pretty_assertions.workspace = true
+theodore-agents.workspace = true
 theodore-git.workspace = true
 theodore-store.workspace = true
 tempfile.workspace = true

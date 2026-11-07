@@ -9,7 +9,9 @@ use async_trait::async_trait;
 use theodore_contract::models;
 use theodore_domain::AgentId;
 use theodore_ports::Store;
-use theodore_ports::agent::{AgentError, AgentInfo, AgentPort, AgentRequest, AgentRun, ModelInfo};
+use theodore_ports::agent::{
+    AgentError, AgentInfo, AgentPort, AgentRequest, AgentRun, ModelInfo, Steer,
+};
 
 use crate::settings::{SCOPE_USER, pick_setting};
 
@@ -69,6 +71,19 @@ impl AgentPort for AgentDefaults {
         self.inner.run(req).await
     }
 
+    async fn run_steerable(
+        &self,
+        mut req: AgentRequest,
+    ) -> Result<(AgentRun, Option<Steer>), AgentError> {
+        if req.model.is_none() {
+            req.model = self.text(model_key(req.agent)).await;
+        }
+        if req.effort.is_none() {
+            req.effort = self.text(effort_key(req.agent)).await;
+        }
+        self.inner.run_steerable(req).await
+    }
+
     async fn models(&self, agent: AgentId) -> Vec<ModelInfo> {
         self.inner.models(agent).await
     }
@@ -118,6 +133,21 @@ mod tests {
         let port = AgentDefaults::new(agent.clone(), store);
         let _ = port.run(r).await;
         agent.last_request().expect("ran")
+    }
+
+    #[tokio::test]
+    async fn a_steerable_run_stays_steerable_and_gets_the_defaults() {
+        let store = FakeStore::new();
+        set(&store, "user", "agents.claude.model", "opus".into());
+        let agent = FakeAgent::new();
+        agent.take_steering();
+        let port = AgentDefaults::new(agent.clone(), store);
+        let (_run, steer) = port
+            .run_steerable(req(AgentId::Claude, None))
+            .await
+            .expect("runs");
+        assert!(steer.is_some(), "Send now needs the runner's handle");
+        assert_eq!(agent.last_request().unwrap().model.as_deref(), Some("opus"));
     }
 
     #[tokio::test]

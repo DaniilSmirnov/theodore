@@ -122,6 +122,17 @@ pub enum AgentEvent {
     TextDelta {
         text: String,
     },
+    /// A new text block starts: the deltas after this aren't the same
+    /// paragraph as the ones before, even with no tool between them. Only a
+    /// streaming CLI that marks its blocks sends it.
+    TextStart,
+    /// Something a subagent did (Claude Code's `parent_tool_use_id`), under
+    /// the `Task`/`Agent` call `parent` that started it. `event` is its text,
+    /// thinking, tool call or result; never part of the run's own answer.
+    Nested {
+        parent: String,
+        event: Box<AgentEvent>,
+    },
     Thinking {
         text: String,
     },
@@ -215,6 +226,76 @@ pub fn offline_message_in(text: &str) -> Option<&str> {
     let start = text.find("Couldn't reach ")?;
     let end = start + text[start..].find(OFFLINE_SUFFIX)? + OFFLINE_SUFFIX.len();
     Some(&text[start..end])
+}
+
+/// The `error.code` of a run that failed because the agent CLI isn't
+/// signed in (or its key was refused): an expected state, fixed by the
+/// user in a terminal, not a crash.
+pub const AGENT_SIGNED_OUT_CODE: &str = "agent.signed_out";
+
+/// What the CLIs say when they have no valid credentials: Codex's HTTP
+/// status line and its missing-header body, Claude Code's `/login`
+/// prompts and 401 wording, Gemini's auth-method and API-key errors.
+/// Matched case-insensitively against the error message and stderr, never
+/// against the agent's own text.
+const AUTH_FAILURE_MARKERS: &[&str] = &[
+    "unexpected status 401",
+    "401 unauthorized",
+    "missing bearer or basic authentication",
+    "api error: 401",
+    "not logged in",
+    "please run /login",
+    "invalid api key",
+    "invalid bearer token",
+    "oauth token has expired",
+    "authentication_error",
+    "failed to authenticate",
+    "unauthenticated",
+    "api key not valid",
+    "please set an auth method",
+];
+
+/// Whether an agent CLI's error output says it has no valid credentials.
+pub fn is_auth_failure(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    AUTH_FAILURE_MARKERS.iter().any(|m| text.contains(m))
+}
+
+/// The CLIs a run can fail to sign in to, as `(name, label, fix)`. The fix
+/// is the command to run in a terminal, from each CLI's own help (`claude
+/// auth login`, `codex login`). Gemini CLI has no login command: it asks
+/// for a sign-in method the first time it starts.
+const SIGN_IN: &[(&str, &str, &str)] = &[
+    ("claude", "Claude", "Run `claude auth login` in a terminal."),
+    ("codex", "Codex", "Run `codex login` in a terminal."),
+    (
+        "gemini",
+        "Gemini",
+        "Run `gemini` in a terminal and pick a sign-in method, or set GEMINI_API_KEY.",
+    ),
+];
+
+fn signed_out_text(label: &str, fix: &str) -> String {
+    format!("{label} isn't signed in. {fix}")
+}
+
+/// The message a run ends with when the agent has no valid credentials.
+/// `agent` is the CLI name (`claude`, `codex`, `gemini`).
+pub fn signed_out_message(agent: &str) -> String {
+    match SIGN_IN.iter().find(|(name, ..)| *name == agent) {
+        Some((_, label, fix)) => signed_out_text(label, fix),
+        None => "The agent isn't signed in. Sign in from its CLI in a terminal.".into(),
+    }
+}
+
+/// The `signed_out_message` inside `text`, if there is one: how a caller
+/// that only gets the run's error text (grouping) tells signed out from a
+/// crash.
+pub fn signed_out_message_in(text: &str) -> Option<String> {
+    SIGN_IN.iter().find_map(|(_, label, fix)| {
+        let m = signed_out_text(label, fix);
+        text.contains(&m).then_some(m)
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -333,6 +414,48 @@ mod tests {
         ] {
             assert!(!is_connection_failure(other), "{other}");
         }
+    }
+
+    #[test]
+    fn auth_failures_are_told_from_other_errors() {
+        for signed_out in [
+            "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: 9a1",
+            "Invalid API key · Please run /login",
+            "Not logged in · Please run /login",
+            "API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\"}}",
+            "OAuth token has expired. Please obtain a new token",
+            "Please set an Auth method in your settings.json",
+            "API key not valid. Please pass a valid API key.",
+        ] {
+            assert!(is_auth_failure(signed_out), "{signed_out}");
+        }
+        for other in [
+            "claude exited with a non-zero status",
+            "Error: getaddrinfo ENOTFOUND api.anthropic.com",
+            "No conversation found with session ID: 0000",
+            "unexpected status 500 Internal Server Error",
+        ] {
+            assert!(!is_auth_failure(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn the_signed_out_message_names_the_agent_and_its_own_command() {
+        assert_eq!(
+            signed_out_message("codex"),
+            "Codex isn't signed in. Run `codex login` in a terminal."
+        );
+        assert_eq!(
+            signed_out_message("claude"),
+            "Claude isn't signed in. Run `claude auth login` in a terminal."
+        );
+        assert!(signed_out_message("gemini").starts_with("Gemini isn't signed in. Run `gemini`"));
+        for agent in ["claude", "codex", "gemini"] {
+            let m = signed_out_message(agent);
+            let wrapped = format!("agent run failed: {m}: unexpected status 401");
+            assert_eq!(signed_out_message_in(&wrapped), Some(m), "{agent}");
+        }
+        assert_eq!(signed_out_message_in("agent run failed: boom"), None);
     }
 
     #[test]

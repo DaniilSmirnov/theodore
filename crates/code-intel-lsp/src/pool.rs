@@ -233,6 +233,13 @@ impl LspPool {
             .filter(|s| matches!(s.state(), ServerState::Warming | ServerState::Ready))
     }
 
+    /// A new session would not have to push out a running one.
+    pub async fn has_room(&self) -> bool {
+        let mut slots = self.inner.slots.lock().await;
+        slots.reap_failed();
+        slots.map.len() < self.inner.max_servers
+    }
+
     /// A worktree closed: it leaves shared sessions, its own sessions shut
     /// down, and its crash record is forgotten.
     pub async fn release_root(&self, root: &Path) {

@@ -24,14 +24,12 @@ pub(crate) fn language_of(manifest: Manifest, only: Option<HashSet<LanguageId>>)
     })
 }
 
-/// A code language code intelligence knows something about: it has a
-/// grammar or a server in the manifest, and is not `prose` (Markdown, JSON,
-/// YAML, TOML). The text fallback leaves the rest out, and notes do not
-/// mention them.
+/// A code language: in the manifest and not `prose` (Markdown, JSON, YAML,
+/// TOML, HTML). A grammar or a server is not required: a language with
+/// neither (Scala, Dockerfile, SQL) is still code, and the text fallback
+/// searches its files.
 pub(crate) fn is_code(manifest: &Manifest, language: &LanguageId) -> bool {
-    manifest
-        .language(language)
-        .is_some_and(|l| !l.prose && (l.grammar.is_some() || !l.servers.is_empty()))
+    manifest.language(language).is_some_and(|l| !l.prose)
 }
 
 pub(crate) struct Ws {
@@ -39,13 +37,16 @@ pub(crate) struct Ws {
     pub repo_key: String,
     pub trust: TrustMode,
     /// `Workspace::lsp`: this workspace's own policy, over the default.
-    pub lsp: Option<LspPolicy>,
+    pub lsp: Mutex<Option<LspPolicy>>,
     /// `Workspace::languages` as given (empty: detected).
     pub requested: Vec<LanguageId>,
     pub pool_key: String,
     pub language_of: LanguageOf,
     pub index: WorkspaceIndex,
     pub servers: Mutex<BTreeMap<LanguageId, ServerPlan>>,
+    /// What `git status` listed at the last name question: a path gone
+    /// from it since (deleted, reverted) is read again too.
+    pub dirty: Mutex<HashSet<String>>,
     /// Background work (mention scans), aborted on close.
     pub tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -162,4 +163,23 @@ impl Gap {
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn code_is_known_and_not_prose() {
+        let m = Manifest::builtin();
+        let code = |id: &str| is_code(&m, &LanguageId::new(id));
+        // With a grammar or a server, and with neither (text-only).
+        for id in ["rust", "php", "scala", "dockerfile", "sql", "css", "bash"] {
+            assert!(code(id), "{id}");
+        }
+        // Prose, and not a language at all.
+        for id in ["markdown", "json", "yaml", "toml", "html", "nope"] {
+            assert!(!code(id), "{id}");
+        }
+    }
 }

@@ -1,5 +1,6 @@
 //! What a running agent shows in the window while it works: its answer as
-//! `Ephemeral::AgentDelta`, its tool calls as `Ephemeral::RunLog`. One
+//! `Ephemeral::AgentDelta`, its tool calls and thinking as `Ephemeral::RunLog`
+//! (a `thinking: ` line stays out of the UI's tool log). One
 //! mapping for every run (chat asks, skills, space turns, fix tasks), so a
 //! runner that streams its text (`AgentRequest::stream_text`) streams it
 //! everywhere, and none shows a message twice.
@@ -14,13 +15,31 @@
 //! Text "Hello"     ──▶ (nothing)            shown  "Hello"
 //! Text "Next."     ──▶ AgentDelta "Next."   no pieces came: shown whole
 //! ```
+//!
+//! The timeline reads its rows from their own events, the same data a reply
+//! stores (`turn_steps`). The tool log (`RunLog`, the AI panel's) stays one
+//! line per call:
+//!
+//! ```text
+//! TextStart          ──▶ RunTextBreak       the next delta is a new row
+//! ToolCall t1        ──▶ RunLog  RunStep    a row, with its id
+//! ToolResult t1      ──▶ RunLog  RunStepDone marks t1, whatever ran since
+//! Thinking           ──▶ RunStep
+//! Nested { Text }    ──▶ RunStep            under its Agent call
+//! Nested { ToolCall }──▶ RunLog  RunStep    under its Agent call
+//! ```
 
-use theodore_contract::Ephemeral;
+use std::collections::{HashMap, HashSet};
+
+use theodore_contract::{Ephemeral, TurnStep};
 use theodore_domain::AgentId;
 use theodore_ports::AgentEvent;
 
 use crate::core::Core;
-use crate::usecases::agents::tool_log_line_with;
+use crate::usecases::agents::{tool_label, tool_log_line_with};
+use crate::usecases::turn_steps::{
+    THINKING_MAX, call_step, capped, handback, launched_in_background, result_summary,
+};
 
 /// One run's live view: maps its `AgentEvent`s to the `Ephemeral`s the UI
 /// shows under `run`.
@@ -32,6 +51,10 @@ pub(crate) struct LiveRun {
     thinking: bool,
     /// What deltas showed that no `Text` has accounted for yet.
     streamed: String,
+    /// A call's label by its id, for what its result says.
+    tools: HashMap<String, String>,
+    /// Handback calls: no row, so their results mark nothing.
+    hidden: HashSet<String>,
 }
 
 impl LiveRun {
@@ -41,6 +64,8 @@ impl LiveRun {
             agent,
             thinking: false,
             streamed: String::new(),
+            tools: HashMap::new(),
+            hidden: HashSet::new(),
         }
     }
 
@@ -63,14 +88,23 @@ impl LiveRun {
                 self.streamed.push_str(text);
                 vec![self.text(text.clone())]
             }
-            AgentEvent::Text { text } => {
-                self.whole(text).map(|t| self.text(t)).into_iter().collect()
-            }
+            AgentEvent::TextStart => vec![self.text_break()],
+            AgentEvent::Text { text } => match self.whole(text) {
+                // A block no pieces came for is its own, marked or not.
+                Some((t, true)) => vec![self.text_break(), self.text(t)],
+                Some((t, false)) => vec![self.text(t)],
+                None => vec![],
+            },
+            AgentEvent::Nested { parent, event } => self.nested(parent, event),
             AgentEvent::Thinking { text } if self.thinking => vec![self.text(text.clone())],
-            AgentEvent::ToolCall { name, input, .. } => {
-                vec![self.log(tool_log_line_with(name, input))]
+            AgentEvent::Thinking { text } if !text.trim().is_empty() => {
+                vec![self.step(TurnStep::Thinking {
+                    text: capped(text.trim(), THINKING_MAX),
+                    parent: None,
+                })]
             }
-            AgentEvent::ToolResult { ok, .. } => vec![self.log(format!("tool result ok={ok}"))],
+            AgentEvent::ToolCall { id, name, input } => self.call(id, None, name, input),
+            AgentEvent::ToolResult { id, ok, output } => self.result(id, *ok, output),
             AgentEvent::Stalled => vec![
                 self.log("stalled".into()),
                 Ephemeral::RunStalled {
@@ -87,15 +121,83 @@ impl LiveRun {
         }
     }
 
-    /// The part of a whole message the deltas didn't show. Deltas cover
-    /// the start of it, all of it, or it and the next block of the same
-    /// message: only the rest is new. A message that matches them but for
-    /// surrounding whitespace is the same one; anything else is a message
-    /// they weren't about, shown whole.
-    fn whole(&mut self, text: &str) -> Option<String> {
+    /// A subagent's: a row under its call, never the run's own text.
+    fn nested(&mut self, parent: &str, event: &AgentEvent) -> Vec<Ephemeral> {
+        match event {
+            AgentEvent::Text { text } if !text.trim().is_empty() => {
+                vec![self.step(TurnStep::Text {
+                    text: capped(text.trim(), THINKING_MAX),
+                    parent: Some(parent.to_string()),
+                })]
+            }
+            AgentEvent::Thinking { text } if !text.trim().is_empty() => {
+                vec![self.step(TurnStep::Thinking {
+                    text: capped(text.trim(), THINKING_MAX),
+                    parent: Some(parent.to_string()),
+                })]
+            }
+            AgentEvent::ToolCall { id, name, input } => self.call(id, Some(parent), name, input),
+            AgentEvent::ToolResult { id, ok, output } => self.result(id, *ok, output),
+            _ => vec![],
+        }
+    }
+
+    fn call(
+        &mut self,
+        id: &str,
+        parent: Option<&str>,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Vec<Ephemeral> {
+        if let Some(report) = handback(name, input) {
+            self.hidden.insert(id.to_string());
+            return match (parent, report) {
+                (Some(of), Some(report)) => vec![Ephemeral::RunStepDone {
+                    run: self.run.clone(),
+                    id: of.to_string(),
+                    ok: None,
+                    summary: Some(report),
+                    background: false,
+                }],
+                _ => vec![],
+            };
+        }
+        self.tools
+            .insert(id.to_string(), tool_label(name).to_string());
+        vec![
+            self.log(tool_log_line_with(name, input)),
+            self.step(call_step(id, parent, name, input)),
+        ]
+    }
+
+    fn result(&mut self, id: &str, ok: bool, output: &str) -> Vec<Ephemeral> {
+        if self.hidden.contains(id) {
+            return vec![];
+        }
+        let tool = self.tools.get(id);
+        let summary = tool.and_then(|t| result_summary(t, output));
+        let background = tool.is_some_and(|t| launched_in_background(t, output));
+        vec![
+            self.log(format!("tool result ok={ok}")),
+            Ephemeral::RunStepDone {
+                run: self.run.clone(),
+                id: id.to_string(),
+                ok: Some(ok),
+                summary,
+                background,
+            },
+        ]
+    }
+
+    /// The part of a whole message the deltas didn't show, and whether it is
+    /// a block of its own. Deltas cover the start of it, all of it, or it and
+    /// the next block of the same message: only the rest is new. A message
+    /// that matches them but for surrounding whitespace is the same one;
+    /// anything else is a message they weren't about, shown whole.
+    fn whole(&mut self, text: &str) -> Option<(String, bool)> {
         if self.streamed.trim().is_empty() {
             self.streamed.clear();
-            return (!text.is_empty()).then(|| text.to_string());
+            return (!text.is_empty()).then(|| (text.to_string(), true));
         }
         if let Some(rest) = self.streamed.strip_prefix(text) {
             self.streamed = rest.to_string();
@@ -103,9 +205,9 @@ impl LiveRun {
         }
         let streamed = std::mem::take(&mut self.streamed);
         if let Some(rest) = text.strip_prefix(streamed.as_str()) {
-            return (!rest.is_empty()).then(|| rest.to_string());
+            return (!rest.is_empty()).then(|| (rest.to_string(), false));
         }
-        (text.trim() != streamed.trim()).then(|| text.to_string())
+        (text.trim() != streamed.trim()).then(|| (text.to_string(), true))
     }
 
     fn text(&self, text: String) -> Ephemeral {
@@ -113,6 +215,19 @@ impl LiveRun {
             run: self.run.clone(),
             agent: self.agent,
             text,
+        }
+    }
+
+    fn text_break(&self) -> Ephemeral {
+        Ephemeral::RunTextBreak {
+            run: self.run.clone(),
+        }
+    }
+
+    fn step(&self, step: TurnStep) -> Ephemeral {
+        Ephemeral::RunStep {
+            run: self.run.clone(),
+            step,
         }
     }
 
@@ -253,6 +368,169 @@ mod tests {
         let events = [thinking("hmm"), delta("Hi"), text("Hi")];
         assert_eq!(shown(&mut live(), &events).0, "Hi");
         assert_eq!(shown(&mut live().with_thinking(), &events).0, "hmmHi");
+    }
+
+    #[test]
+    fn thinking_is_a_step_unless_it_shows_as_text_and_never_in_the_log() {
+        let events = [thinking(" hmm "), thinking("  ")];
+        let mut l = live();
+        let out: Vec<_> = events.iter().flat_map(|e| l.map(e)).collect();
+        assert_eq!(
+            out,
+            vec![Ephemeral::RunStep {
+                run: "r1".into(),
+                step: TurnStep::Thinking {
+                    text: "hmm".into(),
+                    parent: None,
+                },
+            }]
+        );
+        assert!(shown(&mut live().with_thinking(), &events).1.is_empty());
+    }
+
+    #[test]
+    fn a_block_start_breaks_the_text_and_the_text_stays_as_it_was() {
+        let mut l = live();
+        let out: Vec<_> = [
+            AgentEvent::TextStart,
+            delta("A"),
+            text("A"),
+            AgentEvent::TextStart,
+            delta("B"),
+        ]
+        .iter()
+        .flat_map(|e| l.map(e))
+        .collect();
+        let breaks = out
+            .iter()
+            .filter(|e| matches!(e, Ephemeral::RunTextBreak { .. }))
+            .count();
+        assert_eq!(breaks, 2);
+        assert!(matches!(out[0], Ephemeral::RunTextBreak { .. }));
+        assert!(matches!(out[2], Ephemeral::RunTextBreak { .. }));
+    }
+
+    /// A CLI that only sends whole blocks needs no marks: each is its own row.
+    #[test]
+    fn a_whole_block_no_pieces_came_for_starts_its_own_row() {
+        let mut l = live();
+        let out = l.map(&text("One."));
+        assert!(matches!(out[0], Ephemeral::RunTextBreak { .. }));
+        assert!(matches!(&out[1], Ephemeral::AgentDelta { text, .. } if text == "One."));
+    }
+
+    /// Parallel calls: a result marks its own call by id, whichever came last.
+    #[test]
+    fn a_result_names_its_own_call_with_what_it_found() {
+        let mut l = live();
+        let read = AgentEvent::ToolCall {
+            id: "r".into(),
+            name: "Read".into(),
+            input: serde_json::json!({ "file_path": "a.rs" }),
+        };
+        l.map(&read);
+        l.map(&tool("Bash"));
+        let out = l.map(&AgentEvent::ToolResult {
+            id: "r".into(),
+            ok: true,
+            output: "1\tx\n2\ty\n".into(),
+        });
+        assert_eq!(
+            out[1],
+            Ephemeral::RunStepDone {
+                run: "r1".into(),
+                id: "r".into(),
+                ok: Some(true),
+                summary: Some("2 lines".into()),
+                background: false,
+            }
+        );
+    }
+
+    /// The AI panel's log reads a subagent's call as it always did; the
+    /// timeline gets it under its parent, and its text stays out of the answer.
+    #[test]
+    fn a_subagents_steps_are_rows_under_their_parent() {
+        let nested = |event| AgentEvent::Nested {
+            parent: "ag".into(),
+            event: Box::new(event),
+        };
+        let mut l = live();
+        let out = l.map(&nested(tool("Read")));
+        assert!(
+            matches!(&out[0], Ephemeral::RunLog { line, .. } if line == "tool: Read · src/lib.rs")
+        );
+        assert!(matches!(
+            &out[1],
+            Ephemeral::RunStep { step: TurnStep::Tool { parent: Some(p), .. }, .. } if p == "ag"
+        ));
+        let out = l.map(&nested(text("Found it.")));
+        assert!(matches!(
+            out.as_slice(),
+            [Ephemeral::RunStep {
+                step: TurnStep::Text {
+                    parent: Some(_),
+                    ..
+                },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn a_handback_is_no_row_and_tells_its_agents_row() {
+        let mut l = live();
+        let out = l.map(&AgentEvent::Nested {
+            parent: "ag".into(),
+            event: Box::new(AgentEvent::ToolCall {
+                id: "h".into(),
+                name: "SubagentHandback".into(),
+                input: serde_json::json!({ "message": "All fine." }),
+            }),
+        });
+        assert_eq!(
+            out,
+            vec![Ephemeral::RunStepDone {
+                run: "r1".into(),
+                id: "ag".into(),
+                ok: None,
+                summary: Some("All fine.".into()),
+                background: false,
+            }]
+        );
+        let out = l.map(&AgentEvent::ToolResult {
+            id: "h".into(),
+            ok: true,
+            output: "{}".into(),
+        });
+        assert!(out.is_empty());
+    }
+
+    /// The launch note is the CLI's plumbing: it says a subagent runs in the
+    /// background, and no text of it reaches the row.
+    #[test]
+    fn a_background_launch_is_marked_and_says_nothing() {
+        let mut l = live();
+        l.map(&AgentEvent::ToolCall {
+            id: "ag".into(),
+            name: "Agent".into(),
+            input: serde_json::json!({ "description": "Read it", "run_in_background": true }),
+        });
+        let out = l.map(&AgentEvent::ToolResult {
+            id: "ag".into(),
+            ok: true,
+            output: "Async agent launched successfully.\nagentId: a1\n(This tool result is intended for the agent.)".into(),
+        });
+        assert_eq!(
+            out[1],
+            Ephemeral::RunStepDone {
+                run: "r1".into(),
+                id: "ag".into(),
+                ok: Some(true),
+                summary: None,
+                background: true,
+            }
+        );
     }
 
     #[test]

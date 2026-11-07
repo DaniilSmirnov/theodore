@@ -126,6 +126,22 @@ export const COL: Record<RowProp, string> = {
   age: '40px',
 };
 
+/** The number column with the repo name in front: room for a typical
+ *  name before it truncates (the full slug is in its tooltip). */
+const ID_WITH_REPO = '160px';
+
+/** A row's grid columns: pick box, status, number, title, the rest. */
+export function rowColumns(props: readonly RowProp[], repo: boolean): string {
+  const on = (k: RowProp) => props.includes(k);
+  return [
+    '16px',
+    '16px',
+    ...(on('id') ? [repo ? ID_WITH_REPO : COL.id] : []),
+    'minmax(200px,1.5fr)',
+    ...ROW_PROPS.filter((k) => k !== 'id' && on(k)).map((k) => COL[k]),
+  ].join(' ');
+}
+
 export interface Display {
   groupBy: 'section' | 'status' | 'repo' | 'none';
   sort: 'activity' | 'size';
@@ -314,13 +330,7 @@ export const PrRow = observer(function PrRow({
   });
   if (!p) return null;
   const on = (k: RowProp) => props.includes(k);
-  const cols = [
-    '16px',
-    '16px',
-    ...(on('id') ? [COL.id] : []),
-    'minmax(200px,1.5fr)',
-    ...ROW_PROPS.filter((k) => k !== 'id' && on(k)).map((k) => COL[k]),
-  ].join(' ');
+  const cols = rowColumns(props, repo);
   return (
     <div
       id={`R-${id}`}
@@ -350,7 +360,7 @@ export const PrRow = observer(function PrRow({
       <PrStatusIcon summary={p} progress={readProgress(store, id)} />
       {on('id') && (
         <span
-          className="flex min-w-0 max-w-36 whitespace-nowrap text-xs tabular-nums text-muted"
+          className="flex min-w-0 whitespace-nowrap text-xs tabular-nums text-muted"
           title={
             p.url
               ? `${p.pr.repo.owner}/${p.pr.repo.name} #${p.pr.number}`
@@ -919,8 +929,34 @@ function ListBody({
 const order = (groups: { items: InboxPr[] }[]) =>
   groups.flatMap((g) => g.items.map((p) => p.id));
 
+/** Where the selection goes when the list changes under it, `null` to keep
+ *  it. The selected PR leaving what's waiting (done, snoozed) moves it to
+ *  the row that took its place; a snoozed or done row you picked yourself
+ *  keeps it, so its Peek shows. */
+export function followSelection({
+  sel,
+  prev,
+  order,
+  shown,
+  lastIndex,
+}: {
+  sel: PrId | null;
+  /** The selection last time, and whether it was waiting then. */
+  prev: { sel: PrId | null; inOrder: boolean };
+  /** What's waiting, in order: J/K's rows. */
+  order: PrId[];
+  /** Every row on screen, snoozed and done ones too. */
+  shown: PrId[];
+  lastIndex: number;
+}): PrId | null {
+  if (sel && order.includes(sel)) return null;
+  const left = !!sel && sel === prev.sel && prev.inOrder;
+  if (sel && !left && shown.includes(sel)) return null;
+  return order.length ? order[Math.min(lastIndex, order.length - 1)]! : null;
+}
+
 /** Linear-style single-key verbs for the list. */
-function useListKeys(order: PrId[]) {
+function useListKeys(order: PrId[], shown: PrId[]) {
   const store = useRootStore();
   const ui = useUi();
   useViewKeys(
@@ -972,13 +1008,25 @@ function useListKeys(order: PrId[]) {
   // When the selected PR leaves the list (done, snoozed), select the one
   // that took its place — not the top of the list.
   const lastIndex = useRef(0);
+  const prev = useRef<{ sel: PrId | null; inOrder: boolean }>({
+    sel: null,
+    inOrder: false,
+  });
   useEffect(() => {
-    if (ui.selected && order.includes(ui.selected)) {
+    const next = followSelection({
+      sel: ui.selected,
+      prev: prev.current,
+      order,
+      shown,
+      lastIndex: lastIndex.current,
+    });
+    prev.current = {
+      sel: ui.selected,
+      inOrder: !!ui.selected && order.includes(ui.selected),
+    };
+    if (ui.selected && order.includes(ui.selected))
       lastIndex.current = order.indexOf(ui.selected);
-      return;
-    }
-    if (order.length)
-      ui.select(order[Math.min(lastIndex.current, order.length - 1)]!);
+    if (next) ui.select(next);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [order.join(), ui.selected]);
 
@@ -1054,6 +1102,7 @@ export const Inbox = observer(function Inbox() {
   // done leaves the selection, which moves on to the next one.
   useListKeys(
     order(visibleGroups.filter((g) => g.id !== 'snoozed' && g.id !== 'done')),
+    order(visibleGroups),
   );
 
   return (

@@ -17,6 +17,10 @@ import { PullRequests } from './PullRequests';
 import { Review } from './Review';
 import { Sidebar } from './Sidebar';
 import { SettingsNav, SettingsPage } from './Settings';
+import {
+  ProjectSettingsNav,
+  ProjectSettingsPage,
+} from './project/ProjectSettings';
 import { SkillsPage } from './Skills';
 import { TabBar } from './TabBar';
 import { Tasks } from './Tasks';
@@ -25,7 +29,7 @@ import { SignInGate } from './AccountCard';
 import { UpdateReady } from './shell/UpdateReady';
 import { SharingPrompt } from './SharingPrompt';
 import { appView } from '../core/accountGate';
-import { StatusBanners } from './shell/StatusBanners';
+import { StatusBanners, statusKind } from './shell/StatusBanners';
 import { showToast } from './shell/toasts';
 import { isBuildMode } from './space/mode';
 import { isHostOn } from './settings/labs';
@@ -163,16 +167,25 @@ export const App = observer(function App() {
       onContextMenu={onContextMenu}
     >
       <div className="flex min-h-0 flex-1">
-        {/* Settings always shows its own sections: with the sidebar
-            collapsed there'd be no way between its pages. */}
+        {/* Settings (and a project's settings) always show their own
+            sections: with the sidebar collapsed there'd be no way between
+            its pages. */}
         {r.name === 'settings' ? (
           <SettingsNav page={r.page} />
+        ) : r.name === 'project-settings' ? (
+          <ProjectSettingsNav project={r.project} section={r.section} />
         ) : (
           ui.sidebar && <Sidebar />
         )}
         <Surface className="relative flex min-w-0 flex-1 flex-col rounded-none">
           {/* Settings shows its own nav in the sidebar's place. */}
-          <TabBar showOpen={!ui.sidebar && r.name !== 'settings'} />
+          <TabBar
+            showOpen={
+              !ui.sidebar &&
+              r.name !== 'settings' &&
+              r.name !== 'project-settings'
+            }
+          />
           <div className="flex min-h-0 flex-1">
             {r.name === 'inbox' ? (
               <Inbox />
@@ -186,6 +199,8 @@ export const App = observer(function App() {
               <SkillsPage />
             ) : r.name === 'settings' ? (
               <SettingsPage page={r.page} />
+            ) : r.name === 'project-settings' ? (
+              <ProjectSettingsPage project={r.project} section={r.section} />
             ) : r.name === 'new' ? (
               <NewTab key={r.id} route={r} />
             ) : r.name === 'space' ? (
@@ -197,11 +212,21 @@ export const App = observer(function App() {
               <Review key={r.pr} pr={r.pr} />
             )}
           </div>
-          {/* Floats above the hint bar: a banner appearing or clearing
-              never moves the page, and never covers the header. */}
+          {/* What is broken gets a strip of its own under the page, so it
+              never sits over the page's content or its footer. */}
+          {statusKind(
+            store.sync.status,
+            store.ephemeral.hostStatus,
+            Date.now(),
+          ) !== null && (
+            <div className="status-strip flex shrink-0 justify-center border-t border-separator px-4 py-1.5">
+              <StatusBanners />
+            </div>
+          )}
+          {/* The update prompt floats above the hint bar: appearing or
+              clearing never moves the page, nor covers the header. */}
           <div className="pointer-events-none absolute inset-x-0 bottom-14 z-30 flex flex-col items-center gap-2 px-4 [&>*]:pointer-events-auto">
             <UpdateReady inline />
-            <StatusBanners />
           </div>
         </Surface>
       </div>

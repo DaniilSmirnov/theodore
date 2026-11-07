@@ -140,6 +140,70 @@ fn squash(head: &Sha, parent: &Sha, message: &str) -> SpaceCommit {
     }
 }
 
+/// A branch adopted behind its base, never merged with it: shipping it must
+/// not name the base as a parent, or the host shows the base's newer work
+/// as removed by this branch.
+#[tokio::test]
+async fn a_branch_behind_its_base_ships_without_the_base_as_a_parent() {
+    let h = host().await;
+    let fork = h.base.clone();
+
+    // main moves on with a file the adopted branch doesn't have.
+    let clone = h._tmp.path().join("other");
+    git(
+        h._tmp.path(),
+        &["clone", "-q", h.bare.to_str().unwrap(), "other"],
+    );
+    std::fs::write(clone.join("from-main.txt"), "newer\n").unwrap();
+    commit_all(&clone, "main moves on");
+    git(&clone, &["push", "-q", "origin", "main"]);
+    git(&h.cache, &["fetch", "-q", "origin", "main:main"]);
+    let base = h.git.resolve_ref(&h.cache, "main").await.unwrap();
+    assert_ne!(base, fork);
+
+    let wt = h.git.space_worktree(&h.cache, "s1", &fork).await.unwrap();
+    std::fs::write(wt.path.join("c.txt"), "new\n").unwrap();
+    let head = h
+        .git
+        .space_checkpoint(&wt.path, "s1", "turn 1")
+        .await
+        .unwrap()
+        .sha;
+
+    let sha = h
+        .git
+        .space_commit(
+            &h.cache,
+            "s1",
+            &SpaceCommit {
+                merge_parent: Some(base.clone()),
+                ..squash(&head, &fork, "the turn")
+            },
+        )
+        .await
+        .unwrap();
+
+    let parents = git(
+        &h.cache,
+        &["rev-list", "--parents", "-n", "1", sha.as_str()],
+    );
+    assert_eq!(
+        parents.split_whitespace().skip(1).collect::<Vec<_>>(),
+        vec![fork.as_str()],
+        "only its fork point: the head never merged the base"
+    );
+    let removed = git(
+        &h.cache,
+        &[
+            "diff",
+            "--name-only",
+            "--diff-filter=D",
+            &format!("{}...{}", base.as_str(), sha.as_str()),
+        ],
+    );
+    assert_eq!(removed, "", "the base's work isn't removed");
+}
+
 #[tokio::test]
 async fn checkpoints_squash_into_one_commit_by_the_user() {
     let h = host().await;

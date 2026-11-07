@@ -1,5 +1,7 @@
 import { stripHtmlComments } from '../highlight';
 import {
+  memo,
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -51,6 +53,7 @@ import {
   ask,
   askAboutLine,
   askPending,
+  chatAgentGuess,
   askRunId,
   cancelRun,
   commitSuggestions,
@@ -65,12 +68,13 @@ import {
   runSkill,
 } from '../actions';
 import { useRootStore, useUi } from '../stores/context';
-import type { LineAsk } from '../stores/EphemeralStore';
+import type { ChatPending, LineAsk } from '../stores/EphemeralStore';
+import type { RootStore } from '../stores/RootStore';
 import { Md, rich } from '../highlight';
 import { latinKey } from './keys';
 import { useContextMenu, type ContextMenuItem } from './ContextMenu';
 import { ago } from './List';
-import { AgentMenu } from './AgentMenu';
+import { SkillAgentsMenu } from './SkillAgentsMenu';
 import { matchSkills } from './SkillMenu';
 import { useAttachments } from './attachments';
 import {
@@ -78,9 +82,12 @@ import {
   ChatLive,
   ChatLog,
   ChatMessage as ChatMessageView,
+  mixedAgents,
   UserBubble,
 } from './ChatTurn';
-import { Composer } from './space/Composer';
+import { AgentChip, Composer } from './space/Composer';
+import { estimateRowHeight, groupTurns } from './space/chatTurns';
+import { VirtualChat, type VirtualChatControl } from './space/VirtualChat';
 import { AgentTag, Avatar, Btn, Sev, Spinner } from './bits';
 import { PatchView } from './Patch';
 import { isAgentEnabled } from './Settings';
@@ -183,12 +190,12 @@ const LineAskBubble = observer(function LineAskBubble({
   askKey,
   a,
   asked,
-  follow,
+  tagged,
 }: {
   askKey: string;
   a: LineAsk;
   asked: boolean;
-  follow: RefObject<HTMLDivElement | null>;
+  tagged: boolean;
 }) {
   const store = useRootStore();
   return (
@@ -199,8 +206,8 @@ const LineAskBubble = observer(function LineAskBubble({
       <ChatLive
         run={a.message ? askRunId(a.message) : null}
         agent={a.agent}
+        tagged={tagged}
         badges={<Ref a={a.anchor} pr={a.pr} />}
-        follow={follow}
         className="line-ask"
         data={{ 'data-line-ask': askKey }}
         onRetry={() => {
@@ -607,19 +614,6 @@ export function hiddenFindingsNote(
     : null;
 }
 
-/** Finds the user's question right before an agent's reply, for "Ask again". */
-export function priorQuestion(
-  messages: ChatMessage[],
-  reply: ChatMessage,
-): string {
-  const i = messages.findIndex((m) => m.id === reply.id);
-  for (let j = i - 1; j >= 0; j--) {
-    const m = messages[j]!;
-    if (m.author.kind === 'me') return m.text;
-  }
-  return '';
-}
-
 /** The message id behind a chat question's run (`askRunId`'s inverse). */
 const askMessageOf = (run: string) => run.replace(/^ask:/, '');
 
@@ -634,24 +628,109 @@ export function newestRun<T extends { at: number }>(runs: T[]): T | null {
   return runs.reduce<T | null>((a, b) => (!a || b.at >= a.at ? b : a), null);
 }
 
-const Chat = observer(function Chat({ pr }: { pr: PrId }) {
+/** What the AI panel's log shows of one thing that happened: a skill run
+ *  (it reads its own state), or a message with the question it answers. */
+export type AiItem =
+  | { kind: 'run'; id: string }
+  | { kind: 'message'; m: ChatMessage; question: string };
+
+/** One row of the panel: a turn (your question and what came of it), or the
+ *  tail with the answer still being written. */
+export type AiRow =
+  | { kind: 'turn'; key: string; items: AiItem[] }
+  | { kind: 'tail'; key: 'tail' };
+
+/** The conversation as turns, oldest first: each of your messages, or a
+ *  skill run, starts one, and the replies under it stay in it. An agent
+ *  message carries the last question of yours before it, for "Ask again". */
+export function aiTurns(
+  runs: readonly SkillRun[],
+  messages: readonly ChatMessage[],
+): { key: string; items: AiItem[] }[] {
+  let asked = '';
+  const feed = feedOf(runs, messages).map((f): AiItem => {
+    if (f.kind === 'run') return { kind: 'run', id: f.run.id };
+    const mine = f.message.author.kind === 'me';
+    const question = asked;
+    if (mine) asked = f.message.text;
+    return { kind: 'message', m: f.message, question: mine ? '' : question };
+  });
+  return groupTurns(
+    feed,
+    (i) => i.kind === 'run' || i.m.author.kind === 'me',
+    (i) => (i.kind === 'run' ? i.id : i.m.id),
+  );
+}
+
+/** A skill run's room before it was measured: its log and findings. */
+const RUN_HEIGHT = 240;
+
+function estimateAiRow(row: AiRow): number {
+  if (row.kind === 'tail') return 120;
+  const messages = row.items.flatMap((i) =>
+    i.kind === 'message' ? [i.m] : [],
+  );
+  const runs = row.items.length - messages.length;
+  const base = estimateRowHeight({
+    kind: 'turn',
+    key: row.key,
+    messages,
+    live: false,
+  });
+  return base + runs * RUN_HEIGHT;
+}
+
+const isTail = (row: AiRow) => row.kind === 'tail';
+
+/** The ask still going: whether it still shows, and what the log has of it. */
+function pendingView(store: RootStore, pr: PrId) {
+  const messages = store.models.chatMessages.byPr(pr);
+  // The composer's plain send and the hunk header's "Ask agent" (DiffPane)
+  // share this pending bubble via the store — `askPending` sets it,
+  // watches for the reply, and clears it once the real message lands.
+  const pending = store.ephemeral.chatPending.get(pr) ?? null;
+  // Once an agent message lands after the ask, the pending bubble has
+  // nothing left to show: hidden in that same render (never both at once
+  // for a frame); `askPending`'s reaction then clears it from the store.
+  const answered =
+    pending != null &&
+    messages.some((m) => m.author.kind !== 'me' && m.at >= pending.startedAt);
+  const lineAsks = [...store.ephemeral.lineAsks.entries()].filter(
+    ([, a]) => a.pr === pr && a.status === 'asking',
+  );
+  const stored = (id: string | null) =>
+    id != null && messages.some((m) => m.id === id);
+  return { pending, answered, lineAsks, stored };
+}
+
+/** Ends the pending question: cancels its run, takes its bubble away. */
+function stopPendingAsk(store: RootStore, pr: PrId, pending: ChatPending) {
+  void cancelRun(store, pending.run).catch(() => {});
+  store.ephemeral.clearChatPending(pr);
+}
+
+/** The AI panel: the log of turns above, the composer under it. The two are
+ *  siblings: what you type re-renders the composer, never the turns. */
+function Chat({ pr }: { pr: PrId }) {
   const store = useRootStore();
-  const [text, setText] = useState('');
-  const files = useAttachments();
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [skillAgents, setSkillAgents] = useState<AgentId[]>(AGENTS);
   const [installed, setInstalled] = useState<AgentId[] | null>(null);
   // Default to the agents actually installed on this machine, minus any the
   // user has disabled (plan "enable/disable agents": hidden from the chat
-  // picker, skipped for skills).
+  // chip, skipped for skills). The first one is the agent the panel talks
+  // to; the rest are the others skills also run on.
   useEffect(() => {
     let live = true;
     void api
       .detectAgents()
       .then((all) => {
+        // The `agents.chat` agent leads: the chip shows it, questions go to it.
+        const first = chatAgentGuess(store);
         const ids = all
           .filter((a) => a.installed && isAgentEnabled(store, a.id))
-          .map((a) => a.id);
+          .map((a) => a.id)
+          .sort((a, b) => Number(b === first) - Number(a === first));
         if (!live) return;
         setInstalled(ids);
         if (ids.length > 0) setSkillAgents(ids);
@@ -662,49 +741,366 @@ const Chat = observer(function Chat({ pr }: { pr: PrId }) {
     };
   }, [store]);
   const [managing, setManaging] = useState(false);
-  const inputRef = useRef<HTMLTextAreaElement>(null);
-  // The composer's plain send and the hunk header's "Ask agent" (DiffPane)
-  // share this pending bubble via the store — `askPending` sets it,
-  // watches for the reply, and clears it once the real message lands.
-  const pending = store.ephemeral.chatPending.get(pr) ?? null;
-  const end = useRef<HTMLDivElement>(null);
-  const messages = [...store.models.chatMessages.byPr(pr)].sort(
-    (a, b) => a.at - b.at,
-  );
-  const runs = store.models.skillRuns.byPr(pr);
-  useEffect(() => {
-    end.current?.scrollIntoView({ block: 'end' });
-  }, [messages.length, runs.length, pending]);
   useEffect(() => {
     void api
       .listSkills(pr)
       .then(setSkills)
       .catch(() => setSkills([]));
   }, [pr]);
-  // A line ask (DiffPane) wants its question or answer in view.
+  const log = useRef<VirtualChatControl | null>(null);
+  /** The composer's way to empty its box. */
+  const clearText = useRef<(() => void) | null>(null);
+  const runMatch = useCallback(
+    (s: SkillInfo) => {
+      void runSkill(store, pr, s.id, skillAgents);
+      clearText.current?.();
+      log.current?.jumpToLatest();
+    },
+    [store, pr, skillAgents],
+  );
+
+  return (
+    <div className="chat flex min-h-0 flex-1 flex-col">
+      {managing && (
+        <SkillsManagerModal
+          pr={pr}
+          onClose={() => {
+            setManaging(false);
+            // A skill forked or added there shows up in the list right away.
+            void api
+              .listSkills(pr)
+              .then(setSkills)
+              .catch(() => {});
+          }}
+        />
+      )}
+      <AiLog pr={pr} skills={skills} onPickSkill={runMatch} control={log} />
+      <AiComposer
+        pr={pr}
+        skills={skills}
+        skillAgents={skillAgents}
+        onSkillAgents={setSkillAgents}
+        installed={installed}
+        onPickSkill={runMatch}
+        onManage={() => setManaging(true)}
+        log={log}
+        clearText={clearText}
+      />
+    </div>
+  );
+}
+
+/** How long a line ask's question or answer glows once it is brought into
+ *  view (`.ask-flash`). */
+const FLASH_MS = 1700;
+
+/** A message to glow: a line ask wanted it in view. */
+interface AskFlash {
+  id: string;
+  seq: number;
+}
+
+const AiLog = observer(function AiLog({
+  pr,
+  skills,
+  onPickSkill,
+  control,
+}: {
+  pr: PrId;
+  skills: SkillInfo[];
+  onPickSkill: (s: SkillInfo) => void;
+  control: RefObject<VirtualChatControl | null>;
+}) {
+  const store = useRootStore();
+  const messages = [...store.models.chatMessages.byPr(pr)].sort(
+    (a, b) => a.at - b.at,
+  );
+  const runs = store.models.skillRuns.byPr(pr);
+  const { pending, answered, lineAsks } = pendingView(store, pr);
+  const tail = (pending != null && !answered) || lineAsks.length > 0;
+  const turns = aiTurns(runs, messages);
+  const rows: AiRow[] = turns.map((t) => ({ kind: 'turn', ...t }));
+  if (tail) rows.push({ kind: 'tail', key: 'tail' });
+  // Replies are named only when more than one agent wrote them, the live
+  // ones included.
+  const tagged = mixedAgents([
+    ...messages.map((m) => (m.author.kind === 'me' ? null : m.author.agent)),
+    pending && !answered ? pending.agent : null,
+    ...lineAsks.map(([, a]) => a.agent),
+  ]);
+
+  // A line ask (DiffPane) wants its question or answer in view: the row it
+  // is in is scrolled to, mounted or not, and its message glows.
   const focus =
     store.ephemeral.askFocus?.pr === pr ? store.ephemeral.askFocus : null;
+  const target = focus?.message
+    ? (turns.find((t) =>
+        t.items.some((i) => i.kind === 'message' && i.m.id === focus.message),
+      )?.key ?? null)
+    : null;
+  const [flash, setFlash] = useState<AskFlash | null>(null);
   useEffect(() => {
     if (!focus) return;
-    const el = focus.message
-      ? document.querySelector<HTMLElement>(
-          `.chat [data-msg="${CSS.escape(focus.message)}"]`,
-        )
-      : null;
-    if (el) {
-      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      el.classList.remove('ask-flash');
-      void el.offsetWidth; // restart the animation on a repeat focus
-      el.classList.add('ask-flash');
+    if (focus.message && target) {
+      control.current?.scrollToKey(target, 'center');
+      setFlash({ id: focus.message, seq: focus.seq });
     } else {
-      end.current?.scrollIntoView({ block: 'end' });
+      control.current?.jumpToLatest();
     }
     // The question isn't synced yet: a later focus (with its id) follows.
-    if (!focus.message || el) store.ephemeral.consumeAskFocus(focus.seq);
-  }, [focus, store, messages.length]);
-  const lineAsks = [...store.ephemeral.lineAsks.entries()].filter(
-    ([, a]) => a.pr === pr && a.status === 'asking',
+    if (!focus.message || target) store.ephemeral.consumeAskFocus(focus.seq);
+  }, [focus, target, store, control]);
+  useEffect(() => {
+    if (!flash) return;
+    const t = setTimeout(() => setFlash(null), FLASH_MS);
+    return () => clearTimeout(t);
+  }, [flash]);
+
+  const renderRow = useCallback(
+    (row: AiRow) =>
+      row.kind === 'tail' ? (
+        <AiTail pr={pr} tagged={tagged} />
+      ) : (
+        <AiTurn
+          pr={pr}
+          tagged={tagged}
+          items={row.items}
+          flash={
+            flash &&
+            row.items.some((i) => i.kind === 'message' && i.m.id === flash.id)
+              ? flash
+              : null
+          }
+        />
+      ),
+    [pr, flash, tagged],
   );
+
+  if (rows.length === 0) {
+    return (
+      <ChatLog>
+        <ChatEmpty
+          icon={<Sparkles />}
+          title="Ask about this PR"
+          hint="The agent works in a worktree and sees the whole repo."
+        >
+          {skills.length > 0 && (
+            <ListBox
+              aria-label="Suggested skills"
+              selectionMode="none"
+              onAction={(k) => {
+                const s = skills.find((x) => x.id === String(k));
+                if (s) onPickSkill(s);
+              }}
+              className="flex w-full flex-col gap-1.5 p-0"
+            >
+              {skills.slice(0, 3).map((k) => (
+                <ListBox.Item
+                  key={k.id}
+                  id={k.id}
+                  textValue={k.title}
+                  className="w-full gap-2.5 rounded-2xl border border-separator bg-surface px-3 py-2.5 text-sm"
+                >
+                  <span className="grid size-4 shrink-0 place-items-center font-mono text-muted">
+                    /
+                  </span>
+                  <span className="shrink-0 font-mono">{k.id}</span>
+                  <span
+                    className="min-w-0 flex-1 truncate text-xs text-muted"
+                    title={k.description}
+                  >
+                    {k.description}
+                  </span>
+                </ListBox.Item>
+              ))}
+            </ListBox>
+          )}
+        </ChatEmpty>
+      </ChatLog>
+    );
+  }
+  return (
+    <VirtualChat
+      scope={`ai:${pr}`}
+      items={rows}
+      estimate={estimateAiRow}
+      isPinned={isTail}
+      renderItem={renderRow}
+      control={control}
+    />
+  );
+});
+
+/** Your question, skill runs and the replies: skill runs and chat as one
+ *  conversation, oldest first. Keeps its identity until one of them changes,
+ *  so typing and other rows' updates leave it alone. */
+const AiTurn = memo(
+  function AiTurn({
+    pr,
+    items,
+    flash,
+    tagged,
+  }: {
+    pr: PrId;
+    items: AiItem[];
+    tagged: boolean;
+    flash: AskFlash | null;
+  }) {
+    const store = useRootStore();
+    const reAsk = (item: AiItem & { kind: 'message' }) => {
+      if (!item.question) return undefined;
+      const { m, question } = item;
+      return () =>
+        void ask(store, {
+          pr,
+          question,
+          about: null,
+          group: null,
+          agent: m.author.kind === 'me' ? null : m.author.agent,
+        }).catch(() => {});
+    };
+    return (
+      <>
+        {items.map((item) => {
+          if (item.kind === 'run') {
+            return <SkillRunView key={item.id} pr={pr} run={item.id} />;
+          }
+          const { m } = item;
+          const glow = flash?.id === m.id;
+          return (
+            <ChatMessageView
+              // A repeat focus restarts the glow.
+              key={glow ? `${m.id}:${flash.seq}` : m.id}
+              m={m}
+              tagged={tagged}
+              className={glow ? 'ask-flash' : ''}
+              refs={
+                m.refs.length > 0
+                  ? m.refs.map((a, i) => <Ref key={i} a={a} pr={pr} />)
+                  : undefined
+              }
+              onAskAgain={reAsk(item)}
+              onRetryFailed={reAsk(item)}
+            />
+          );
+        })}
+      </>
+    );
+  },
+  (a, b) =>
+    a.pr === b.pr &&
+    a.flash === b.flash &&
+    a.tagged === b.tagged &&
+    a.items.length === b.items.length &&
+    a.items.every((x, i) => {
+      const y = b.items[i]!;
+      return x.kind === 'run'
+        ? y.kind === 'run' && x.id === y.id
+        : y.kind === 'message' && x.m === y.m && x.question === y.question;
+    }),
+);
+
+/** The answer still being written, under the last turn: the question you
+ *  just asked until its stored message shows, the agent's live reply, and
+ *  the line asks still going. */
+const AiTail = observer(function AiTail({
+  pr,
+  tagged,
+}: {
+  pr: PrId;
+  tagged: boolean;
+}) {
+  const store = useRootStore();
+  const { pending, answered, lineAsks, stored } = pendingView(store, pr);
+  return (
+    <>
+      {pending && !answered && (
+        <>
+          {/* The question, until its stored message shows above. */}
+          {!stored(askMessageOf(pending.run)) && (
+            <UserBubble text={pending.question} />
+          )}
+          <ChatLive
+            run={pending.run}
+            agent={pending.agent}
+            tagged={tagged}
+            className="chat-pending"
+            onRetry={() => {
+              const { question, agent } = pending;
+              stopPendingAsk(store, pr, pending);
+              void askPending(store, {
+                pr,
+                question,
+                about: null,
+                group: null,
+                agent,
+              }).catch(() => {});
+            }}
+          />
+        </>
+      )}
+      {lineAsks.map(([key, a]) => (
+        <LineAskBubble
+          key={key}
+          askKey={key}
+          a={a}
+          asked={stored(a.message)}
+          tagged={tagged}
+        />
+      ))}
+    </>
+  );
+});
+
+/** The box under the log, and everything that changes as you type in it. */
+const AiComposer = observer(function AiComposer({
+  pr,
+  skills,
+  skillAgents,
+  onSkillAgents,
+  installed,
+  onPickSkill,
+  onManage,
+  log,
+  clearText,
+}: {
+  pr: PrId;
+  skills: SkillInfo[];
+  skillAgents: AgentId[];
+  onSkillAgents: (agents: AgentId[]) => void;
+  installed: AgentId[] | null;
+  onPickSkill: (s: SkillInfo) => void;
+  onManage: () => void;
+  /** The log above: sending goes to the bottom of it. */
+  log: RefObject<VirtualChatControl | null>;
+  clearText: RefObject<(() => void) | null>;
+}) {
+  const store = useRootStore();
+  const [text, setText] = useState('');
+  const files = useAttachments();
+  // Only agents installed on this computer and not disabled in Settings →
+  // Agents are offered.
+  const enabled = (installed ?? []).filter((a) => isAgentEnabled(store, a));
+  // The agent the panel talks to, as the chip shows it: the first of the
+  // chosen ones that is offered. Its model and effort are the agent's
+  // settings, which core reads when it asks.
+  const chatAgent =
+    (skillAgents[0] && enabled.includes(skillAgents[0])
+      ? skillAgents[0]
+      : enabled[0]) ??
+    skillAgents[0] ??
+    null;
+  const pickChat = (a: AgentId) =>
+    onSkillAgents([a, ...skillAgents.filter((x) => x !== a)]);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    clearText.current = () => setText('');
+    return () => {
+      clearText.current = null;
+    };
+  }, [clearText]);
+  const runs = store.models.skillRuns.byPr(pr);
+  const { pending, answered, lineAsks } = pendingView(store, pr);
   // The diff line the next question is about (a line's AI button), and its
   // ask for the caret.
   const lineRef = store.ephemeral.lineRefs.get(pr) ?? null;
@@ -720,25 +1116,17 @@ const Chat = observer(function Chat({ pr }: { pr: PrId }) {
     el.setSelectionRange(el.value.length, el.value.length);
     store.ephemeral.consumeComposerFocus(composerFocus);
   }, [composerFocus, store]);
-  // Once an agent message lands after the ask, the pending bubble has
-  // nothing left to show: hidden in that same render (never both at once
-  // for a frame); `askPending`'s reaction then clears it from the store.
-  const answered =
-    pending != null &&
-    messages.some((m) => m.author.kind !== 'me' && m.at >= pending.startedAt);
-  const stored = (id: string | null) =>
-    id != null && messages.some((m) => m.id === id);
 
-  const stopPending = () => {
-    if (!pending) return;
-    void cancelRun(store, pending.run).catch(() => {});
-    store.ephemeral.clearChatPending(pr);
-  };
   // Stop in the composer ends the newest run still going here: the
   // pending question, a line's question, or a skill run.
   const current = newestRun<LiveRun>([
     ...(pending && !answered
-      ? [{ at: pending.startedAt, stop: stopPending }]
+      ? [
+          {
+            at: pending.startedAt,
+            stop: () => stopPendingAsk(store, pr, pending),
+          },
+        ]
       : []),
     ...lineAsks.map(([key, a]) => ({
       at: a.startedAt ?? 0,
@@ -768,14 +1156,11 @@ const Chat = observer(function Chat({ pr }: { pr: PrId }) {
     return () => window.removeEventListener('keydown', onKey, true);
   }, []);
 
-  const runMatch = (s: SkillInfo) => {
-    void runSkill(store, pr, s.id, skillAgents);
-    setText('');
-  };
-
   const send = () => {
     const t = text.trim();
     if (!t || files.busy) return;
+    // What you sent is at the bottom: you are there to see it.
+    log.current?.jumpToLatest();
     if (t.startsWith('/')) {
       // ⏎ with the list open picks there; the arrow runs the typed name,
       // or the first skill it matches.
@@ -794,13 +1179,13 @@ const Chat = observer(function Chat({ pr }: { pr: PrId }) {
         pr,
         anchor: lineRef,
         question: t,
-        picked: skillAgents[0] ?? null,
+        picked: chatAgent,
         attachments: files.ids.length ? files.ids : null,
       });
       store.ephemeral.clearLineRef(pr);
       files.clear();
     } else {
-      const agent = skillAgents[0] ?? null;
+      const agent = chatAgent;
       void askPending(store, {
         pr,
         question: t,
@@ -815,205 +1200,76 @@ const Chat = observer(function Chat({ pr }: { pr: PrId }) {
     setText('');
   };
 
-  const reAsk = (m: ChatMessage) => {
-    const question = priorQuestion(messages, m);
-    if (!question) return undefined;
-    return () =>
-      void ask(store, {
-        pr,
-        question,
-        about: null,
-        group: null,
-        agent: m.author.kind === 'me' ? null : m.author.agent,
-      }).catch(() => {});
-  };
-
   return (
-    <div className="chat flex min-h-0 flex-1 flex-col">
-      {managing && (
-        <SkillsManagerModal
-          pr={pr}
-          onClose={() => {
-            setManaging(false);
-            // A skill forked or added there shows up in the list right away.
-            void api
-              .listSkills(pr)
-              .then(setSkills)
-              .catch(() => {});
-          }}
-        />
-      )}
-      <ChatLog end={end}>
-        {messages.length === 0 &&
-        runs.length === 0 &&
-        !pending &&
-        lineAsks.length === 0 ? (
-          <ChatEmpty
-            icon={<Sparkles />}
-            title="Ask about this PR"
-            hint="The agent works in a worktree and sees the whole repo."
-          >
-            {skills.length > 0 && (
-              <ListBox
-                aria-label="Suggested skills"
-                selectionMode="none"
-                onAction={(k) => {
-                  const s = skills.find((x) => x.id === String(k));
-                  if (s) runMatch(s);
+    <div className="chat-input flex flex-col gap-2 px-4 pb-3 pt-1">
+      <Composer
+        inputRef={inputRef}
+        value={text}
+        onChange={setText}
+        onSubmit={send}
+        label="Ask the agent"
+        placeholder={
+          lineRef
+            ? `Ask about ${refLabel(lineRef)}`
+            : 'Ask about the code, or / to run a skill'
+        }
+        requireText
+        sendWhileRunning
+        running={current != null}
+        onStop={current?.stop}
+        skills={skills}
+        onPickSkill={onPickSkill}
+        skillFooter={
+          <div className="flex items-center gap-1 ps-3 pt-1 text-xs text-muted">
+            <span className="min-w-0 truncate">
+              Runs on {skillAgents.join(' + ')}
+            </span>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="manage-skills ms-auto shrink-0 gap-1.5 text-xs text-muted"
+              onPress={onManage}
+            >
+              <Pencil className="size-3.5" />
+              Manage skills…
+            </Button>
+          </div>
+        }
+        attachments={files}
+        strip={
+          lineRef && (
+            <div className="line-ref flex w-full px-3 pb-1">
+              <Ref
+                a={lineRef}
+                pr={pr}
+                onRemove={() => {
+                  store.ephemeral.clearLineRef(pr);
+                  inputRef.current?.focus();
                 }}
-                className="flex w-full flex-col gap-1.5 p-0"
-              >
-                {skills.slice(0, 3).map((k) => (
-                  <ListBox.Item
-                    key={k.id}
-                    id={k.id}
-                    textValue={k.title}
-                    className="w-full gap-2.5 rounded-2xl border border-separator bg-surface px-3 py-2.5 text-sm"
-                  >
-                    <span className="grid size-4 shrink-0 place-items-center font-mono text-muted">
-                      /
-                    </span>
-                    <span className="shrink-0 font-mono">{k.id}</span>
-                    <span
-                      className="min-w-0 flex-1 truncate text-xs text-muted"
-                      title={k.description}
-                    >
-                      {k.description}
-                    </span>
-                  </ListBox.Item>
-                ))}
-              </ListBox>
-            )}
-          </ChatEmpty>
-        ) : (
-          <>
-            {/* Skill runs and chat as one conversation, oldest first. */}
-            {feedOf(runs, messages).map((item) =>
-              item.kind === 'run' ? (
-                <SkillRunView key={item.run.id} pr={pr} run={item.run.id} />
-              ) : (
-                <ChatMessageView
-                  key={item.message.id}
-                  m={item.message}
-                  refs={
-                    item.message.refs.length > 0
-                      ? item.message.refs.map((a, i) => (
-                          <Ref key={i} a={a} pr={pr} />
-                        ))
-                      : undefined
-                  }
-                  onAskAgain={reAsk(item.message)}
-                  onRetryFailed={reAsk(item.message)}
-                />
-              ),
-            )}
-            {pending && !answered && (
-              <>
-                {/* The question, until its stored message shows above. */}
-                {!stored(askMessageOf(pending.run)) && (
-                  <UserBubble text={pending.question} />
-                )}
-                <ChatLive
-                  run={pending.run}
-                  agent={pending.agent}
-                  follow={end}
-                  className="chat-pending"
-                  onRetry={() => {
-                    const { question, agent } = pending;
-                    stopPending();
-                    void askPending(store, {
-                      pr,
-                      question,
-                      about: null,
-                      group: null,
-                      agent,
-                    }).catch(() => {});
-                  }}
-                />
-              </>
-            )}
-            {lineAsks.map(([key, a]) => (
-              <LineAskBubble
-                key={key}
-                askKey={key}
-                a={a}
-                asked={stored(a.message)}
-                follow={end}
               />
-            ))}
-          </>
-        )}
-      </ChatLog>
-
-      <div className="chat-input flex flex-col gap-2 px-4 pb-3 pt-1">
-        <Composer
-          inputRef={inputRef}
-          value={text}
-          onChange={setText}
-          onSubmit={send}
-          label="Ask the agent"
-          placeholder={
-            lineRef
-              ? `Ask about ${refLabel(lineRef)}`
-              : 'Ask about the code, or / to run a skill'
-          }
-          requireText
-          sendWhileRunning
-          running={current != null}
-          onStop={current?.stop}
-          skills={skills}
-          onPickSkill={runMatch}
-          skillFooter={
-            <div className="flex items-center gap-1 ps-3 pt-1 text-xs text-muted">
-              <span className="min-w-0 truncate">
-                Runs on {skillAgents.join(' + ')}
-              </span>
-              <Button
-                size="sm"
-                variant="ghost"
-                className="manage-skills ms-auto shrink-0 gap-1.5 text-xs text-muted"
-                onPress={() => setManaging(true)}
-              >
-                <Pencil className="size-3.5" />
-                Manage skills…
-              </Button>
             </div>
-          }
-          attachments={files}
-          strip={
-            lineRef && (
-              <div className="line-ref flex w-full px-3 pb-1">
-                <Ref
-                  a={lineRef}
-                  pr={pr}
-                  onRemove={() => {
-                    store.ephemeral.clearLineRef(pr);
-                    inputRef.current?.focus();
-                  }}
-                />
-              </div>
-            )
-          }
-          // Backspace in an empty box takes the line chip back out.
-          onEmptyBackspace={
-            lineRef ? () => store.ephemeral.clearLineRef(pr) : undefined
-          }
-          chips={
-            /* Only agents installed on this computer and not disabled in
-               Settings → Agents are offered. */
-            <AgentMenu
-              multiple
-              agents={(installed ?? AGENTS).filter((a) =>
-                isAgentEnabled(store, a),
-              )}
-              selected={skillAgents}
-              onSelect={setSkillAgents}
-            />
-          }
-        />
-        <div className="flex items-center gap-2 px-2 text-xs text-muted">
-          <span className="min-w-0 truncate">The agent can be wrong</span>
-        </div>
+          )
+        }
+        // Backspace in an empty box takes the line chip back out.
+        onEmptyBackspace={
+          lineRef ? () => store.ephemeral.clearLineRef(pr) : undefined
+        }
+        chips={
+          <>
+            <AgentChip value={chatAgent} onChange={pickChat} />
+            {chatAgent && (
+              <SkillAgentsMenu
+                agents={enabled}
+                primary={chatAgent}
+                selected={skillAgents}
+                onSelect={onSkillAgents}
+              />
+            )}
+          </>
+        }
+      />
+      <div className="flex items-center gap-2 px-2 text-xs text-muted">
+        <span className="min-w-0 truncate">The agent can be wrong</span>
       </div>
     </div>
   );
@@ -1088,10 +1344,15 @@ function ThreadCardInner({ pr, thread }: { pr: PrId; thread: Thread }) {
   const store = useRootStore();
   const [reply, setReply] = useState('');
   const [busy, setBusy] = useState(false);
+  const [open, setOpen] = useState(false);
   const people = [
     ...new Map(thread.comments.map((c) => [c.author.login, c.author])),
   ];
+  const first = thread.comments[0]!;
   const last = thread.comments.at(-1)!;
+  const replies = thread.comments.length - 1;
+  // How it started, then (opened) every reply in order.
+  const shown = open ? thread.comments : [first];
   const send = () => {
     const body = reply.trim();
     if (!body) return;
@@ -1125,20 +1386,38 @@ function ThreadCardInner({ pr, thread }: { pr: PrId; thread: Thread }) {
           </span>
         )}
       </div>
-      <p className="line-clamp-2 text-sm text-muted">
-        {/* Name the speaker only when more than one person is in the thread;
-         *  the header already shows a lone author. */}
-        {people.length > 1 && (
-          <>
-            <span className="text-foreground">{last.author.login}:</span>{' '}
-          </>
-        )}
-        {stripHtmlComments(last.body)}
-      </p>
+      {shown.map((c) => (
+        <p
+          key={c.id}
+          className={`text-sm text-muted ${open ? 'whitespace-pre-wrap' : 'line-clamp-2'}`}
+        >
+          {/* Name the speaker only when more than one person is in the
+           *  thread; the header already shows a lone author. */}
+          {people.length > 1 && (
+            <>
+              <span className="text-foreground">{c.author.login}:</span>{' '}
+            </>
+          )}
+          {stripHtmlComments(c.body)}
+        </p>
+      ))}
       <div className="flex items-center justify-between text-xs text-muted">
         <span>
-          {plural(thread.comments.length, 'comment', 'comments', 'comments')} ·{' '}
-          {ago(last.created_at)}
+          {replies > 0 ? (
+            <button
+              type="button"
+              className="thread-replies hover:text-foreground hover:underline"
+              aria-expanded={open}
+              onClick={() => setOpen((v) => !v)}
+            >
+              {open
+                ? 'Hide replies'
+                : `${replies} ${replies === 1 ? 'reply' : 'replies'}`}
+            </button>
+          ) : (
+            '1 comment'
+          )}{' '}
+          · {ago(last.created_at)}
         </span>
         {thread.outdated && <span>outdated</span>}
       </div>

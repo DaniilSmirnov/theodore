@@ -34,19 +34,27 @@ fn kind_of(name: SpaceCommandName) -> SpaceCommandKind {
     }
 }
 
-/// The script of `kind` when it is configured and allowed; otherwise why
-/// not, without running anything.
-fn gated(cfg: &SpaceConfig, kind: SpaceCommandKind) -> Result<String, SpaceToolError> {
+/// What the agent reads when `kind` isn't configured: not an error, nothing
+/// was asked of it that it could do.
+fn unset(kind: SpaceCommandKind) -> String {
+    format!(
+        "no `spaces.{}` command is configured for this project, so nothing ran; \
+         don't retry, carry on without it",
+        kind_name(kind)
+    )
+}
+
+/// The script of `kind` when it is configured and allowed, `None` when it is
+/// not configured; an error when the user hasn't allowed it. Nothing runs.
+fn gated(cfg: &SpaceConfig, kind: SpaceCommandKind) -> Result<Option<String>, SpaceToolError> {
     let key = kind_name(kind);
     match cfg.command(kind) {
-        None => Err(SpaceToolError::Unavailable(format!(
-            "no `spaces.{key}` command is configured for this project"
-        ))),
+        None => Ok(None),
         Some(c) if !c.allowed => Err(SpaceToolError::NotAllowed(format!(
             "`spaces.{key}` comes from the repo's config and the user hasn't allowed the \
              repo's commands in this space; ask them to allow them"
         ))),
-        Some(c) => Ok(c.script),
+        Some(c) => Ok(Some(c.script)),
     }
 }
 
@@ -73,7 +81,16 @@ impl Core {
         if space.status == SpaceStatus::Archived {
             return Err(unavailable("this space is archived"));
         }
-        let script = gated(&cfg, SpaceCommandKind::Check)?;
+        let Some(script) = gated(&cfg, SpaceCommandKind::Check)? else {
+            return Ok(CheckOutcome {
+                ran: false,
+                passed: false,
+                exit_code: None,
+                timed_out: false,
+                summary: unset(SpaceCommandKind::Check),
+                output: vec![],
+            });
+        };
         let cancel = self
             .0
             .runs
@@ -96,6 +113,7 @@ impl Core {
             )
             .await;
         Ok(CheckOutcome {
+            ran: true,
             passed: exit.success(),
             exit_code: exit.code,
             timed_out: exit.timed_out,
@@ -111,7 +129,9 @@ impl Core {
         if row.status == SpaceStatus::Archived {
             return Err(unavailable("this space is archived"));
         }
-        gated(&cfg, SpaceCommandKind::Run)?;
+        if gated(&cfg, SpaceCommandKind::Run)?.is_none() {
+            return self.space_tool_status(&row.id).await;
+        }
         self.space_run(SpaceRunRequest {
             space: row.id.clone(),
             start: true,
@@ -137,9 +157,10 @@ impl Core {
         let (row, _, cfg) = self.tool_space(space).await?;
         let running = self.with_runtime(&row.id, |rt| rt.run.is_some());
         let command = cfg.command(SpaceCommandKind::Run);
+        let configured = command.is_some();
         let last = row.process.as_ref().filter(|_| !running);
         Ok(AppStatus {
-            configured: command.is_some(),
+            configured,
             allowed: command.is_some_and(|c| c.allowed),
             running,
             urls: local_urls(&row.ports),
@@ -155,6 +176,7 @@ impl Core {
             }),
             exit_code: last.and_then(|p| p.exit_code),
             error: last.and_then(|p| p.error.clone()),
+            note: (!configured).then(|| unset(SpaceCommandKind::Run)),
         })
     }
 

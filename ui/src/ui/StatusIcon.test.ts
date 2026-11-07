@@ -59,10 +59,21 @@ describe('prStatus', () => {
     ).toBe('open');
   });
 
-  it('puts a problem above draft and ready', () => {
-    expect(prStatus({ ...full, state: 'draft', conflicts: true })).toEqual({
+  it('puts a problem above ready', () => {
+    expect(prStatus({ ...full, conflicts: true })).toEqual({
       tone: 'problem',
       label: 'Conflicts with main',
+    });
+  });
+
+  it('says Draft first: a draft is not up for merging, problems or not', () => {
+    expect(prStatus({ ...full, state: 'draft', checks: 'fail' })).toEqual({
+      tone: 'draft',
+      label: 'Draft · Checks failing',
+    });
+    expect(prStatus({ ...full, state: 'draft' })).toEqual({
+      tone: 'draft',
+      label: 'Draft',
     });
   });
 });

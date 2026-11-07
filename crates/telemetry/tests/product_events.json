@@ -77,5 +77,18 @@
   {
     "event": "problem_reported",
     "mode": ""
+  },
+  {
+    "event": "update_installed",
+    "version": ""
+  },
+  {
+    "event": "update_failed",
+    "reason": ""
+  },
+  {
+    "event": "move_to_applications",
+    "choice": "",
+    "from": ""
   }
 ]

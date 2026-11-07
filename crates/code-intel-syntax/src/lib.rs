@@ -41,7 +41,7 @@ pub use indexer::{
 };
 pub use pos::byte_offset;
 pub use query::SymbolAt;
-pub use snapshot::{FileEntry, Snapshot, blob_sha, file_entry, git_snapshot};
+pub use snapshot::{FileEntry, Snapshot, blob_sha, dirty_paths, file_entry, git_snapshot};
 pub use text::{preview, text_search};
 
 /// Files larger than this are not indexed unless the caller says otherwise

@@ -69,10 +69,11 @@ impl Core {
         apply_suggestions(&worktree, &edits).await?;
 
         let branch = detail.summary.head_ref.clone();
+        let author = self.pr_commit_author(&req.pr, &pr_ref.repo).await?;
         self.0
             .deps
             .git
-            .commit_and_push(&worktree, &pr_ref.repo, &branch, &req.message)
+            .commit_and_push(&worktree, &pr_ref.repo, &branch, &req.message, &author)
             .await?;
         Ok(())
     }

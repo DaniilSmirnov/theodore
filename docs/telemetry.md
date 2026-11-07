@@ -76,6 +76,9 @@ fixed set — never code, paths, titles or comment text. The wire shape is pinne
 | `space_shipped` | `how` (`open_pr`, `open_draft_pr`, `push`, `merge_locally`, `keep_branch`) |
 | `config_saved` | `where` (`global`, `repo`, `local`) |
 | `problem_reported` | `mode` (`issue`, `issue_with_logs`, `logs_only`) |
+| `update_installed` | `version` (the update now on disk; the running one is `app_version`) |
+| `update_failed` | `reason` (`read_only`, `network`, `signature`, `other`) |
+| `move_to_applications` | `choice` (`moved`, `declined`, `failed`), `from` (`volume`, `translocated`, `folder`) |
 
 Every PostHog event also carries `app_version`, `os`, `channel` (the update channel), `commit`
 and `build_env` (`production`, `staging`, `nightly`, `dev`; docs/releasing.md "Build stamp").
@@ -90,8 +93,8 @@ Failures are logged with a stable dotted `error.code`, plus context: `agent` and
 |---|---|
 | Grouping | `grouping.invalid_output`, `grouping.agent_failed`, `grouping.repaired` (a repair round or the Other fallback was needed) |
 | Host | `host.unauthorized` (401), `host.forbidden` (403), `host.rate_limited`, `host.not_found`, `host.conflict`, `host.validation`, `host.network`, `host.server_error`, `host.protocol`, `host.auth` (as the app sees 401/403), `host.forbidden` also for a GraphQL mutation refused as `FORBIDDEN` |
-| Agent | `agent.crashed` (non-zero exit / error, with `stderr_tail` ≤ 2 KB), `agent.timed_out`, `agent.stalled`, `agent.spawn_failed`, `agent.not_installed`, `agent.offline` (info: the CLI couldn't reach its servers — a run, a grouping, a space turn) |
-| Git | `git.command_failed`, `git.auth`, `git.network` (the remote can't be reached; expected, logged at info), `git.not_installed`, `git.refused`, `git.not_a_worktree` (a space dir git wouldn't resolve as its worktree), `git.busy` (a rebase or conflict unfinished in a space; expected, logged at info), `git.unsupported`, `git.parse`, `git.io` |
+| Agent | `agent.crashed` (non-zero exit / error, with `stderr_tail` ≤ 2 KB), `agent.timed_out`, `agent.stalled`, `agent.spawn_failed`, `agent.not_installed`, `agent.offline` (info: the CLI couldn't reach its servers — a run, a grouping, a space turn), `agent.signed_out` (info: the CLI has no valid credentials; the user sees "Codex isn't signed in. Run `codex login` in a terminal.", the raw error stays in `stderr_tail`) |
+| Git | `git.command_failed`, `git.auth`, `git.network` (the remote can't be reached; expected, logged at info), `git.not_installed`, `git.refused`, `git.not_a_worktree` (a space dir git wouldn't resolve as its worktree), `git.busy` (a rebase or conflict unfinished in a space; expected, logged at info), `git.unsupported`, `git.commit_not_found` (a stale sha, force-pushed away; expected, logged at info), `git.parse`, `git.io` |
 | Store | `store.db`, `store.serde`, `store.migration` |
 | Outbox | `outbox.gave_up` |
 | Spaces | `space.command_failed`, `space.command_timed_out`, `space.turn_failed`, `space.worktree_moved_aside` (a space dir that wasn't its worktree, moved to `spaces/.moved-aside/`) |

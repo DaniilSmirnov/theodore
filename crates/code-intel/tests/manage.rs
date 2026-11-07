@@ -83,6 +83,20 @@ async fn limits_apply_live_and_a_larger_file_limit_reindexes() {
     indexed(&ci, wt.path()).await;
     let syms = ci.file_symbols(wt.path(), "src/big.rs").await.unwrap();
     assert!(syms.items.is_empty(), "over the limit: not indexed");
+    // A name only there: the answer says which skipped file has it.
+    let found = ci.find_symbol(wt.path(), "f3", None).await.unwrap();
+    assert!(found.items.is_empty());
+    let note = found.note.unwrap_or_default();
+    assert!(
+        note.contains("not searched, over code_intel.max_file_kb: src/big.rs"),
+        "{note}"
+    );
+    // One no skipped file mentions: nothing about them.
+    let none = ci.find_symbol(wt.path(), "nowhere", None).await.unwrap();
+    assert!(
+        !none.note.unwrap_or_default().contains("max_file_kb"),
+        "only files that mention the name"
+    );
 
     ci.set_limits(CodeIntelLimits {
         max_file_kb: 64,
@@ -159,7 +173,10 @@ async fn remove_is_refused_while_a_worktree_uses_it_and_sticks_until_install() {
         .await
         .unwrap();
     let err = ci.remove(&rust).await.unwrap_err().to_string();
-    assert!(err.contains("in use by an open worktree"), "{err}");
+    assert!(
+        err.contains("rust is in use by 1 open worktree(s)"),
+        "{err}"
+    );
 
     ci.close(wt.path()).await;
     ci.remove(&rust).await.unwrap();
@@ -189,6 +206,11 @@ const PLATFORM: &str = "test-plat";
 
 /// Language `x` served by `srv`, downloaded from `uri`.
 fn server_facade(env: &Env, uri: &str, body: &[u8]) -> CodeIntel {
+    server_facade_with(env, uri, body, "")
+}
+
+/// `more`: languages after `x`, in the manifest's yaml.
+fn server_facade_with(env: &Env, uri: &str, body: &[u8], more: &str) -> CodeIntel {
     let sha = hex::encode(Sha256::digest(body));
     let yaml = format!(
         r#"
@@ -203,7 +225,7 @@ languages:
   - id: x
     globs: ["*.x"]
     servers: [srv]
-"#
+{more}"#
     );
     let manifest = Manifest::parse(&yaml, r#"{"schema":1,"grammars":[]}"#)
         .unwrap()
@@ -276,6 +298,40 @@ async fn install_reports_progress_and_remove_takes_the_server_back_to_missing() 
         .unwrap();
     let s = status_of(&ci, wt.path(), "x").await;
     assert_eq!(s.server.unwrap().install, InstallState::Missing);
+}
+
+/// One server, two languages (tsgo: typescript and tsx). Installing it for
+/// one must not leave the other's row stuck on Downloading, with no plan to
+/// start the server from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installing_a_server_settles_every_language_it_serves() {
+    let http = MockServer::start().await;
+    let body = b"#!/bin/sh\nsleep 30\n".to_vec();
+    Mock::given(method("GET"))
+        .and(path("/srv"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .mount(&http)
+        .await;
+    let env = Env::new();
+    let more = "  - id: y\n    globs: [\"*.y\"]\n    servers: [srv]\n";
+    let ci = server_facade_with(&env, &http.uri(), &body, more);
+    let wt = repo(&[("a.x", "x"), ("a.y", "y")]);
+    ci.open(workspace(wt.path(), TrustMode::Trusted))
+        .await
+        .unwrap();
+
+    ci.install(&LanguageId::new("x"), None).await.unwrap();
+
+    for language in ["x", "y"] {
+        let s = status_of(&ci, wt.path(), language).await;
+        assert_eq!(
+            s.server.unwrap().install,
+            InstallState::Installed {
+                version: "1.0".into()
+            },
+            "{language}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -13,8 +13,11 @@
 //!
 //! Documents open lazily: a request on a file sends `didOpen` with its text
 //! from disk first, and the least recently used one is closed beyond
-//! `max_open_docs`. `file_changed` pushes the new text of an open file and
-//! tells servers that watch files through the client.
+//! `max_open_docs`. Every request reads the documents open in its worktree
+//! again first and pushes what changed (`didChange`): the agent's own edits
+//! reach the disk without telling us, and a position means the file as it
+//! is now. `file_changed` does the same for one file and tells servers that
+//! watch files through the client.
 //!
 //! Server→client requests are answered so servers never stall waiting on
 //! us: `workspace/configuration` from `init_options` (see
@@ -70,6 +73,20 @@ pub struct SessionOptions {
     pub diagnostics_wait: Duration,
 }
 
+impl SessionOptions {
+    /// These options with `config`'s own start timeout and settle time.
+    fn for_server(mut self, config: &LaunchConfig) -> Self {
+        if let Some(secs) = config.start_timeout_secs {
+            self.init_timeout = Duration::from_secs(secs);
+            self.ready_max_wait = Duration::from_secs(secs);
+        }
+        if let Some(secs) = config.ready_settle_secs {
+            self.ready_settle = Duration::from_secs(secs);
+        }
+        self
+    }
+}
+
 impl Default for SessionOptions {
     fn default() -> Self {
         Self {
@@ -106,6 +123,10 @@ struct Shared {
     progress_changed: Notify,
     /// The last `publishDiagnostics` (or pull report) per file.
     diagnostics: Mutex<HashMap<PathBuf, Vec<lsp_types::Diagnostic>>>,
+    /// Files changed since the server last reported on them, and the
+    /// version it was sent: a report of an older version is dropped.
+    /// Locked before `diagnostics` when both are.
+    stale: Mutex<HashMap<PathBuf, i32>>,
     diagnostics_changed: Notify,
     /// The server registered `workspace/didChangeWatchedFiles`.
     watches_files: AtomicBool,
@@ -152,8 +173,35 @@ impl Shared {
         let Some(path) = text::uri_path(p.uri.as_str()) else {
             return;
         };
-        lock(&self.diagnostics).insert(path, p.diagnostics);
+        self.reported(path, p.diagnostics, p.version);
+    }
+
+    /// The server's diagnostics of `path` (of `version`, when it says).
+    fn reported(&self, path: PathBuf, diags: Vec<lsp_types::Diagnostic>, version: Option<i32>) {
+        let mut stale = lock(&self.stale);
+        if let (Some(want), Some(got)) = (stale.get(&path), version)
+            && got < *want
+        {
+            return;
+        }
+        stale.remove(&path);
+        lock(&self.diagnostics).insert(path, diags);
+        drop(stale);
         self.diagnostics_changed.notify_waiters();
+    }
+
+    /// `path` was sent to the server as `version`: what it reported before
+    /// is about another text.
+    fn changed(&self, path: &Path, version: i32) {
+        let mut stale = lock(&self.stale);
+        stale.insert(path.to_path_buf(), version);
+        lock(&self.diagnostics).remove(path);
+    }
+
+    /// `path` has a report about its current text.
+    fn fresh(&self, path: &Path) -> bool {
+        let stale = lock(&self.stale);
+        !stale.contains_key(path) && lock(&self.diagnostics).contains_key(path)
     }
 
     fn folders_json(&self) -> Value {
@@ -292,6 +340,7 @@ impl LspSession {
         config: LaunchConfig,
         options: SessionOptions,
     ) -> CodeIntelResult<Arc<Self>> {
+        let options = options.for_server(&config);
         let server = config.server.clone();
         let err = |message: String| CodeIntelError::Server {
             server: server.clone(),
@@ -338,6 +387,7 @@ impl LspSession {
             }),
             progress_changed: Notify::new(),
             diagnostics: Mutex::default(),
+            stale: Mutex::default(),
             diagnostics_changed: Notify::new(),
             watches_files: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
@@ -509,12 +559,22 @@ impl LspSession {
         &self,
         params: R::Params,
     ) -> CodeIntelResult<R::Result> {
+        let unsupported = || {
+            CodeIntelError::Unsupported(format!("{} does not answer {}", self.server(), R::METHOD))
+        };
+        // Not offered at `initialize`: not asked (taplo has no workspace/symbol).
+        if capability(R::METHOD).is_some_and(|cap| !self.info().has(cap)) {
+            return Err(unsupported());
+        }
         let params = serde_json::to_value(params).map_err(|e| self.err(e))?;
         let raw = self
             .rpc
             .request(R::METHOD, params, self.options.request_timeout)
             .await
-            .map_err(|e| self.err(e))?;
+            .map_err(|e| match e {
+                RpcError::Server { code, .. } if code == rpc::METHOD_NOT_FOUND => unsupported(),
+                e => self.err(e),
+            })?;
         self.touch();
         serde_json::from_value(raw).map_err(|e| self.err(RpcError::Decode(e.to_string())))
     }
@@ -527,6 +587,74 @@ impl LspSession {
             .find(|f| **f == canon)
             .cloned()
             .ok_or_else(|| CodeIntelError::NotOpen(root.to_path_buf()))
+    }
+
+    /// [`folder`](Self::folder), with every document open under it read
+    /// again first: a request's positions are the file as it is on disk
+    /// now, and so must the server's copy be. Nobody tells us about the
+    /// agent's own Edit tool.
+    async fn synced(&self, root: &Path) -> CodeIntelResult<PathBuf> {
+        let root = self.folder(root)?;
+        let mut docs = self.docs.lock().await;
+        let open: Vec<PathBuf> = docs
+            .open
+            .keys()
+            .filter(|p| p.starts_with(&root))
+            .cloned()
+            .collect();
+        for abs in open {
+            self.sync_doc(&mut docs, &abs).await;
+        }
+        Ok(root)
+    }
+
+    /// The server keeps a copy of each open document (`textDocumentSync`
+    /// is not `None`), so it needs `didChange`.
+    fn syncs(&self) -> bool {
+        let caps = &self.info().caps;
+        let none = |v: Option<&Value>| matches!(v, Some(Value::Number(n)) if n.as_u64() == Some(0));
+        !none(caps.pointer("/textDocumentSync")) && !none(caps.pointer("/textDocumentSync/change"))
+    }
+
+    /// Reads the open document `abs` from disk again: new text goes to the
+    /// server (`didChange`, the next version), a file gone is closed.
+    /// `true` when the server's copy changed.
+    async fn sync_doc(&self, docs: &mut Docs, abs: &Path) -> bool {
+        let Some(doc) = docs.open.get_mut(abs) else {
+            return false;
+        };
+        match tokio::fs::read_to_string(abs).await {
+            Ok(text) if text == doc.text => false,
+            Ok(text) => {
+                doc.version += 1;
+                if self.syncs() {
+                    self.rpc.notify(
+                        "textDocument/didChange",
+                        json!({
+                            "textDocument": {"uri": text::file_uri(abs), "version": doc.version},
+                            "contentChanges": [{"text": text}],
+                        }),
+                    );
+                }
+                doc.text = text;
+                self.shared.changed(abs, doc.version);
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                docs.open.remove(abs);
+                lock(&self.shared.stale).remove(abs);
+                lock(&self.shared.diagnostics).remove(abs);
+                self.rpc.notify(
+                    "textDocument/didClose",
+                    json!({"textDocument": {"uri": text::file_uri(abs)}}),
+                );
+                true
+            }
+            Err(e) => {
+                tracing::debug!(server = %self.config.server, path = %abs.display(), "lsp: re-read: {e}");
+                false
+            }
+        }
     }
 
     /// Open `abs` on the server if it is not yet, and return its text.
@@ -652,7 +780,7 @@ impl LspSession {
         at: Position,
     ) -> CodeIntelResult<Located> {
         let _busy = self.begin().await?;
-        let root = self.folder(root)?;
+        let root = self.synced(root).await?;
         let abs = text::resolve(&root, path)?;
         let text = self.open_doc(&abs, path).await?;
         let params = lsp_types::GotoDefinitionParams {
@@ -686,7 +814,7 @@ impl LspSession {
         include_decl: bool,
     ) -> CodeIntelResult<Located> {
         let _busy = self.begin().await?;
-        let root = self.folder(root)?;
+        let root = self.synced(root).await?;
         let abs = text::resolve(&root, path)?;
         let text = self.open_doc(&abs, path).await?;
         let params = lsp_types::ReferenceParams {
@@ -714,7 +842,7 @@ impl LspSession {
         path: &str,
     ) -> CodeIntelResult<Vec<CodeSymbol>> {
         let _busy = self.begin().await?;
-        let root = self.folder(root)?;
+        let root = self.synced(root).await?;
         let abs = text::resolve(&root, path)?;
         let text = self.open_doc(&abs, path).await?;
         let params = lsp_types::DocumentSymbolParams {
@@ -747,7 +875,7 @@ impl LspSession {
         query: &str,
     ) -> CodeIntelResult<Vec<CodeSymbol>> {
         let _busy = self.begin().await?;
-        let root = self.folder(root)?;
+        let root = self.synced(root).await?;
         let params = lsp_types::WorkspaceSymbolParams {
             query: query.to_string(),
             work_done_progress_params: Default::default(),
@@ -839,36 +967,39 @@ impl LspSession {
         path: Option<&str>,
     ) -> CodeIntelResult<Vec<Diagnostic>> {
         let _busy = self.begin().await?;
-        let root = self.folder(root)?;
+        let root = self.synced(root).await?;
         let files: Vec<PathBuf> = match path {
             Some(rel) => {
                 let abs = text::resolve(&root, rel)?;
-                let notified = self.shared.diagnostics_changed.notified();
                 let was_open = self.docs.lock().await.open.contains_key(&abs);
                 self.open_doc(&abs, rel).await?;
                 if self.info().has("/diagnosticProvider") {
                     self.pull_diagnostics(&abs).await?;
-                } else if !was_open && !lock(&self.shared.diagnostics).contains_key(&abs) {
-                    // Just opened: give the server a moment to publish.
-                    let _ = tokio::time::timeout(self.options.diagnostics_wait, async {
-                        tokio::pin!(notified);
-                        loop {
-                            notified.as_mut().await;
-                            if lock(&self.shared.diagnostics).contains_key(&abs) {
-                                break;
-                            }
-                            notified.set(self.shared.diagnostics_changed.notified());
-                        }
-                    })
-                    .await;
+                } else if !was_open || lock(&self.shared.stale).contains_key(&abs) {
+                    // Just opened or just changed: the server publishes
+                    // about the text it has now.
+                    self.wait_fresh(std::slice::from_ref(&abs)).await;
                 }
                 vec![abs]
             }
-            None => lock(&self.shared.diagnostics)
-                .keys()
-                .filter(|p| text::relative(&root, p).is_some())
-                .cloned()
-                .collect(),
+            None => {
+                let changed: Vec<PathBuf> = lock(&self.shared.stale)
+                    .keys()
+                    .filter(|p| p.starts_with(&root))
+                    .cloned()
+                    .collect();
+                for abs in &changed {
+                    if self.info().has("/diagnosticProvider") {
+                        self.pull_diagnostics(abs).await?;
+                    }
+                }
+                self.wait_fresh(&changed).await;
+                lock(&self.shared.diagnostics)
+                    .keys()
+                    .filter(|p| text::relative(&root, p).is_some())
+                    .cloned()
+                    .collect()
+            }
         };
         let raw: Vec<(PathBuf, Vec<lsp_types::Diagnostic>)> = {
             let cache = lock(&self.shared.diagnostics);
@@ -905,34 +1036,48 @@ impl LspSession {
     /// `textDocument/diagnostic` into the cache; an "unchanged" report keeps
     /// the cached one.
     async fn pull_diagnostics(&self, abs: &Path) -> CodeIntelResult<()> {
-        let params = lsp_types::DocumentDiagnosticParams {
+        let params = PullDiagnosticsParams {
             text_document: lsp_types::TextDocumentIdentifier {
                 uri: text::lsp_uri(abs),
             },
-            identifier: None,
-            previous_result_id: None,
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
         };
-        let report = self
-            .call::<lsp_types::request::DocumentDiagnosticRequest>(params)
-            .await?;
+        let report = self.call::<PullDiagnostics>(params).await?;
         if let lsp_types::DocumentDiagnosticReportResult::Report(
             lsp_types::DocumentDiagnosticReport::Full(full),
         ) = report
         {
-            lock(&self.shared.diagnostics).insert(
+            self.shared.reported(
                 abs.to_path_buf(),
                 full.full_document_diagnostic_report.items,
+                None,
             );
         }
         Ok(())
     }
 
+    /// Until the server has reported on each of `files` as they are now,
+    /// at most `diagnostics_wait`.
+    async fn wait_fresh(&self, files: &[PathBuf]) {
+        let _ = tokio::time::timeout(self.options.diagnostics_wait, async {
+            loop {
+                let notified = self.shared.diagnostics_changed.notified();
+                tokio::pin!(notified);
+                // Registered before the check: a report in between wakes it.
+                notified.as_mut().enable();
+                if files.iter().all(|f| self.shared.fresh(f)) {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await;
+    }
+
     /// The edits renaming the symbol at `at` to `new_name` would make,
     /// grouped by file, each file's edits last-first so they apply in
     /// order. Fails when the rename would also create, move or delete
-    /// files, or touch files outside `root`.
+    /// files, or touch files outside `root`. Each edit's `expect` is what
+    /// its range held in the server's copy of the file.
     pub async fn rename(
         &self,
         root: &Path,
@@ -941,7 +1086,7 @@ impl LspSession {
         new_name: &str,
     ) -> CodeIntelResult<Vec<TextEdit>> {
         let _busy = self.begin().await?;
-        let root = self.folder(root)?;
+        let root = self.synced(root).await?;
         let abs = text::resolve(&root, path)?;
         let text = self.open_doc(&abs, path).await?;
         let params = lsp_types::RenameParams {
@@ -969,10 +1114,14 @@ impl LspSession {
             let text = texts.get(&file).map(String::as_str).unwrap_or("");
             let mut edits: Vec<TextEdit> = edits
                 .into_iter()
-                .map(|e| TextEdit {
-                    path: rel.clone(),
-                    range: text::range_from_lsp(text, e.range, enc),
-                    new_text: e.new_text,
+                .map(|e| {
+                    let range = text::range_from_lsp(text, e.range, enc);
+                    TextEdit {
+                        path: rel.clone(),
+                        range,
+                        new_text: e.new_text,
+                        expect: text::slice(text, range).map(str::to_string),
+                    }
                 })
                 .collect();
             edits.sort_by_key(|e| std::cmp::Reverse(e.range.start));
@@ -989,7 +1138,7 @@ impl LspSession {
         at: Position,
     ) -> CodeIntelResult<Option<String>> {
         let _busy = self.begin().await?;
-        let root = self.folder(root)?;
+        let root = self.synced(root).await?;
         let abs = text::resolve(&root, path)?;
         let text = self.open_doc(&abs, path).await?;
         let params = lsp_types::HoverParams {
@@ -1008,43 +1157,10 @@ impl LspSession {
         let _busy = self.begin().await?;
         let root = self.folder(root)?;
         let abs = text::resolve(&root, path)?;
-        let now = tokio::fs::read_to_string(&abs).await.ok();
-        let syncs = !matches!(
-            self.info().caps.pointer("/textDocumentSync"),
-            Some(Value::Number(n)) if n.as_u64() == Some(0)
-        ) && !matches!(
-            self.info().caps.pointer("/textDocumentSync/change"),
-            Some(Value::Number(n)) if n.as_u64() == Some(0)
-        );
-        {
-            let mut docs = self.docs.lock().await;
-            match (docs.open.get_mut(&abs), &now) {
-                (Some(doc), Some(text)) if doc.text != *text => {
-                    doc.version += 1;
-                    doc.text = text.clone();
-                    if syncs {
-                        self.rpc.notify(
-                            "textDocument/didChange",
-                            json!({
-                                "textDocument": {"uri": text::file_uri(&abs), "version": doc.version},
-                                "contentChanges": [{"text": text}],
-                            }),
-                        );
-                    }
-                }
-                (Some(_), None) => {
-                    docs.open.remove(&abs);
-                    self.rpc.notify(
-                        "textDocument/didClose",
-                        json!({"textDocument": {"uri": text::file_uri(&abs)}}),
-                    );
-                }
-                _ => {}
-            }
-        }
+        self.sync_doc(&mut *self.docs.lock().await, &abs).await;
         if self.shared.watches_files.load(Ordering::SeqCst) {
             // 2 = changed, 3 = deleted.
-            let kind = if now.is_some() { 2 } else { 3 };
+            let kind = if abs.is_file() { 2 } else { 3 };
             self.rpc.notify(
                 "workspace/didChangeWatchedFiles",
                 json!({"changes": [{"uri": text::file_uri(&abs), "type": kind}]}),
@@ -1105,6 +1221,7 @@ impl LspSession {
             );
         }
         drop(docs);
+        lock(&self.shared.stale).retain(|p, _| !p.starts_with(&root));
         lock(&self.shared.diagnostics).retain(|p, _| !p.starts_with(&root));
         self.rpc.notify(
             "workspace/didChangeWorkspaceFolders",
@@ -1205,7 +1322,7 @@ fn initialize_params(root: &Path, config: &LaunchConfig) -> Value {
                 "definition": {"linkSupport": true},
                 "references": {},
                 "documentSymbol": {"hierarchicalDocumentSymbolSupport": true},
-                "publishDiagnostics": {"relatedInformation": false, "versionSupport": false},
+                "publishDiagnostics": {"relatedInformation": false, "versionSupport": true},
                 "diagnostic": {"dynamicRegistration": false, "relatedDocumentSupport": false},
                 "rename": {"prepareSupport": false},
                 "hover": {"contentFormat": ["markdown", "plaintext"]},
@@ -1289,8 +1406,40 @@ fn workspace_edits(
     Ok(out)
 }
 
+/// The server capability that offers a request, for those a server may
+/// lack.
+fn capability(method: &str) -> Option<&'static str> {
+    Some(match method {
+        "textDocument/definition" => "/definitionProvider",
+        "textDocument/references" => "/referencesProvider",
+        "textDocument/documentSymbol" => "/documentSymbolProvider",
+        "workspace/symbol" => "/workspaceSymbolProvider",
+        "textDocument/rename" => "/renameProvider",
+        "textDocument/hover" => "/hoverProvider",
+        "textDocument/diagnostic" => "/diagnosticProvider",
+        _ => return None,
+    })
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `textDocument/diagnostic`, with only the field every server needs. The
+/// crate's own params serialize their unset options as `null`, which tsgo
+/// refuses: "null value is not allowed for field identifier".
+enum PullDiagnostics {}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullDiagnosticsParams {
+    text_document: lsp_types::TextDocumentIdentifier,
+}
+
+impl lsp_types::request::Request for PullDiagnostics {
+    type Params = PullDiagnosticsParams;
+    type Result = lsp_types::DocumentDiagnosticReportResult;
+    const METHOD: &'static str = "textDocument/diagnostic";
 }
 
 #[cfg(test)]
@@ -1311,6 +1460,7 @@ mod tests {
             }),
             progress_changed: Notify::new(),
             diagnostics: Mutex::default(),
+            stale: Mutex::default(),
             diagnostics_changed: Notify::new(),
             watches_files: AtomicBool::new(false),
             stopping: AtomicBool::new(false),

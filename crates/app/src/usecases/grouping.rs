@@ -147,12 +147,19 @@ impl Core {
         let prev: Option<Grouping> = prev_row.and_then(|r| {
             let algo = theodore_domain::grouping::row_algo(&r.data);
             let same_rules = theodore_domain::grouping::row_review_hash(&r.data) == hash.as_deref();
-            serde_json::from_value::<Grouping>(r.data).ok().filter(|g| {
-                g.rev != head
-                    && !g.in_progress
-                    && algo >= theodore_domain::grouping::ALGO_VERSION
-                    && same_rules
-            })
+            serde_json::from_value::<Grouping>(r.data)
+                .ok()
+                .filter(|g| {
+                    g.rev != head
+                        && !g.in_progress
+                        && algo >= theodore_domain::grouping::ALGO_VERSION
+                        && same_rules
+                })
+                // Its catch-all isn't a group to place hunks in.
+                .map(|mut g| {
+                    g.groups.retain(|g| g.id.0 != UNGROUPED);
+                    g
+                })
         });
         let repo_scope = detail.summary.pr.repo.slug();
         let configured = self
@@ -175,8 +182,14 @@ impl Core {
             .instrument(span)
             .await;
         writer.finish(result.is_ok()).await;
-        if let Err(e @ AppError::Grouper(crate::error::GrouperError::Offline(_))) = &result {
-            // The agent couldn't reach its servers: the network, not a bug.
+        if let Err(
+            e @ AppError::Grouper(
+                crate::error::GrouperError::Offline(_) | crate::error::GrouperError::SignedOut(_),
+            ),
+        ) = &result
+        {
+            // The agent couldn't be reached or isn't signed in: the network
+            // or the user's to fix, not a bug.
             tracing::info!(
                 error.code = e.code(),
                 pr = %pr.0,
@@ -366,6 +379,89 @@ impl Core {
 
 /// The span a grouping run goes in. The grouper records when the first
 /// group was shown on it (`first_group_ms`).
+/// The id of the catch-all group `carry_grouping` adds.
+pub(crate) const UNGROUPED: &str = "ungrouped";
+
+impl Core {
+    /// A branch review moved to `head` without a regroup (a space's turn,
+    /// docs/spaces.md "Review of a space"): the stored grouping keeps its
+    /// groups and gets the hunks none of them holds in a trailing "Not
+    /// grouped yet" group, so no changed file is in none. Its `rev` stays,
+    /// so opening Review or Regroup still groups the new head; no agent runs.
+    pub(crate) async fn carry_grouping(&self, pr: &PrId, head: &theodore_domain::Sha) {
+        let entry = self
+            .0
+            .revisions
+            .read()
+            .await
+            .get(&(pr.clone(), head.clone()))
+            .cloned();
+        let Some(entry) = entry else {
+            return;
+        };
+        let store = self.0.deps.store.clone();
+        let id = pr.0.clone();
+        let row = tokio::task::spawn_blocking(move || store.get(models::GROUPING, &id))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .flatten();
+        let Some(row) = row else {
+            return;
+        };
+        let Ok(mut grouping) = serde_json::from_value::<Grouping>(row.data.clone()) else {
+            return;
+        };
+        if grouping.in_progress {
+            return;
+        }
+        let before = grouping.groups.clone();
+        grouping.groups.retain(|g| g.id.0 != UNGROUPED);
+        if grouping.groups.is_empty() {
+            return;
+        }
+        let taken: BTreeSet<theodore_domain::HunkId> = grouping
+            .groups
+            .iter()
+            .flat_map(|g| g.hunks.iter().cloned())
+            .collect();
+        let rest: Vec<theodore_domain::HunkId> = entry
+            .revision
+            .hunks()
+            .map(|h| h.id.clone())
+            .filter(|h| !taken.contains(h))
+            .collect();
+        if !rest.is_empty() {
+            grouping.groups.push(theodore_domain::Group {
+                id: theodore_domain::GroupId::new(UNGROUPED),
+                title: "Not grouped yet".into(),
+                why: "Changed since the last grouping. Regroup places them.".into(),
+                kind: theodore_domain::GroupKind::Normal,
+                risk: None,
+                check: vec![],
+                hunks: rest,
+                outliers: vec![],
+            });
+        }
+        if grouping.groups == before {
+            return;
+        }
+        let mut data = row.data;
+        let Ok(groups) = serde_json::to_value(&grouping.groups) else {
+            return;
+        };
+        data["groups"] = groups;
+        let _ = self
+            .apply(vec![NewAction {
+                model: models::GROUPING.into(),
+                model_id: pr.0.clone(),
+                action: SyncActionCode::U,
+                data: Some(data),
+            }])
+            .await;
+    }
+}
+
 pub(crate) fn grouping_span(pr: &PrId, agent: AgentId, incremental: bool) -> tracing::Span {
     tracing::info_span!(
         "grouping",
@@ -728,7 +824,12 @@ pub async fn symbol_links(
     let mut found: Vec<(usize, usize, String)> = Vec::new();
     for (from, name, hits) in hits {
         let mut kept = 0;
-        for h in hits.iter().filter(|h| !h.is_definition) {
+        // A text hit is only the same word: a column `name` in a migration
+        // says nothing about a function `name()`.
+        for h in hits
+            .iter()
+            .filter(|h| !h.is_definition && h.source != theodore_ports::Source::Text)
+        {
             if kept >= limits.max_links_per_symbol {
                 break;
             }
@@ -1051,6 +1152,8 @@ mod link_tests {
             Ok(())
         }
         async fn close(&self, _root: &Path) {}
+        async fn warm(&self, _root: &Path) {}
+        async fn set_lsp(&self, _root: &Path, _on: bool) {}
         async fn find_symbol(
             &self,
             _root: &Path,
@@ -1279,6 +1382,19 @@ mod link_tests {
             SymbolLinkLimits::default(),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn the_same_word_found_by_text_search_links_nothing() {
+        let (rev, _) = rev();
+        let mut port = Port {
+            symbols: vec![parse_config()],
+            ..Port::default()
+        };
+        let mut word = hit("src/main.rs", 5, false);
+        word.source = Source::Text;
+        port.refs.insert(("src/config.rs".into(), 10), vec![word]);
+        assert_eq!(links(port, &rev).await, Vec::<SymbolLink>::new());
     }
 
     #[tokio::test]

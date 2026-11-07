@@ -46,7 +46,10 @@ fn err(e: theodore_grouping::GroupingPipelineError) -> GrouperError {
             let text = e.to_string();
             match theodore_ports::offline_message_in(&text) {
                 Some(offline) => GrouperError::Offline(offline.to_string()),
-                None => GrouperError::Agent(text),
+                None => match theodore_ports::signed_out_message_in(&text) {
+                    Some(signed_out) => GrouperError::SignedOut(signed_out),
+                    None => GrouperError::Agent(text),
+                },
             }
         }
     }
@@ -217,6 +220,19 @@ mod tests {
         assert_eq!(e.code(), "agent.offline");
         let e = err(GroupingPipelineError::AgentRun("exited 1: boom".into()));
         assert!(matches!(e, GrouperError::Agent(_)), "{e:?}");
+    }
+
+    #[test]
+    fn an_agent_that_is_signed_out_says_how_to_sign_in() {
+        let msg = theodore_ports::signed_out_message("codex");
+        let e = err(GroupingPipelineError::AgentRun(format!(
+            "{msg}: unexpected status 401 Unauthorized"
+        )));
+        assert!(
+            matches!(&e, GrouperError::SignedOut(m) if *m == msg),
+            "{e:?}"
+        );
+        assert_eq!(e.code(), "agent.signed_out");
     }
 
     /// The app streams Claude and Gemini groupings (each group handed on

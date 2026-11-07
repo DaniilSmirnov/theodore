@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { SpaceUpdate } from '../../gen/contract';
-import { baseMovedLabel, resolvingText } from './BaseUpdate';
+import { baseMovedLabel, resolvingText, updateOutcome } from './BaseUpdate';
 
 const updating = (conflicts: string[]): SpaceUpdate => ({
   base_tip: 't',
@@ -32,6 +32,18 @@ describe('update from base', () => {
         { base_tip: 't', behind: 2 },
       ),
     ).toBeNull();
+  });
+
+  it('confirms an update that went through, and says nothing on conflicts', () => {
+    const done = { base: 'main', updating: null };
+    expect(updateOutcome('update', done)).toBe('Updated from main');
+    expect(updateOutcome('complete', done)).toBe('Merged main into the space');
+    expect(updateOutcome('abort', done)).toBe(
+      'Update aborted: back where it started',
+    );
+    const resolving = { base: 'main', updating: updating(['a.ts']) };
+    expect(updateOutcome('update', resolving)).toBeNull();
+    expect(updateOutcome('complete', resolving)).toBeNull();
   });
 
   it('names the conflicted files while resolving', () => {

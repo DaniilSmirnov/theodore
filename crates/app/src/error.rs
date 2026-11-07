@@ -17,6 +17,10 @@ pub enum AppError {
     NotFound(String),
     #[error("invalid request: {0}")]
     Invalid(String),
+    /// The host refused a write the caller waited on: its own words, as
+    /// they'd show in the outbox's toast.
+    #[error("{0}")]
+    Refused(String),
     #[error("background task failed: {0}")]
     Join(String),
     #[error("account: {0}")]
@@ -51,11 +55,21 @@ impl AppError {
             AppError::Grouper(e) => e.code(),
             AppError::NotFound(_) => "app.not_found",
             AppError::Invalid(_) => "app.invalid",
+            AppError::Refused(_) => "host.refused",
             AppError::Join(_) => "app.internal",
             AppError::Account(e) => e.code(),
             AppError::AccountRequired => "account.required",
             AppError::OfflineNotCached => "app.offline_not_cached",
             AppError::Offline => "app.offline",
+        }
+    }
+
+    /// What a person reads (a toast, a dialog): a refusal says its reason
+    /// without the "invalid request:" prefix the log keeps (`Display`).
+    pub fn user_message(&self) -> String {
+        match self {
+            AppError::Invalid(m) => m.clone(),
+            other => other.to_string(),
         }
     }
 
@@ -75,6 +89,7 @@ impl AppError {
             self,
             AppError::NotFound(_)
                 | AppError::Invalid(_)
+                | AppError::Refused(_)
                 | AppError::AccountRequired
                 | AppError::OfflineNotCached
                 | AppError::Offline
@@ -83,6 +98,7 @@ impl AppError {
                 | AppError::Git(theodore_ports::GitError::Refused(_))
                 | AppError::Git(theodore_ports::GitError::Busy(_))
                 | AppError::Git(theodore_ports::GitError::Unsupported(_))
+                | AppError::Git(theodore_ports::GitError::MissingCommit(_))
         )
     }
 }
@@ -97,6 +113,9 @@ pub enum GrouperError {
     /// The agent couldn't reach its servers (`ports::offline_message`).
     #[error("{0}")]
     Offline(String),
+    /// The agent isn't signed in (`ports::signed_out_message`).
+    #[error("{0}")]
+    SignedOut(String),
 }
 
 impl GrouperError {
@@ -105,6 +124,7 @@ impl GrouperError {
             GrouperError::Agent(_) => "grouping.agent_failed",
             GrouperError::Invalid(_) => "grouping.invalid_output",
             GrouperError::Offline(_) => theodore_ports::AGENT_OFFLINE_CODE,
+            GrouperError::SignedOut(_) => theodore_ports::AGENT_SIGNED_OUT_CODE,
         }
     }
 }
@@ -139,6 +159,7 @@ mod tests {
             ),
             (HostError::NotFound(String::new()).into(), "host.not_found"),
             (HostError::Network("dns".into()).into(), "host.network"),
+            (HostError::Server("502".into()).into(), "host.server_error"),
             (HostError::Protocol("x".into()).into(), "host.protocol"),
             (
                 GrouperError::Invalid("bad json".into()).into(),
@@ -171,5 +192,22 @@ mod tests {
             assert!(parts.next().is_some_and(|p| !p.is_empty()));
             assert!(parts.next().is_some_and(|p| !p.is_empty()));
         }
+    }
+
+    #[test]
+    fn a_refusal_reads_without_the_invalid_request_prefix() {
+        let e = AppError::Invalid("conflicts left in notes.md; abort the update".into());
+        assert_eq!(
+            e.user_message(),
+            "conflicts left in notes.md; abort the update"
+        );
+        assert!(
+            e.to_string().starts_with("invalid request: "),
+            "logs keep it"
+        );
+        assert_eq!(
+            AppError::NotFound("pr".into()).user_message(),
+            "not found: pr"
+        );
     }
 }

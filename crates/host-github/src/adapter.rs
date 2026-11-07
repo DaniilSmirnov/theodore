@@ -10,7 +10,7 @@ use theodore_host_http::{HttpClient, TokenSource};
 use theodore_ports::{
     Capabilities, Changes, Clock, CreatedIssue, Fetched, HostAdapter, HostError, HostResult,
     InboxSection, IssueTracker, MergeMethod, MergeState, MergeStatus, NewIssue, NewPr,
-    ReviewComment, ReviewSubmission, SubmittedReview, TrackedIssue,
+    ReviewComment, ReviewSubmission, Searched, SubmittedReview, TrackedIssue,
 };
 
 use crate::{anchor, graphql, logs, pagination, rest, time};
@@ -92,8 +92,12 @@ impl GithubAdapter {
     }
 
     async fn changed_since_via_search(&self) -> HostResult<Changes> {
-        let nodes = graphql::search_prs(&self.graphql, "is:pr is:open involves:@me").await?;
-        let prs = nodes.iter().filter_map(search_node_to_pr_ref).collect();
+        let found = graphql::search_prs(&self.graphql, "is:pr is:open involves:@me").await?;
+        let prs = found
+            .nodes
+            .iter()
+            .filter_map(search_node_to_pr_ref)
+            .collect();
         Ok(Changes {
             prs,
             cursor: "search-fallback".to_string(),
@@ -301,12 +305,23 @@ impl HostAdapter for GithubAdapter {
     }
 
     async fn search(&self, section: &InboxSection) -> HostResult<Vec<PrSummary>> {
+        Ok(self.search_checked(None, section).await?.prs)
+    }
+
+    async fn search_checked(
+        &self,
+        _repo: Option<&RepoRef>,
+        section: &InboxSection,
+    ) -> HostResult<Searched> {
         let (query, reason) = section_query(section);
-        let nodes = graphql::search_prs(&self.graphql, &query).await?;
-        Ok(nodes
+        let found = graphql::search_prs(&self.graphql, &query).await?;
+        let prs: Vec<PrSummary> = found
+            .nodes
             .iter()
             .filter_map(|n| search_node_to_summary(n, reason))
-            .collect())
+            .collect();
+        let complete = found.total.is_some_and(|total| prs.len() as u64 >= total);
+        Ok(Searched { prs, complete })
     }
 
     async fn list_repos(&self) -> HostResult<Vec<HostRepo>> {
@@ -358,10 +373,19 @@ impl HostAdapter for GithubAdapter {
         Ok(pull_to_pr_ref(repo, pull))
     }
 
-    async fn my_open_issues(&self, repo: &RepoRef) -> HostResult<Vec<TrackedIssue>> {
-        let me = self.viewer().await?.login;
-        let issues = rest::list_assigned_issues(&self.rest, &repo.owner, &repo.name, &me).await?;
-        Ok(issues.into_iter().map(gh_issue_to_tracked).collect())
+    async fn open_issues(&self, repo: &RepoRef) -> HostResult<Vec<TrackedIssue>> {
+        let all = rest::list_open_issues(&self.rest, &repo.owner, &repo.name, None).await?;
+        // Yours first; without a viewer the list is still the repo's.
+        let mine = match self.viewer().await {
+            Ok(me) => {
+                rest::list_open_issues(&self.rest, &repo.owner, &repo.name, Some(&me.login)).await?
+            }
+            Err(_) => Vec::new(),
+        };
+        let tracked = |v: Vec<rest::GhIssueFull>| -> Vec<TrackedIssue> {
+            v.into_iter().map(gh_issue_to_tracked).collect()
+        };
+        Ok(theodore_ports::mine_first(tracked(mine), tracked(all)))
     }
 
     async fn get_issue(&self, repo: &RepoRef, number: u64) -> HostResult<TrackedIssue> {
@@ -428,6 +452,29 @@ impl HostAdapter for GithubAdapter {
             }
         }
         Ok(None)
+    }
+
+    async fn find_markers(
+        &self,
+        pr: &PrRef,
+        markers: &[String],
+    ) -> HostResult<std::collections::HashSet<String>> {
+        if markers.is_empty() {
+            return Ok(Default::default());
+        }
+        let threads = self
+            .fetch_all_threads(&pr.repo.owner, &pr.repo.name, pr.number)
+            .await?;
+        Ok(markers
+            .iter()
+            .filter(|m| {
+                let tag = marker_tag(m);
+                threads
+                    .iter()
+                    .any(|t| t.comments.iter().any(|c| c.body.contains(&tag)))
+            })
+            .cloned()
+            .collect())
     }
 
     async fn reply(&self, _pr: &PrRef, thread: &ThreadId, body: &str) -> HostResult<CommentId> {
@@ -964,6 +1011,7 @@ fn gh_issue_to_tracked(issue: rest::GhIssueFull) -> TrackedIssue {
         title: issue.title,
         body: issue.body.unwrap_or_default(),
         url: issue.html_url,
+        closed: issue.state.as_deref() == Some("closed"),
     }
 }
 

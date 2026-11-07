@@ -3,15 +3,12 @@ import { ThemePicker } from './ThemePicker';
 import {
   ArrowLeft,
   ArrowRotateRight,
-  ChevronRight,
   CircleCheckFill,
   CircleInfo,
   Cpu,
   Cubes3,
   Flask,
-  Folder,
   Gear,
-  Grip,
   Keyboard,
   Lock,
   LogoGithub,
@@ -36,13 +33,11 @@ import {
   Typography,
 } from '@heroui/react';
 import { observer } from 'mobx-react-lite';
-import { useDragAndDrop, type Key } from 'react-aria-components';
 import type {
   AgentId,
   AgentStatus,
   AppInfo,
   HostAuthStatus,
-  Project,
   UpdateInfo,
 } from '../gen/contract';
 import { api, CommandFailure } from '../core/api';
@@ -50,7 +45,7 @@ import { checkFailureText, isOffline } from '../core/updateCheck';
 import { useViewKeys } from './keys';
 import { setSetting } from '../actions';
 import { useDeviceLogin } from '../core/deviceLogin';
-import { useRootStore, useUi, useWorkspaces } from '../stores/context';
+import { useRootStore, useUi } from '../stores/context';
 import type { SettingsPage as Page } from '../stores/UiStore';
 import { AgentTag, Avatar, Btn, K, Spinner } from './bits';
 import {
@@ -67,9 +62,6 @@ import { AccountCard } from './AccountCard';
 import { buildLabel, buildReport, builtAtIso } from './buildStamp';
 import { DeviceLoginPanel } from './DeviceLoginPanel';
 import { IntegrationsPage } from './linear/IntegrationsPage';
-import { projectLabel } from './Projects';
-import { ConfigEditor } from './project/ConfigEditor';
-import { ProjectLanguages } from './project/ProjectLanguages';
 import { PrivacyCard } from './Privacy';
 import { SandboxBadge } from './sandbox/SandboxBadge';
 import { SandboxPage } from './sandbox/SandboxPage';
@@ -80,8 +72,12 @@ import { isHostOn, isLinearOn } from './settings/labs';
 import { LabsPage as ExperimentsPage } from './settings/LabsPage';
 
 const AGENTS: AgentId[] = ['claude', 'codex', 'gemini'];
-const AI_KEYS = ['agents.grouping', 'agents.chat', 'agents.fix'] as const;
-const AI_TITLE: Record<(typeof AI_KEYS)[number], string> = {
+export const AI_KEYS = [
+  'agents.grouping',
+  'agents.chat',
+  'agents.fix',
+] as const;
+export const AI_TITLE: Record<(typeof AI_KEYS)[number], string> = {
   'agents.grouping': 'Diff grouping',
   'agents.chat': 'Chat questions',
   'agents.fix': 'Finding fixes',
@@ -93,7 +89,6 @@ const PAGES: { id: Page; title: string; icon: ReactNode }[] = [
   { id: 'appearance', title: 'Appearance', icon: <Palette /> },
   { id: 'agents', title: 'Agents', icon: <Cpu /> },
   { id: 'integrations', title: 'Integrations', icon: <PlugConnection /> },
-  { id: 'projects', title: 'Projects', icon: <Folder /> },
   { id: 'about', title: 'About & updates', icon: <CircleInfo /> },
   { id: 'sandbox', title: 'Sandbox', icon: <Cubes3 /> },
   { id: 'labs', title: 'Spaces', icon: <Sparkles /> },
@@ -106,8 +101,6 @@ const SUB: Record<Page, string> = {
   appearance: 'How Theodore looks. System follows macOS.',
   agents: 'Agent CLIs on this computer, and which one handles each task.',
   integrations: 'Other tools Theodore can link PRs to.',
-  projects: 'Connected repositories and the settings effective in each.',
-  languages: 'Connected repositories and the settings effective in each.',
   updates: 'Version, release channel and updates.',
   about: 'Version, release channel and updates.',
   sandbox: 'The simulated host this window runs against: faults and timeline.',
@@ -175,13 +168,7 @@ export const SettingsNav = observer(function SettingsNav({
       <ListBox
         aria-label="Settings pages"
         selectionMode="single"
-        selectedKeys={[
-          page === 'updates'
-            ? 'about'
-            : page === 'languages'
-              ? 'projects'
-              : page,
-        ]}
+        selectedKeys={[page === 'updates' ? 'about' : page]}
         onSelectionChange={(keys) => {
           const k = keys === 'all' ? undefined : [...keys][0];
           if (k) ui.go({ name: 'settings', page: k as Page });
@@ -825,6 +812,16 @@ const UpdatesPage = observer(function UpdatesPage() {
       })
       .finally(() => setChecking(false));
   };
+  if (store.ephemeral.appInfo?.build_env === 'nightly') {
+    return (
+      <section className="flex flex-col gap-2">
+        <Typography.Heading level={6}>Updates</Typography.Heading>
+        <Card variant="secondary" className="px-4 py-3 text-sm text-muted">
+          A nightly build doesn't update itself. Build a new one to move ahead.
+        </Card>
+      </section>
+    );
+  }
   return (
     <>
       <section className="flex flex-col gap-2">
@@ -907,7 +904,7 @@ const UpdatesPage = observer(function UpdatesPage() {
 });
 
 /** What `key` resolves to for `scope`, and where that value came from. */
-function effectiveOf(
+export function effectiveOf(
   store: ReturnType<typeof useRootStore>,
   scope: string,
   key: string,
@@ -922,154 +919,11 @@ function effectiveOf(
 
 const AGENT_DEFAULT: AgentId = 'claude';
 
-const SOURCE_NOTE: Record<'repo' | 'user' | 'default', string> = {
+export const SOURCE_NOTE: Record<'repo' | 'user' | 'default', string> = {
   repo: 'from this project’s config files',
   user: 'from your user settings',
   default: 'default',
 };
-
-/** Settings → Projects → ⟨repo⟩: the settings effective for this repo and
- *  where each came from, its languages (`ProjectLanguages`), then the
- *  project's config file: create it from
- *  these settings, edit, check and save it (`ConfigEditor`). */
-const RepoSettingsPage = observer(function RepoSettingsPage({
-  project,
-  onBack,
-}: {
-  project: Project;
-  onBack: () => void;
-}) {
-  const store = useRootStore();
-  // Bumped when the Languages switches write the local file, so the
-  // config editor below reads it again.
-  const [configRev, setConfigRev] = useState(0);
-  const scope = `repo:${project.repo.owner}/${project.repo.name}`;
-  const rows: { key: string; title: string }[] = [
-    ...AI_KEYS.map((key) => ({ key, title: AI_TITLE[key] })),
-  ];
-  return (
-    <>
-      <Button
-        variant="ghost"
-        size="sm"
-        className="repo-settings-back w-fit gap-2 px-2 text-muted"
-        onPress={onBack}
-      >
-        <ArrowLeft className="size-4" />
-        Projects
-      </Button>
-      <section className="flex flex-col gap-2">
-        <Typography.Heading level={6}>Effective settings</Typography.Heading>
-        <Card variant="secondary" className="gap-0 p-0">
-          {rows.map((r) => {
-            const eff = effectiveOf(store, scope, r.key);
-            return (
-              <div
-                key={r.key}
-                className="set-row flex items-center gap-4 border-b border-separator px-4 py-3 last:border-b-0"
-              >
-                <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                  <span className="text-sm font-medium">{r.title}</span>
-                  <span className="text-xs text-muted">
-                    {SOURCE_NOTE[eff.source]}
-                  </span>
-                </div>
-                <span className="text-sm tabular-nums text-muted">
-                  {eff.value == null ? '—' : String(eff.value)}
-                </span>
-              </div>
-            );
-          })}
-        </Card>
-        <span className="text-xs text-muted">
-          A value from the project’s config wins over your user settings for
-          this repo — change it in the config below.
-        </span>
-      </section>
-      <Separator />
-      <ProjectLanguages
-        key={project.id}
-        project={project}
-        onConfigWritten={() => setConfigRev((r) => r + 1)}
-      />
-      <Separator />
-      <ConfigEditor project={project} rev={configRev} />
-    </>
-  );
-});
-
-const ProjectsPage = observer(function ProjectsPage() {
-  const store = useRootStore();
-  const ui = useUi();
-  const ws = useWorkspaces();
-  const projects = ws.projects; // switcher order, not add order
-  const [sel, setSel] = useState<string | null>(null);
-  const project = sel ? store.models.projects.get(sel) : undefined;
-  const { dragAndDropHooks } = useDragAndDrop({
-    getItems: (keys) => [...keys].map((key) => ({ 'text/plain': String(key) })),
-    onReorder(e) {
-      const { dropPosition } = e.target;
-      if (dropPosition !== 'before' && dropPosition !== 'after') return;
-      ws.reorder([...e.keys].map(String), String(e.target.key), dropPosition);
-    },
-  });
-  if (project) {
-    return <RepoSettingsPage project={project} onBack={() => setSel(null)} />;
-  }
-  return (
-    <section className="flex flex-col gap-2">
-      <Typography.Heading level={6}>Connected repositories</Typography.Heading>
-      {projects.length === 0 ? (
-        <div className="flex items-center gap-3">
-          <span className="flex-1 text-sm text-muted">
-            No projects yet — connect a repository or a local folder.
-          </span>
-          <Button
-            size="sm"
-            variant="secondary"
-            onPress={() => ui.openModal('add-project')}
-          >
-            Add project…
-          </Button>
-        </div>
-      ) : (
-        <>
-          <Card variant="secondary" className="gap-0 p-0">
-            <ListBox
-              aria-label="Projects"
-              selectionMode="none"
-              dragAndDropHooks={dragAndDropHooks}
-              onAction={(k: Key) => setSel(String(k))}
-              className="p-0 [&>*+*]:mt-0"
-            >
-              {projects.map((p) => (
-                <ListBox.Item
-                  key={p.id}
-                  id={p.id}
-                  textValue={projectLabel(p)}
-                  className="repo-row flex w-full items-center gap-3 rounded-none border-b border-separator px-4 py-3 last:border-b-0 hover:bg-default/50 data-[dragging]:opacity-50"
-                >
-                  <Grip
-                    aria-hidden
-                    className="size-4 shrink-0 cursor-grab text-muted"
-                  />
-                  <Folder className="size-4 text-muted" />
-                  <span className="min-w-0 flex-1 truncate text-sm">
-                    {projectLabel(p)}
-                  </span>
-                  <ChevronRight className="size-4 text-muted" />
-                </ListBox.Item>
-              ))}
-            </ListBox>
-          </Card>
-          <span className="text-xs text-muted">
-            Drag to reorder — the switcher and ⌃1…9 follow this order.
-          </span>
-        </>
-      )}
-    </section>
-  );
-});
 
 const AboutPage = observer(function AboutPage() {
   const ui = useUi();
@@ -1172,10 +1026,8 @@ export const SettingsPage = observer(function SettingsPage({
 }) {
   const store = useRootStore();
   const labs = isLabsVisible(store);
-  // Old page ids: `updates` now lives on About & updates, `languages` in
-  // each project's settings.
-  const shown: Page =
-    page === 'updates' ? 'about' : page === 'languages' ? 'projects' : page;
+  // Old page id: `updates` now lives on About & updates.
+  const shown: Page = page === 'updates' ? 'about' : page;
   const title = PAGES.find((p) => p.id === shown)?.title ?? 'Settings';
   return (
     <div className="view settings-page flex min-w-0 flex-1 flex-col overflow-auto">
@@ -1197,8 +1049,6 @@ export const SettingsPage = observer(function SettingsPage({
           isLinearOn(store) ? (
             <IntegrationsPage />
           ) : null
-        ) : shown === 'projects' ? (
-          <ProjectsPage />
         ) : page === 'sandbox' ? (
           <SandboxPage />
         ) : page === 'labs' ? (

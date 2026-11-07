@@ -4,7 +4,8 @@
  * one this box talks to. "Models" holds every model each CLI offers (older
  * versions one level down), "Effort" the levels the current model takes,
  * and ⌘⇧/ cycles the effort from the box the chip sits in. Model and effort
- * are the agent's settings, shared everywhere.
+ * are the agent's settings, shared everywhere. The same chip sits in a
+ * space's box and in the AI panel's.
  */
 import { useEffect, useMemo, useRef } from 'react';
 import { Check, ChevronDown, Gear } from '@gravity-ui/icons';
@@ -123,17 +124,14 @@ export const AgentMenu = observer(function AgentMenu({
   agents,
   selected,
   onSelect,
-  multiple,
   isDisabled,
   ultracode,
 }: {
   /** Offered: installed and enabled. */
   agents: AgentId[];
-  /** The first runs chat turns; all of them run skills (`multiple`). */
-  selected: AgentId[];
-  onSelect: (next: AgentId[]) => void;
-  /** Skills may run on several agents at once (the AI panel). */
-  multiple?: boolean;
+  /** The agent this box talks to (the first offered when null). */
+  selected: AgentId | null;
+  onSelect: (next: AgentId) => void;
   isDisabled?: boolean;
   /** A space's box: Claude also offers Ultracode, past Max. */
   ultracode?: boolean;
@@ -142,8 +140,7 @@ export const AgentMenu = observer(function AgentMenu({
   const ui = useUi();
   const chip = useRef<HTMLSpanElement>(null);
   const catalog = useAgentModels(agents);
-  const primary = selected[0] ?? agents[0] ?? null;
-  const others = selected.slice(1);
+  const primary = selected ?? agents[0] ?? null;
   const now: Partial<Record<AgentId, Running>> = {};
   for (const a of agents) now[a] = running(store, a, catalog[a]);
   const cur = primary ? now[primary] : undefined;
@@ -196,9 +193,7 @@ export const AgentMenu = observer(function AgentMenu({
   }, [store, primary, levels, isDisabled]);
 
   const switchTo = (agent: AgentId) => {
-    if (agent !== primary) {
-      onSelect([agent, ...others.filter((a) => a !== agent)]);
-    }
+    if (agent !== primary) onSelect(agent);
   };
   const pick = (key: string) => {
     const [agent, id] = key.split('|') as [AgentId, string];
@@ -209,24 +204,26 @@ export const AgentMenu = observer(function AgentMenu({
     switchTo(agent);
   };
 
-  const extra = others.map((a) => AGENT_NAME[a]).join(' + ');
-
   return (
-    <span ref={chip} className="flex min-w-0 shrink">
+    <span ref={chip} className="flex min-w-[6.5rem] shrink">
       <Dropdown>
         <Button
           size="sm"
           variant="tertiary"
           aria-label="Model"
           isDisabled={isDisabled}
-          className="min-w-0 shrink gap-1.5 rounded-full px-3 text-xs"
+          // Squeezed by a running turn's Stop / Queue / Send now, it keeps
+          // enough room for a short model name, never a bare chevron.
+          className="min-w-[6.5rem] shrink gap-1.5 rounded-full px-3 text-xs"
         >
           <span className="min-w-0 truncate">
             {primary ? (cur?.model?.label ?? AGENT_NAME[primary]) : 'agent'}
             {cur?.effort && (
-              <span className="text-muted"> {effortLabel(cur.effort)}</span>
+              <span className="agent-effort text-muted">
+                {' '}
+                {effortLabel(cur.effort)}
+              </span>
             )}
-            {extra && <span className="text-muted"> + {extra}</span>}
           </span>
           <ChevronDown className="size-3 shrink-0 text-muted" />
         </Button>
@@ -354,50 +351,6 @@ export const AgentMenu = observer(function AgentMenu({
                         )}
                       </Dropdown.Item>
                     ))}
-                  </Dropdown.Menu>
-                </Dropdown.Popover>
-              </Dropdown.SubmenuTrigger>
-            ) : null}
-            {multiple && primary && agents.length > 1 ? (
-              <Dropdown.SubmenuTrigger>
-                <Dropdown.Item
-                  id="also"
-                  textValue="Skills also run on"
-                  className="gap-2"
-                >
-                  <span className="flex-1">Skills also run on</span>
-                  <span className="text-xs text-muted">
-                    {others.length
-                      ? others.map((a) => AGENT_NAME[a]).join(', ')
-                      : 'None'}
-                  </span>
-                  <Dropdown.SubmenuIndicator />
-                </Dropdown.Item>
-                <Dropdown.Popover placement="right top">
-                  <Dropdown.Menu
-                    aria-label="Skills also run on"
-                    selectionMode="multiple"
-                    selectedKeys={new Set(others)}
-                    onSelectionChange={(keys) => {
-                      const also = agents.filter(
-                        (a) => a !== primary && (keys === 'all' || keys.has(a)),
-                      );
-                      onSelect([primary, ...also]);
-                    }}
-                  >
-                    {agents
-                      .filter((a) => a !== primary)
-                      .map((a) => (
-                        <Dropdown.Item
-                          key={a}
-                          id={a}
-                          textValue={AGENT_NAME[a]}
-                          className="gap-2"
-                        >
-                          <span className="flex-1">{AGENT_NAME[a]}</span>
-                          <Dropdown.ItemIndicator />
-                        </Dropdown.Item>
-                      ))}
                   </Dropdown.Menu>
                 </Dropdown.Popover>
               </Dropdown.SubmenuTrigger>

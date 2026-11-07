@@ -313,7 +313,7 @@ async fn faults_map_to_host_errors() {
     sb.set_fault("server_errors", true, Some(1.0)).unwrap();
     assert!(matches!(
         host.get_pr(&p, None).await,
-        Err(HostError::Network(_))
+        Err(HostError::Server(_))
     ));
     sb.set_fault("server_errors", false, None).unwrap();
     assert!(sb.set_fault("gremlins", true, None).is_err());

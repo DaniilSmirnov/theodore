@@ -107,14 +107,19 @@ pub fn build_args(req: &AgentRequest, cfg: &AgentBinaryConfig) -> Vec<String> {
     args.extend(cfg.extra_args.iter().cloned());
     if let Some(thread) = &req.resume {
         // The thread already opens with the system prompt (folded into its
-        // first turn, below): only the new turn goes in.
+        // first turn, below): only the new turn goes in. Except in Plan mode:
+        // a thread opened in another one never heard the Plan rules.
+        let prompt = match (&req.system, req.mode) {
+            (Some(system), AgentMode::Plan) => format!("{system}\n\n{}", req.prompt),
+            _ => req.prompt.clone(),
+        };
         args.push("resume".to_string());
         for path in images {
             args.push("-i".to_string());
             args.push(path);
         }
         args.push(thread.clone());
-        args.push(req.prompt.clone());
+        args.push(prompt);
         return args;
     }
     // Codex exec has no --append-system-prompt; fold it into the prompt text.
@@ -536,6 +541,24 @@ mod model_tests {
             "{args:?}"
         );
         // Flags come before the prompt, which stays last.
+        assert_eq!(args.last().map(String::as_str), Some("p"));
+    }
+
+    /// A thread opened in another mode never heard the Plan rules, and the
+    /// run's read-only sandbox doesn't tell it to end in a plan.
+    #[test]
+    fn a_resumed_plan_turn_still_gets_the_system_prompt() {
+        let mut plan = req(None, None);
+        plan.mode = AgentMode::Plan;
+        plan.system = Some("Plan rules".into());
+        plan.resume = Some("thread-1".into());
+        let args = build_args(&plan, &Default::default());
+        assert_eq!(args.last().map(String::as_str), Some("Plan rules\n\np"));
+        assert_eq!(args[args.len() - 2], "thread-1");
+
+        // Any other mode: its thread already opens with the prompt.
+        plan.mode = AgentMode::Edit;
+        let args = build_args(&plan, &Default::default());
         assert_eq!(args.last().map(String::as_str), Some("p"));
     }
 

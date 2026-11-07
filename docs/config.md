@@ -32,7 +32,9 @@ global ──▶ repo ──▶ local ──▶ effective config
   ```
 
   It is read only from a local folder project's own checkout, never from a
-  space's worktree (where the agent could write it). A host project has no
+  space's worktree (where the agent could write it). Committed, it isn't
+  personal: it gets the repo layer's limits (no `lsp`, commands wait for
+  Allow). A host project has no
   checkout, so its local file lives in Theodore's data directory:
   `~/.theodore/projects/<host>/<owner>/<name>/config.local.yaml`.
 
@@ -225,8 +227,9 @@ archive ─▶ stop run ─▶ checkpoint ─▶ archive ─▶ remove worktree 
   **Fix with agent**. Notes from copying (a missing file, a path outside the
   project) are shown with it.
 - **No commands at all.** A project whose `spaces:` section sets none of
-  `setup` / `run` / `check` / `archive` shows **Set up with agent** instead:
-  a turn asking the space's agent to look at the repo (package manager,
+  `setup` / `run` / `check` / `archive` shows **Set up with agent** in a
+  quiet row above the composer (not while a turn runs; ✕ hides it for the
+  project): a turn asking the space's agent to look at the repo (package manager,
   lockfiles, README, Makefile/justfile, docker compose, existing scripts)
   and write the section. The agent edits `.theodore/config.yaml` with its
   normal tools, in its own worktree, like any other change — so whatever it
@@ -238,6 +241,23 @@ archive ─▶ stop run ─▶ checkpoint ─▶ archive ─▶ remove worktree 
   output, asking it to fix the script or the config. Setup itself is left
   `failed` — Retry and Continue without setup stay put, and a Retry that
   later succeeds still fires the goal it was waiting on.
+- **Retry reads the worktree's file.** So a command fixed in the space can
+  run before it ships. The one exception to "at the base":
+
+  ```
+  Retry ─▶ worktree's .theodore/config.yaml sets the setup, differs from the base's?
+             ├─ no (no file, no setup in it, same commands) ─▶ the base's, as before
+             └─ yes ─▶ allowed? ─yes─▶ runs
+                         └─no─▶ "Run commands from this repo?" shows the changed set
+                                  Allow   ─▶ runs; the base's set stays allowed too
+                                  Not now ─▶ setup skipped; the base's commands untouched
+  ```
+
+  | Read from | |
+  | --- | --- |
+  | the worktree, for a Retry only | the repo layer of that setup: its command and `env` |
+  | the base, as ever | `run`, `check`, `archive`, ports, `copy` |
+  | never a worktree | the personal local file |
 - **Check** is part of the turn: the space stays running until it ends, and
   Stop stops it too. A turn that changed nothing runs no check. Passed /
   failed shows as a chip on the turn, expandable to the output.
@@ -286,8 +306,12 @@ code_intel:
 - `lsp.*` is honoured only from your global and local files. A repo's file
   setting it is ignored, with a toast, and the editor warns on that line:
   a repo turning servers on for reviews of its own PRs would run their
-  authors' code. Each project's switches (Settings → Projects → ⟨project⟩
-  → Languages) write its local file; unset there, your global file applies.
+  authors' code. Each project's switches (workspace switcher → Project
+  settings → Languages) write its local file, ignored through the checkout's own
+  `info/exclude` so the checkout stays clean; unset there, your global file
+  applies. A repo that commits `.theodore/config.local.yaml` has no local
+  layer (the file counts as the repo's, above): the switches refuse, write
+  nothing, and say to set `code_intel.lsp.*` in your global file.
 
 - Read like the rest of the repo layer: at the base, never at a PR's head,
   so a PR can't change what gets downloaded or run.
@@ -301,10 +325,23 @@ code_intel:
 Each entry is a path relative to the project's folder: a file, a directory
 (copied whole), or a `*` / `?` glob in its last segment (`.env*`). Absolute
 paths, `..`, `.git` and symlinks are skipped with a note. Copying needs the
-project's own checkout: a host project has none, so `copy` is skipped there
-with a note. Unset by every layer, a space copies `.env*` by default — so a
+project's own checkout: a host project has none, so `copy` is skipped there,
+with a note only when a layer set `copy`. Unset by every layer, a space copies `.env*` by default — so a
 project with no config at all still gets its local secrets; set `copy: []`
 to turn that off.
+
+A copied file stays the space's own: one git would otherwise pick up
+(untracked, not ignored by the repo's `.gitignore` or your global one; the
+folder's own `.git/info/exclude` doesn't reach a space) is excluded in
+Theodore's cache of the project, by name, so it never enters a checkpoint, the
+diff or what ships. A file the base tracks stays tracked: a copy that differs
+from the base shows in the diff like any edit.
+
+Build junk is left out the same way, even in a repo with no `.gitignore`:
+`__pycache__/`, `*.pyc`/`*.pyo`, `node_modules/` and `.DS_Store` always,
+`/target/` when the space has a `Cargo.toml` at its root. Untracked files
+only: a repo that tracks such a file keeps shipping its changes. `dist/` and
+`build/` aren't on the list; too many repos commit them.
 
 ## 4. Variables
 
@@ -354,6 +391,9 @@ repo commands in effect ─▶ sha256 ─▶ allowed for this project? ─yes─
   `env`) are skipped, everything else works, and the space shows that they
   were skipped with a way to review and allow them later.
 - A value your local or global file overrides is not part of the set.
+- A Retry of setup asks about the set in the worktree's own file when it
+  differs from the base's (§2 "Retry reads the worktree's file"), with the
+  same fingerprint rule; nothing else is read from a worktree.
 
 ## 6. Global template
 
@@ -410,7 +450,7 @@ The change itself (docs/spaces.md §5):
 | Tool | Takes | Returns |
 | --- | --- | --- |
 | `ship` | `action`: `open_pr · open_draft_pr · push · merge_locally · keep_branch`; `title?` | `branch`, `sha`, `pr_number`, `pr_url`, a one-line `summary` |
-| `get_space_diff` | `file?`, `stat?` | `base`, `base_sha` (merge-base), `head`, `uncommitted`, `files` (status, +/−), `diff` (unified, at most 120 000 chars; `truncated`) |
+| `get_space_diff` | `file?`, `stat?` | `base`, `base_sha` (merge-base), `head`, `uncommitted` (edits since the last checkpoint), `files` (status, +/−), `diff` (unified, at most 120 000 chars; `truncated`) |
 | `get_review_comments` | `file?` | `items`: `kind` (`draft · finding · thread`), `on` (`space · pr`), `location`, `state` (`draft · open · resolved · outdated`), `severity`, `title`, `comments` (`author`: `you`, an agent or a login) |
 | `add_review_comment` | `file`, `line` (new side, 1-based), `body`, `severity?` (`info` default · `warn` · `high`) | `finding_id` |
 | `set_base` | `branch` | `base`, `base_sha`, `previous`, `note` (an open PR is not retargeted) |
@@ -449,7 +489,7 @@ Claude and Gemini get the server over HTTP, Codex through its
 
 ## 8. Creating and saving the config from Theodore
 
-Settings → Projects → ⟨project⟩ → **Config**.
+Workspace switcher → Project settings → **Config**.
 
 ```
 Create from current settings ─▶ the repo's file, else your local file, else generated:

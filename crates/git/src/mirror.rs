@@ -200,7 +200,15 @@ impl GitCli {
         let out = proc(
             folder,
             &askpass,
-            &["diff", "--name-only", "-z", a.as_str(), b.as_str()],
+            // No rename detection: a rename's old path changed too.
+            &[
+                "diff",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                a.as_str(),
+                b.as_str(),
+            ],
         )
         .run()
         .await?;
@@ -344,6 +352,27 @@ impl GitCli {
         for p in &changed {
             segments(p)?;
         }
+        // Edited in the folder since the last sync: not ours to overwrite.
+        // As the folder's own `HEAD` has it is no edit (a first sync from a
+        // base the folder isn't on).
+        let edited = self.edited_since(folder, from, &changed).await?;
+        let edited = if edited.is_empty() {
+            edited
+        } else {
+            let askpass = self.ensure_askpass()?;
+            let head = proc(folder, &askpass, &["rev-parse", "--verify", "HEAD"])
+                .run_text()
+                .await?;
+            self.edited_since(folder, &Sha::new(head.trim()), &edited)
+                .await?
+        };
+        if !edited.is_empty() {
+            return Err(GitError::Refused(format!(
+                "the folder was edited since mirroring: {}; nothing was synced. Commit or \
+                 undo those edits, or turn Mirror off and Discard them",
+                edited.join(", ")
+            )));
+        }
         let (to_checkout, to_delete) = self.split_by_tree(folder, to, &changed).await?;
         self.checkout_from_tree(folder, to, &to_checkout).await?;
         for p in &to_delete {
@@ -369,8 +398,19 @@ impl GitCli {
         for p in paths {
             segments(p)?;
         }
-        let (tracked, deleted) = self.split_by_tree(folder, to, paths).await?;
-        let mut edited = self.differs_from_tree(folder, to, &tracked).await?;
+        self.edited_since(folder, to, paths).await
+    }
+
+    /// Which of `paths` in `folder` aren't as they are at `tree`: changed,
+    /// or there though `tree` doesn't have them.
+    async fn edited_since(
+        &self,
+        folder: &Path,
+        tree: &Sha,
+        paths: &[String],
+    ) -> GitResult<Vec<String>> {
+        let (tracked, deleted) = self.split_by_tree(folder, tree, paths).await?;
+        let mut edited = self.differs_from_tree(folder, tree, &tracked).await?;
         for p in deleted {
             if folder.join(p).exists() {
                 edited.push(p.to_string());

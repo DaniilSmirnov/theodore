@@ -104,6 +104,7 @@ async fn links_for(
             review: false,
             spaces: false,
         }),
+        servers: Default::default(),
     };
     ci.open(ws)
         .await

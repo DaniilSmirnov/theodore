@@ -1,4 +1,4 @@
-/** Settings → Projects → ⟨project⟩ → Languages: the project's two
+/** Project settings → Languages: the project's two
  *  language-server switches (its local config file), then each of its
  *  languages with grammar, server, index and Install / Remove / Decline
  *  (`languages.ts`). */
@@ -14,6 +14,7 @@ import {
 import { observer } from 'mobx-react-lite';
 import type {
   CodeLanguage,
+  CodeLsp,
   CodeLspScope,
   CodeLspToggle,
   Project,
@@ -23,7 +24,6 @@ import { Shell, Spinner } from '../bits';
 import {
   INSTALL_POLICY_TEXT,
   LanguagesModel,
-  SERVER_STATE,
   canDecline,
   canInstall,
   canRemove,
@@ -35,6 +35,7 @@ import {
   languageName,
   lspNote,
   removeText,
+  runView,
   type InstallView,
   type LanguageProgress,
 } from './languages';
@@ -121,6 +122,7 @@ export const ProjectLanguages = observer(function ProjectLanguages({
               <LanguageRow
                 key={l.language}
                 lang={l}
+                lsp={status.lsp}
                 progress={model.progress.get(l.language)}
                 pending={model.pending.has(l.language)}
                 onInstall={() => void model.install(l.language)}
@@ -200,16 +202,22 @@ function LspRow({
   );
 }
 
-function StateChip({ view }: { view: Pick<InstallView, 'label' | 'tone'> }) {
-  return (
+function StateChip({
+  view,
+}: {
+  view: Pick<InstallView, 'label' | 'tone'> & { title?: string | null };
+}) {
+  const chip = (
     <Chip size="sm" variant="soft" color={view.tone} className="shrink-0">
       {view.label}
     </Chip>
   );
+  return view.title ? <span title={view.title}>{chip}</span> : chip;
 }
 
 function LanguageRow({
   lang,
+  lsp,
   progress,
   pending,
   onInstall,
@@ -217,15 +225,27 @@ function LanguageRow({
   onDecline,
 }: {
   lang: CodeLanguage;
+  lsp: CodeLsp;
   progress: LanguageProgress | undefined;
   pending: boolean;
   onInstall: () => void;
   onRemove: () => void;
   onDecline: () => void;
 }) {
-  const grammar = installView(lang.grammar);
-  const server = lang.server ? installView(lang.server.install) : null;
-  const running = lang.server ? SERVER_STATE[lang.server.state] : null;
+  // No grammar to get: not a problem to report, text search serves it.
+  const textOnly = lang.grammar.state === 'unavailable';
+  const grammar: InstallView = textOnly
+    ? {
+        label: 'Text search',
+        tone: 'default',
+        detail: null,
+        downloading: false,
+      }
+    : installView(lang.grammar);
+  const server = lang.server
+    ? installView(lang.server.install, lang.server.hint)
+    : null;
+  const running = lang.server ? runView(lang.server.state, lsp) : null;
   const download = downloadOf(progress);
   const downloading = isDownloading(lang, progress);
   const busy = pending || downloading;
@@ -237,12 +257,21 @@ function LanguageRow({
     (lang.server.install.state === 'system' ||
       lang.server.install.state === 'installed');
   return (
-    <div className="code-language set-row flex items-center gap-4 border-b border-separator px-4 py-3 last:border-b-0">
-      <div className="flex min-w-0 flex-1 flex-col gap-1">
+    // The buttons wrap under the text when the row is too narrow for both:
+    // three of them (Decline, Remove, Install) are wider than any fixed
+    // column, and the text column has a floor of its own.
+    <div className="code-language set-row flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-separator px-4 py-3 last:border-b-0">
+      <div className="flex min-w-[16rem] flex-1 flex-col gap-1">
         <span className="text-sm font-medium">
           {languageName(lang.language)}{' '}
           <span className="font-normal text-muted">
             · {lang.files} {lang.files === 1 ? 'file' : 'files'}
+            {!textOnly && (
+              <span className="tabular-nums" title="Files indexed">
+                {' '}
+                · {lang.index_percent}% indexed
+              </span>
+            )}
           </span>
         </span>
         <span className="flex flex-wrap items-center gap-1.5 text-xs text-muted">
@@ -250,7 +279,9 @@ function LanguageRow({
           <StateChip view={grammar} />
           {lang.server ? (
             <>
-              <span className="ml-1.5 font-mono">{lang.server.name}</span>
+              <span className="ml-1.5 min-w-0 break-all font-mono">
+                {lang.server.name}
+              </span>
               <StateChip view={server!} />
               {serverReady && running && <StateChip view={running} />}
             </>
@@ -267,22 +298,19 @@ function LanguageRow({
             {server.detail}
           </span>
         )}
-        {server?.tone === 'default' && server.detail && (
-          <span className="text-xs text-muted">{server.detail}</span>
-        )}
+        {(server?.tone === 'default' || server?.tone === 'warning') &&
+          server.detail && (
+            <span className="text-xs break-words text-muted">
+              {server.detail}
+            </span>
+          )}
         {errors.map((e) => (
           <span key={e} className="text-xs break-words text-danger">
             {e}
           </span>
         ))}
       </div>
-      <span
-        className="w-20 shrink-0 text-right text-xs tabular-nums text-muted"
-        title="Files indexed"
-      >
-        {lang.index_percent}% indexed
-      </span>
-      <div className="flex w-40 shrink-0 items-center justify-end gap-1">
+      <div className="ml-auto flex shrink-0 items-center justify-end gap-1">
         {busy ? (
           <span className="flex items-center gap-1.5 text-xs text-muted">
             <Spinner /> {downloading && !download && 'Downloading…'}

@@ -71,6 +71,8 @@ async fn tsgo_resolves_definition_references_and_symbols() {
             "typescript".into(),
             vec!["ts".into()],
         )],
+        start_timeout_secs: None,
+        ready_settle_secs: None,
     };
     let options = SessionOptions {
         request_timeout: Duration::from_secs(60),

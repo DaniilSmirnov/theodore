@@ -101,6 +101,11 @@ impl Core {
                 mode: req.mode,
                 held: false,
             }),
+            activity: vec![],
+            duration_ms: None,
+            changed_files: vec![],
+            model: None,
+            text_in_steps: false,
         };
         self.apply(vec![NewAction {
             model: models::CHAT_MESSAGE.into(),
@@ -199,6 +204,11 @@ impl Core {
             // Sent now: it sorts after the turn it waited for.
             at: self.0.deps.clock.now(),
             queued: None,
+            activity: vec![],
+            duration_ms: None,
+            changed_files: vec![],
+            model: None,
+            text_in_steps: false,
             ..message
         };
         self.start_turn(space, &req, message, true, None).await
@@ -217,8 +227,15 @@ impl Core {
     /// A turn ended: its final space patch, then the queue — the next
     /// message runs, or the queue is held for you. One step under the
     /// space's queue lock, so no send slips in between.
-    pub(crate) async fn end_turn(&self, space: &str, actions: Vec<NewAction>, end: TurnEnd) {
+    pub(crate) async fn end_turn(&self, space: &str, mut actions: Vec<NewAction>, end: TurnEnd) {
         let _queue = self.space_queue_lock(space).await;
+        let now = self.0.deps.clock.now();
+        actions.push(NewAction {
+            model: models::SPACE.into(),
+            model_id: space.to_string(),
+            action: SyncActionCode::C,
+            data: Some(serde_json::json!({ "attention_at": now, "updated_at": now })),
+        });
         let _ = self.apply(actions).await;
         match end {
             TurnEnd::Interrupted => self.hold_queue(space).await,
@@ -351,6 +368,11 @@ impl Core {
             failed: None,
             attachments: vec![],
             queued: None,
+            activity: vec![],
+            duration_ms: None,
+            changed_files: vec![],
+            model: None,
+            text_in_steps: false,
         };
         self.apply(vec![NewAction {
             model: models::CHAT_MESSAGE.into(),

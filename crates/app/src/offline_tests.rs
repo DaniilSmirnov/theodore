@@ -523,6 +523,9 @@ async fn offline_the_pollers_wait_for_a_backed_off_probe() {
     let core = start_offline(&f);
     core.ensure_open(&pr).await.unwrap();
     settled_offline(&f, &core).await;
+    // The startup searches' failures left over would greet the authored-PRs
+    // poll once the host is back and take it offline again.
+    f.host.search_responses.lock().unwrap().clear();
     let (prs, inbox) = (
         calls(&f.host.get_pr_calls),
         calls(&f.host.changed_since_calls),

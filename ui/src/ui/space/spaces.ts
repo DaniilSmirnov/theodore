@@ -91,39 +91,67 @@ export function archivedSpacesIn(ws: WorkspaceId, spaces: Space[]): Space[] {
 
 export type SpaceGlyph = 'running' | 'unseen' | 'idle' | 'failed';
 
+type UnreadFields = Pick<Space, 'status' | 'updated_at' | 'turns'> &
+  Partial<Pick<Space, 'attention_at'>>;
+
+/** Whether something asked for you since `seenAt`: a turn ended or failed, a
+ *  plan or a question came. Not any write: a PR opening or an Update from
+ *  base isn't news. A space with no such event since `attention_at` was added
+ *  falls back to `updated_at`, as it did. */
+function hasNews(s: UnreadFields, seenAt: number | undefined): boolean {
+  return s.turns > 0 && (seenAt ?? 0) < (s.attention_at ?? s.updated_at);
+}
+
 /** What the sidebar shows next to a space (docs/spaces.md §3): a finished
  *  turn you haven't looked at reads as waiting for you. `seenAt` is when
  *  the space page was last open, kept locally. */
 export function spaceGlyph(
-  s: Pick<Space, 'status' | 'updated_at' | 'turns'>,
+  s: UnreadFields,
   seenAt: number | undefined,
 ): SpaceGlyph {
   if (s.status === 'running') return 'running';
   if (s.status === 'failed') return 'failed';
-  if (s.turns > 0 && (seenAt ?? 0) < s.updated_at) return 'unseen';
+  if (hasNews(s, seenAt)) return 'unseen';
   return 'idle';
 }
 
 /** Whether "Mark as unread" would do anything: there's a turn to flag, and
  *  it doesn't already show as waiting for you. */
 export function canMarkUnread(
-  s: Pick<Space, 'status' | 'updated_at' | 'turns'>,
+  s: UnreadFields,
   seenAt: number | undefined,
 ): boolean {
   return s.turns > 0 && spaceGlyph(s, seenAt) !== 'unseen';
+}
+
+/** A space error as a person reads it: a refusal without the core's
+ *  "invalid request:" prefix (the log keeps it). */
+export function plainError(error: string): string {
+  return error.replace(/^invalid request:\s*/, '');
+}
+
+type EndedFields = Pick<
+  Space,
+  'status' | 'name' | 'error' | 'goal' | 'title' | 'updating'
+>;
+
+/** What a failed end is called: the agent's turn on an Update from base
+ *  that left conflicts is the update waiting on you, not a turn failure. */
+function failedWhat(next: Pick<Space, 'updating'>): string {
+  return next.updating ? 'update has conflicts left' : 'turn failed';
 }
 
 /** A turn just ended (running → anything else): what to tell you if you're
  *  not looking at the space. `null` when nothing finished. */
 export function turnEnded(
   prev: Pick<Space, 'status'> | undefined,
-  next: Pick<Space, 'status' | 'name' | 'error' | 'goal' | 'title'>,
+  next: EndedFields,
 ): { level: 'info' | 'error'; text: string } | null {
   if (prev?.status !== 'running' || next.status === 'running') return null;
   if (next.status === 'failed') {
     return {
       level: 'error',
-      text: `${spaceTitle(next)}: turn failed${next.error ? ` — ${next.error}` : ''}`,
+      text: `${spaceTitle(next)}: ${failedWhat(next)}${next.error ? ` — ${plainError(next.error)}` : ''}`,
     };
   }
   return { level: 'info', text: `${spaceTitle(next)}: turn done` };
@@ -170,8 +198,12 @@ export const STAGE_LABEL: Record<SpaceStage, string> = {
 };
 
 /** Turns since the last ship that a Push would send. */
-export function unshipped(s: Pick<Space, 'shipped' | 'head_sha'>): boolean {
-  return s.shipped != null && s.shipped.head !== s.head_sha;
+export function unshipped(
+  s: Pick<Space, 'shipped' | 'head_sha'> & Partial<Pick<Space, 'fork_sha'>>,
+): boolean {
+  // A space adopted from a branch or PR starts as pushed: at that tip.
+  const pushed = s.shipped?.head ?? s.fork_sha;
+  return pushed != null && pushed !== s.head_sha;
 }
 
 /** What a space is called on screen: the chat agent's proposed title
@@ -180,7 +212,9 @@ export function unshipped(s: Pick<Space, 'shipped' | 'head_sha'>): boolean {
  *  name. The slug (`name`) is only for its branch; the goal's first line
  *  is still what Open PR / Merge locally defaults their own title to
  *  (`defaultTitle`, unrelated to this one). */
-export function spaceTitle(s: Pick<Space, 'goal' | 'name' | 'title'>): string {
+export function spaceTitle(
+  s: Pick<Space, 'goal' | 'name' | 'title'> & { branch?: string },
+): string {
   const proposed = s.title?.trim();
   const raw = proposed && proposed.length > 0 ? proposed : defaultTitle(s);
   // Short enough for a sidebar row or a notification: no trailing period
@@ -192,12 +226,40 @@ export function spaceTitle(s: Pick<Space, 'goal' | 'name' | 'title'>): string {
   return `${(word > 30 ? cut.slice(0, word) : cut).replace(/[,;:]$/, '')}…`;
 }
 
-export function defaultTitle(s: Pick<Space, 'goal' | 'name'>): string {
+/** A space row's label: its PR's number in front, unless the title
+ *  already opens with it (a space started from PR #113 is titled
+ *  "#113 …" itself). */
+export function withPrNumber(
+  number: number | undefined,
+  title: string,
+): string {
+  if (number == null) return title;
+  const tag = `#${number}`;
+  return new RegExp(`^${tag}(?!\\d)`).test(title) ? title : `${tag} ${title}`;
+}
+
+/** The goal's first line; with no goal the slug — or, when that is only the
+ *  placeholder `space` / `space-2` (a space started from a branch with no
+ *  note, before its start named it), the branch's name. */
+export function defaultTitle(
+  s: Pick<Space, 'goal' | 'name'> & { branch?: string },
+): string {
   const line = s.goal
     .split('\n')
     .map((l) => l.trim())
     .find((l) => l.length > 0);
-  return line ?? s.name;
+  if (line) return line;
+  const placeholder = /^space(-\d+)?$/.test(s.name);
+  return (placeholder && s.branch?.trim()) || s.name;
+}
+
+/** The title Open PR proposes: the goal's (`defaultTitle`) — or after a
+ *  Continue, nothing: left empty, the core writes it from the round's net
+ *  change (`ship_title.rs`), never from a sentence in the chat. */
+export function shipTitle(
+  s: Pick<Space, 'goal' | 'name' | 'rounds'> & { branch?: string },
+): string {
+  return s.rounds?.length ? '' : defaultTitle(s);
 }
 
 /** "3 files +42 −7" for the changes pane header. */
@@ -441,6 +503,15 @@ export function lastAgentTurn(s: Pick<Space, 'turn_log'>): SpaceTurn | null {
   return null;
 }
 
+/** Agent turns the space stands on: `turns` minus the undone ones (a
+ *  Revert of yours isn't a turn). "after turn N" in the changes pane. */
+export function liveTurns(s: Pick<Space, 'turns' | 'turn_log'>): number {
+  const undone = (s.turn_log ?? []).filter(
+    (t) => t.undone && !(t.reverted ?? []).length,
+  ).length;
+  return Math.max(0, s.turns - undone);
+}
+
 /** Message ids (yours and the agent's) of the space's undone turns. */
 export function undoneMessages(s: Pick<Space, 'turn_log'>): Set<string> {
   return new Set(
@@ -464,12 +535,12 @@ export function notifyOn(
  *  did: "<space>: turn finished" / "<space>: turn failed". */
 export function nativeNotice(
   prev: Pick<Space, 'status'> | undefined,
-  next: Pick<Space, 'status' | 'name' | 'error' | 'goal' | 'title'>,
+  next: EndedFields,
 ): { title: string; body?: string } | null {
   if (prev?.status !== 'running' || next.status === 'running') return null;
   if (next.status === 'failed') {
-    const title = `${spaceTitle(next)}: turn failed`;
-    return next.error ? { title, body: next.error } : { title };
+    const title = `${spaceTitle(next)}: ${failedWhat(next)}`;
+    return next.error ? { title, body: plainError(next.error) } : { title };
   }
   return { title: `${spaceTitle(next)}: turn finished` };
 }
@@ -492,15 +563,14 @@ export function questionAsked(
  *  (finished or failed), and spaces whose agent waits on your answer;
  *  archived ones aside. */
 export function waitingSpaces(
-  spaces: Pick<Space, 'id' | 'status' | 'updated_at' | 'turns' | 'question'>[],
+  spaces: (UnreadFields & Pick<Space, 'id' | 'question'>)[],
   seen: (id: string) => number | undefined,
 ): number {
   return spaces.filter(
     (s) =>
       (s.status === 'running' && !!s.question) ||
       ((s.status === 'idle' || s.status === 'failed') &&
-        s.turns > 0 &&
-        (seen(s.id) ?? 0) < s.updated_at),
+        hasNews(s, seen(s.id))),
   ).length;
 }
 
@@ -531,14 +601,53 @@ export function defaultMergeMethod(info: MergeInfo): MergeMethod {
 export type SpaceMerge =
   { kind: 'merge' | 'auto' | 'queue' } | { kind: 'none'; reason: string };
 
+/** The Checks tab's Merge line, agreeing with what blocks Merge: a draft
+ *  or conflicts on the PR row win over a `merge_info` that still says
+ *  clean. `labels`: the merge dialog's state wording. */
+export function mergeLine(
+  pr: Pick<PrSummary, 'state' | 'conflicts'>,
+  info: MergeInfo | null,
+  labels: Record<MergeInfo['state'], string>,
+): { ok: boolean | null; text: string } {
+  if (pr.state === 'merged') return { ok: true, text: 'Merged' };
+  if (pr.state === 'closed')
+    return { ok: false, text: 'Closed without merging' };
+  if (pr.state === 'draft') return { ok: false, text: DRAFT_REASON };
+  if (pr.conflicts || info?.state === 'dirty')
+    return { ok: false, text: labels.dirty };
+  if (!info) return { ok: null, text: 'Checking…' };
+  const extra = `${info.auto_merge_enabled ? ' · auto-merge on' : ''}${info.in_queue ? ' · in the merge queue' : ''}`;
+  return {
+    ok: info.state === 'clean' && info.mergeable !== false,
+    text: `${labels[info.state]}${extra}`,
+  };
+}
+
+/** How often a space page asks for its PR (`refresh_space_pr`): often
+ *  while checks run, now and then otherwise, never once it's done. */
+export function prPollMs(
+  pr: Pick<PrSummary, 'state' | 'checks'> | undefined,
+): number | null {
+  if (pr?.state === 'merged' || pr?.state === 'closed') return null;
+  return !pr || pr.checks === 'pending' ? 10_000 : 30_000;
+}
+
+const DRAFT_REASON = 'A draft: mark it ready for review first';
+const CONFLICT_REASON = 'Conflicts with the base branch';
+
 export function spaceMerge(
   info: MergeInfo | null,
-  s: Pick<Space, 'shipped' | 'head_sha' | 'status'>,
+  s: Pick<Space, 'shipped' | 'head_sha' | 'status'> &
+    Partial<Pick<Space, 'fork_sha'>>,
+  /** The PR row: its draft state and conflicts can be newer than `info`. */
+  pr?: Pick<PrSummary, 'state' | 'conflicts'>,
 ): SpaceMerge {
   if (s.status === 'running')
     return { kind: 'none', reason: 'The agent is still working' };
-  if (s.shipped?.how === 'pr' && unshipped(s))
+  if (pr?.state === 'draft') return { kind: 'none', reason: DRAFT_REASON };
+  if ((s.shipped == null || s.shipped.how === 'pr') && unshipped(s))
     return { kind: 'none', reason: 'Push the new turns first' };
+  if (pr?.conflicts) return { kind: 'none', reason: CONFLICT_REASON };
   if (!info) return { kind: 'none', reason: 'Checking whether it can merge…' };
   if (info.in_queue) return { kind: 'none', reason: 'In the merge queue' };
   if (info.auto_merge_enabled)
@@ -598,4 +707,16 @@ export function actionablePlan(
   const log = (s.turn_log ?? []).filter((t) => !t.undone);
   const last = log[log.length - 1];
   return last?.plan ? last.reply : null;
+}
+
+/** The drawers under a space page. */
+export type Drawer = 'logs' | 'terminal';
+
+/** One drawer at a time: opening one closes the other, its own toggle
+ *  closes it. */
+export function toggleDrawer(
+  current: Drawer | null,
+  which: Drawer,
+): Drawer | null {
+  return current === which ? null : which;
 }

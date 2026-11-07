@@ -4,7 +4,7 @@
 //! core-owned (written only by the sync engine, the poller or a usecase) and
 //! is rejected outright — a client transaction never reaches it.
 
-use theodore_contract::{HunkRead, MutationOp, models};
+use theodore_contract::{CheckTick, HunkRead, MutationOp, models};
 use theodore_domain::{Anchor, Draft, FindingState, PrId, Task, TaskStatus};
 
 use crate::core::Core;
@@ -35,6 +35,15 @@ pub(super) async fn validate_op(core: &Core, op: &MutationOp) -> Result<(), Stri
         (m, MutationOp::Create { .. } | MutationOp::Update { .. }) if m == models::FILE_VIEWED => {
             Ok(())
         }
+
+        // ── check_tick: a "What to check" item ticked (created) or unticked
+        // (deleted); local review state, like a read mark ──────────────────
+        (m, MutationOp::Create { data, .. }) if m == models::CHECK_TICK => {
+            serde_json::from_value::<CheckTick>(data.clone())
+                .map(|_| ())
+                .map_err(|e| format!("bad check_tick: {e}"))
+        }
+        (m, MutationOp::Delete { .. }) if m == models::CHECK_TICK => Ok(()),
 
         // ── draft: a comment being composed, not yet submitted ────────────
         (m, MutationOp::Create { data, .. }) if m == models::DRAFT => {
@@ -343,6 +352,33 @@ mod tests {
                     model: models::HUNK_READ.into(),
                     id: format!("{}:{}", pr.0, hunks[0]),
                     data: serde_json::json!({"pr": pr.0, "hunk": hunks[0]}),
+                },
+                accepted: true,
+            },
+            // ── setCheckTicked: a "What to check" tick on, then off ─────
+            Case {
+                desc: "setCheckTicked: create check_tick",
+                op: MutationOp::Create {
+                    model: models::CHECK_TICK.into(),
+                    id: format!("{}:b:h:g1:item", pr.0),
+                    data: serde_json::json!({"pr": pr.0, "scope": "b:h:g1", "item": "item"}),
+                },
+                accepted: true,
+            },
+            Case {
+                desc: "setCheckTicked: create check_tick without its pr",
+                op: MutationOp::Create {
+                    model: models::CHECK_TICK.into(),
+                    id: "x".into(),
+                    data: serde_json::json!({"scope": "b:h:g1"}),
+                },
+                accepted: false,
+            },
+            Case {
+                desc: "setCheckTicked: delete check_tick",
+                op: MutationOp::Delete {
+                    model: models::CHECK_TICK.into(),
+                    id: format!("{}:b:h:g1:item", pr.0),
                 },
                 accepted: true,
             },

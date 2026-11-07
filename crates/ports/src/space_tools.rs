@@ -10,6 +10,7 @@
 //!       ─▶ ask_user ─▶ card in the space ─▶ you answer ─▶ the answers
 //!                                        └─ Stop / timeout ─▶ an error
 //! a repo command not allowed yet ─▶ NotAllowed, nothing runs
+//! no command configured          ─▶ a result saying so, not an error
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,10 @@ impl SpaceCommandName {
 /// `run_check`: how the check ended and its last lines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CheckOutcome {
+    /// The command ran. `false`: none is configured, nothing ran and
+    /// `summary` says so; retrying changes nothing.
+    pub ran: bool,
+    /// It ran and exited 0.
     pub passed: bool,
     /// `None` when killed, timed out or never started.
     pub exit_code: Option<i32>,
@@ -67,6 +72,10 @@ pub struct AppStatus {
     pub last_status: Option<String>,
     pub exit_code: Option<i32>,
     pub error: Option<String>,
+    /// What to know when there is no run command: nothing was started and
+    /// retrying changes nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// `read_logs`: the last lines of one command.
@@ -190,7 +199,8 @@ pub enum SpaceToolError {
     /// "Not now" to). Nothing ran.
     #[error("not allowed by the user yet: {0}")]
     NotAllowed(String),
-    /// Not configured, archived, unknown space…
+    /// Archived, unknown space… (a command that isn't configured is no
+    /// error: its tool answers with a result saying so).
     #[error("{0}")]
     Unavailable(String),
 }

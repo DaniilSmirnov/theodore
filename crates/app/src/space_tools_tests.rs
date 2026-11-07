@@ -58,22 +58,46 @@ async fn repo_commands_not_allowed_yet_are_refused_and_never_run() {
     assert_eq!(e.f.commands.scripts(), ["make check"]);
 }
 
+/// Nothing ran because nothing is configured: a result the agent reads and
+/// stops asking, not an error (a red row on every turn).
 #[tokio::test]
-async fn an_unset_command_is_unavailable_not_a_shell() {
+async fn an_unset_command_is_a_result_saying_so_not_an_error_or_a_shell() {
     let e = start_env(false).await;
     let s = e.create("").await;
-    let err = e.core.space_tool_check(&s.id, "r").await.unwrap_err();
-    assert_eq!(
-        err,
-        SpaceToolError::Unavailable(
-            "no `spaces.check` command is configured for this project".into()
-        )
+    let check = e.core.space_tool_check(&s.id, "r").await.unwrap();
+    assert!(!check.ran && !check.passed && check.output.is_empty());
+    assert_eq!(check.exit_code, None);
+    assert!(
+        check
+            .summary
+            .starts_with("no `spaces.check` command is configured"),
+        "{}",
+        check.summary
     );
-    assert!(matches!(
-        e.core.space_tool_start(&s.id).await,
-        Err(SpaceToolError::Unavailable(_))
-    ));
+    assert!(check.summary.contains("don't retry"));
+
+    let started = e.core.space_tool_start(&s.id).await.unwrap();
+    assert!(!started.configured && !started.running);
+    let note = started.note.as_deref().unwrap();
+    assert!(
+        note.starts_with("no `spaces.run` command is configured"),
+        "{note}"
+    );
+    let status = e.core.space_tool_status(&s.id).await.unwrap();
+    assert_eq!(status.note.as_deref(), Some(note));
     assert!(e.f.commands.specs().is_empty());
+}
+
+/// A configured check that fails is still told as it ran, exit code first.
+#[tokio::test]
+async fn a_configured_command_has_no_note() {
+    let e = start_env(false).await;
+    e.global("spaces: {check: make check, run: pnpm dev}");
+    let s = e.create("").await;
+    let status = e.core.space_tool_status(&s.id).await.unwrap();
+    assert_eq!(status.note, None);
+    let check = e.core.space_tool_check(&s.id, "r").await.unwrap();
+    assert!(check.ran);
 }
 
 #[tokio::test]

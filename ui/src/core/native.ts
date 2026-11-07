@@ -8,6 +8,14 @@ import { getTransport } from './transport';
  *  is the space id. The shell has brought the window forward already. */
 export const OPEN_SPACE_EVENT = 'open-space';
 
+/** The space a link asked for before the UI listened for
+ *  `OPEN_SPACE_EVENT` (a link that launched the app); later ones come as
+ *  that event. */
+export async function takePendingSpace(): Promise<string | null> {
+  if (!isTauri()) return null;
+  return getTransport().invoke<string | null>('take_pending_space');
+}
+
 let permission: Promise<boolean> | null = null;
 
 /** Asks once per session; macOS remembers the answer. */

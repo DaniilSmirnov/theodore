@@ -224,6 +224,34 @@ async fn diff_parses_a_real_git_diff_end_to_end() {
     assert_eq!(moved.old_path.as_deref(), Some("keep.txt"));
 }
 
+/// A stale sha (a last-seen head force-pushed away) is a typed "commit not
+/// found", not git's "Invalid symmetric difference expression".
+#[tokio::test]
+async fn diff_with_a_commit_not_in_the_repo_is_commit_not_found() {
+    let fx = setup();
+    let cli = fx.cli();
+    let repo_dir = fx.repo_dir();
+    let base = theodore_domain::Sha::new(fx.base_sha.clone());
+    let gone = theodore_domain::Sha::new("b6cef3e".repeat(5) + "b6cef");
+
+    let err = cli
+        .diff(&repo_dir, &base, &gone, &DiffOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, theodore_ports::GitError::MissingCommit(s) if *s == gone.as_str()),
+        "{err:?}"
+    );
+    let err = cli
+        .diff(&repo_dir, &gone, &base, &DiffOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, theodore_ports::GitError::MissingCommit(_)),
+        "{err:?}"
+    );
+}
+
 #[tokio::test]
 async fn show_reads_file_content_and_none_for_missing_path() {
     let fx = setup();

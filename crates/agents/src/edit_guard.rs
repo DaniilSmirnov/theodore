@@ -109,20 +109,41 @@ pub fn check(input: &str, roots: &[PathBuf]) -> Result<(), String> {
 }
 
 /// `p` with symlinks resolved on its deepest existing ancestor (the file
-/// itself may not exist yet).
+/// itself may not exist yet). A dangling symlink counts as where it points:
+/// a write through it creates that file.
 fn physical(p: &Path) -> PathBuf {
+    physical_within(p, MAX_LINKS).unwrap_or_default()
+}
+
+/// Links followed before a path counts as unresolvable, as the OS does.
+const MAX_LINKS: u32 = 40;
+
+/// `None`, inside no root: a path that never resolves (a link loop, a
+/// missing directory with `..` after it).
+fn physical_within(p: &Path, links: u32) -> Option<PathBuf> {
     let mut base = p;
     let mut rest = Vec::new();
     loop {
-        if let Ok(real) = std::fs::canonicalize(base) {
-            return rest.iter().rev().fold(real, |acc, c| acc.join(c));
+        let found = if let Ok(real) = std::fs::canonicalize(base) {
+            Some(real)
+        } else if let Ok(target) = std::fs::read_link(base) {
+            let target = base
+                .parent()
+                .map_or(target.clone(), |dir| dir.join(&target));
+            Some(physical_within(&target, links.checked_sub(1)?)?)
+        } else {
+            None
+        };
+        if let Some(real) = found {
+            return Some(rest.iter().rev().fold(real, |acc, c| acc.join(c)));
         }
         match (base.parent(), base.file_name()) {
             (Some(parent), Some(name)) => {
                 rest.push(name.to_os_string());
                 base = parent;
             }
-            _ => return p.to_path_buf(),
+            _ if p.components().any(|c| c == Component::ParentDir) => return None,
+            _ => return Some(p.to_path_buf()),
         }
     }
 }
@@ -171,6 +192,30 @@ mod tests {
         let roots = vec![ws.clone()];
         let p = ws.join("link/x.txt").display().to_string();
         assert!(check(&input(&p), &roots).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_out_of_the_worktree_is_outside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let roots = vec![ws.clone()];
+        let at = |p: &Path| input(&p.display().to_string());
+        // A write through one creates the file it names.
+        std::os::unix::fs::symlink(tmp.path().join("out/new.txt"), ws.join("abs")).unwrap();
+        std::os::unix::fs::symlink("../out.txt", ws.join("rel")).unwrap();
+        assert!(check(&at(&ws.join("abs")), &roots).is_err());
+        assert!(check(&at(&ws.join("rel")), &roots).is_err());
+        // Through a dangling link in the middle of the path too.
+        std::os::unix::fs::symlink(tmp.path().join("gone"), ws.join("dir")).unwrap();
+        assert!(check(&at(&ws.join("dir/new.txt")), &roots).is_err());
+        // A loop never resolves, so it is never inside.
+        std::os::unix::fs::symlink("loop", ws.join("loop")).unwrap();
+        assert!(check(&at(&ws.join("loop")), &roots).is_err());
+        // Dangling, but inside.
+        std::os::unix::fs::symlink("not-yet.txt", ws.join("in")).unwrap();
+        assert!(check(&at(&ws.join("in")), &roots).is_ok());
     }
 
     #[test]

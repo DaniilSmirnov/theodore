@@ -137,6 +137,15 @@ pub trait Store: Send + Sync {
         Ok(0)
     }
 
+    /// Whether an item `op` with exactly this `payload` waits, not yet
+    /// taken (`pending`, a backoff included): a write that reads its state
+    /// when it runs coalesces with one already queued. `false` by default:
+    /// no coalescing, every push runs.
+    fn outbox_has_pending(&self, op: &str, payload: &serde_json::Value) -> StoreResult<bool> {
+        let _ = (op, payload);
+        Ok(false)
+    }
+
     /// The oldest sync log id still present, or `None` if the log is empty
     /// or this implementation never compacts it. `catch_up` compares its
     /// caller's `since` against this: a client standing further behind than

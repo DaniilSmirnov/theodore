@@ -58,6 +58,11 @@ pub(crate) struct Inner {
     /// Wakes the outbox worker as soon as an item is pushed, so it doesn't
     /// wait for its idle poll (which is paced by `Clock`, not wall time).
     pub outbox_notify: Notify,
+    /// Callers waiting on one outbox item's outcome (`enqueue_and_wait`):
+    /// `None` when it landed, the host's message when it failed for good —
+    /// then the caller reports it and the worker shows no toast of its own.
+    pub outbox_waiters:
+        tokio::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Option<String>>>>,
     pub shutdown: CancellationToken,
     /// Serializes PR opens so two callers never clone/fetch the same PR twice.
     pub open_lock: tokio::sync::Mutex<()>,
@@ -70,11 +75,15 @@ pub(crate) struct Inner {
     /// (`usecases::grouping::GroupingSlot`).
     pub grouping_inflight: std::sync::Mutex<HashMap<PrId, bool>>,
     /// Last host health the UI was told about (`Ephemeral::HostStatus`):
-    /// online, rate-limit reset, token accepted.
-    pub host_health: std::sync::Mutex<(bool, Option<i64>, bool)>,
+    /// online, rate-limit reset, token accepted, answering with server
+    /// errors.
+    pub host_health: std::sync::Mutex<(bool, Option<i64>, bool, bool)>,
     /// While the host is unreachable the pollers make no host calls; this
     /// paces the one probe that notices it's back (`poller::probe_host`).
     pub host_probe: std::sync::Mutex<crate::poller::HostProbe>,
+    /// When each PR was last asked for its state because a search no longer
+    /// returned it (`usecases/reconcile.rs`). Memory only: a restart asks again.
+    pub reconciled: std::sync::Mutex<HashMap<PrId, i64>>,
     /// The device flow's `device_code` + poll interval between `login_start`
     /// and the login finishing (plan "login"): kept in memory only, never
     /// persisted — a restart just means starting over.
@@ -152,12 +161,14 @@ impl Core {
             etags: RwLock::new(HashMap::new()),
             runs: RwLock::new(HashMap::new()),
             outbox_notify: Notify::new(),
+            outbox_waiters: tokio::sync::Mutex::new(HashMap::new()),
             shutdown: CancellationToken::new(),
             open_lock: tokio::sync::Mutex::new(()),
             ship_lock: tokio::sync::Mutex::new(()),
             grouping_inflight: std::sync::Mutex::new(HashMap::new()),
-            host_health: std::sync::Mutex::new((true, None, true)),
+            host_health: std::sync::Mutex::new((true, None, true, false)),
             host_probe: std::sync::Mutex::new(crate::poller::HostProbe::default()),
+            reconciled: std::sync::Mutex::new(HashMap::new()),
             login: Mutex::new(None),
             linear_cache: std::sync::Mutex::new(HashMap::new()),
             account: crate::usecases::account::AccountState::new(open),
@@ -274,7 +285,10 @@ impl Core {
         use theodore_ports::HostError;
         matches!(
             err,
-            HostError::Auth | HostError::RateLimited { .. } | HostError::Network(_)
+            HostError::Auth
+                | HostError::RateLimited { .. }
+                | HostError::Network(_)
+                | HostError::Server(_)
         )
     }
 
@@ -293,10 +307,12 @@ impl Core {
     pub(crate) fn note_host<T>(&self, result: &theodore_ports::HostResult<T>) {
         use theodore_ports::HostError;
         let next = match result {
-            Ok(_) => (true, None, true),
-            Err(HostError::Auth) => (true, None, false),
-            Err(HostError::RateLimited { reset_at }) => (true, Some(*reset_at), true),
-            Err(HostError::Network(_)) => (false, None, true),
+            Ok(_) => (true, None, true, false),
+            Err(HostError::Auth) => (true, None, false, false),
+            Err(HostError::RateLimited { reset_at }) => (true, Some(*reset_at), true, false),
+            Err(HostError::Network(_)) => (false, None, true, false),
+            // It answered: up, but in trouble — not offline.
+            Err(HostError::Server(_)) => (true, None, true, true),
             // A 404, a validation error, … says nothing about the connection.
             Err(_) => return,
         };
@@ -323,6 +339,7 @@ impl Core {
                 online: next.0,
                 rate_limited_until: next.1,
                 auth_ok: next.2,
+                server_trouble: next.3,
             });
         }
     }
@@ -361,6 +378,35 @@ impl Core {
             .map_err(|e| theodore_ports::StoreError::Db(e.to_string()))??;
         self.0.outbox_notify.notify_one();
         Ok(id)
+    }
+
+    /// `enqueue_outbox`, then waits up to `wait` for the item's outcome:
+    /// `Ok` once it landed — or if it's still going (offline, backing
+    /// off), where the outbox carries on as usual — `Err` with the host's
+    /// words if it refused, which the caller reports instead of a toast.
+    pub(crate) async fn enqueue_and_wait(
+        &self,
+        op: &'static str,
+        payload: serde_json::Value,
+        wait: std::time::Duration,
+    ) -> Result<(), crate::error::AppError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let id = {
+            // Held across the push: the worker can't settle the item
+            // before its waiter is in place.
+            let mut waiters = self.0.outbox_waiters.lock().await;
+            let id = self.enqueue_outbox(op, payload).await?;
+            waiters.insert(id, tx);
+            id
+        };
+        match tokio::time::timeout(wait, rx).await {
+            Ok(Ok(Some(message))) => Err(crate::error::AppError::Refused(message)),
+            Ok(_) => Ok(()),
+            Err(_) => {
+                self.0.outbox_waiters.lock().await.remove(&id);
+                Ok(())
+            }
+        }
     }
 
     /// `apply` plus `enqueue_outbox`, atomically (plan "Fix target" accept
@@ -458,12 +504,17 @@ impl Core {
         detail: &theodore_domain::PrDetail,
     ) -> crate::error::AppResult<()> {
         let pr_s = detail.summary.pr.id().0.clone();
+        crate::poller::wake_if_pushed(self, &detail.summary.pr.id(), &detail.summary.head_sha)
+            .await;
         let mut summary_data = serde_json::to_value(&detail.summary)
             .map_err(|e| crate::error::AppError::Invalid(e.to_string()))?;
         self.keep_inbox_reasons(&pr_s, &mut summary_data).await;
         let detail_data = serde_json::to_value(detail)
             .map_err(|e| crate::error::AppError::Invalid(e.to_string()))?;
-        let actions = vec![
+        let viewed =
+            crate::reading::host_viewed_actions(self, &detail.summary.pr.id(), &detail.viewed)
+                .await;
+        let mut actions = vec![
             NewAction {
                 model: models::PR.into(),
                 model_id: pr_s.clone(),
@@ -477,6 +528,7 @@ impl Core {
                 data: Some(detail_data),
             },
         ];
+        actions.extend(viewed);
         self.apply(actions).await?;
         Ok(())
     }

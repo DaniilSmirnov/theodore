@@ -128,6 +128,10 @@ agent / poller ─────────────────────�
 - Every change — user, agent, GitHub poll — becomes a `SyncAction` with a
   monotonically increasing `syncId`. The UI has one model and one inbound stream.
 - UI reload: bootstrap from core, then catch up from `lastSyncId`.
+- A bootstrap reads its `syncId` before its rows, so a write between them is
+  replayed, not lost. A PR scope's id is still the global log's position while
+  its rows are one scope's: the client closes the difference with `catch_up`
+  in the frame order, it never jumps `lastSyncId` to that id.
 - Undo/redo: an undo queue that replays inverse changes as new transactions.
 
 ### 3.2 What goes through the sync log
@@ -135,7 +139,7 @@ agent / poller ─────────────────────�
 | Synced (mutable, persisted) | Not synced |
 | --- | --- |
 | PR list rows, inbox state, snooze | Diff hunks and file contents — immutable per commit, fetched by query |
-| Read state per hunk, Viewed per file | Agent token stream — ephemeral `agent:delta` events; only the final message is synced |
+| Read state per hunk, Viewed per file, "What to check" ticks | Agent token stream — ephemeral `agent:delta` events; only the final message is synced |
 | Groups (and regroupings) | Skill run log lines — ephemeral, last N kept in memory |
 | Threads, comments, drafts | Syntax highlighting — computed in UI |
 | Findings, fixes, tasks | |
@@ -162,6 +166,8 @@ change first, sends it through the outbox, and reconciles:
 - success → nothing to do (or merge server ids into the model);
 - user-visible failure → compensating action + toast;
 - conflict on poll (someone else changed it) → GitHub wins, UI gets the delta.
+  Viewed included: every fresh PR fetch takes the host's per-file state,
+  except a file whose own write still waits in the outbox.
 
 Offline / 401 / rate limit → outbox pauses; reads come from SQLite. A host
 refusal (validation, forbidden, not found, a malformed answer) fails the
@@ -396,6 +402,9 @@ content creation.
 GitHub:    GET /notifications  (If-Modified-Since, honours X-Poll-Interval)
               └─ something changed ─▶ GraphQL for the changed PRs only
            open PR: GET /pulls/{n} with ETag every 10–30 s (304s are free)
+           your PRs: search author:@me is:open every 60 s (no notification
+              comes for your own actions); one it stopped returning ─▶
+              GET /pulls/{n} with ETag
 GitLab:    ?updated_after=<cursor>
 Bitbucket: re-lists the viewer's involved PRs every poll — no indexed
            "updated after" filter cheap enough to use as a real delta probe
@@ -408,14 +417,51 @@ The notifications API needs a classic token (`gh`, OAuth app, classic PAT) with
 `notifications` or `repo` scope; fine-grained PATs and GitHub App tokens don't
 get it. For those, fall back to GraphQL `search` on a slow interval.
 
+Searches only add and update rows, so an open row nothing returns any more is
+asked about directly (`usecases/reconcile.rs`):
+
+```
+complete search ─▶ stored rows that claim open and it didn't return
+                     │ at most 10 per run, the ones asked longest ago first;
+                     ▼ one still open isn't asked again for an hour
+                  get_pr ─┬─ a PR ──────────▶ written as the host says
+                          ├─ 404 ───────────▶ pr, pr_detail, grouping removed
+                          ├─ connection ────▶ stop, retry next run
+                          └─ anything else ─▶ left as is
+```
+
+| Search | Rows it speaks for |
+| --- | --- |
+| A project's `is:pr is:open repo:<slug>` | that repo's rows |
+| The inbox's four sections, all complete | the primary host's rows outside any project |
+
+- Complete means the host said so (`HostAdapter::search_checked`). GitHub's
+  search stops at 1000 results and returns a node it can't show as null, so an
+  answer short of its `issueCount` is partial. A failed or partial search
+  changes nothing, and doesn't clear inbox reasons either.
+- A raw query is complete only on GitHub: GitLab and Bitbucket don't read
+  `is:open repo:o/r` as a query, so their project rows aren't reconciled.
+- Never asked about: branch and space reviews (no host URL), a live space's PR
+  (`sweep_spaces` keeps it fresh), archived rows.
+- Threads, drafts and `inbox_state` survive a 404, so the PR comes back whole if
+  access to its repo does. A PR open in a tab keeps its row until the next launch.
+
+The sidebar's "Pull requests N" counts open and draft rows the workspace shows,
+everyone's in a project's repo and yours elsewhere, without branch reviews: the
+same rows as the page's All filter, whose "Branch reviews" section is separate.
+It isn't any one GitHub page's number: github.com/pulls lists only what you wrote.
+
 ### 6.7 Outbox, idempotency, errors
 
 - Every host write goes through the outbox as resumable steps. Where the host
   has no batch (Bitbucket), comments are posted one by one and the outbox
   resumes from the last confirmed step.
 - No idempotency keys on GitHub: each comment body carries
-  `<!-- theodore:<draft-id> -->` (invisible when rendered). After a timeout the
-  outbox looks for it before retrying, so nothing is posted twice.
+  `<!-- theodore:<draft-id> -->` (invisible when rendered). Every submit
+  attempt first reads which of its markers are on the PR already (one pass
+  over the threads) and leaves those out, so nothing is posted twice. A
+  submitted review archives all its drafts, and a later submit sends only
+  drafts that aren't archived.
 - One error type for all adapters:
   `Auth · Forbidden · RateLimited{reset_at} · NotFound · Conflict · Validation · Network · Unsupported · Protocol`.
   The outbox decides from it: wait, retry, or roll back with a compensating action.
@@ -924,6 +970,24 @@ spawn (cwd = worktree) ─▶ stream ─▶ Done
 - A skill can run on several agents in parallel; findings merge (§4).
 - Chat: questions about the PR, a group, or a line; replies stream as ephemeral
   events and are stored when complete.
+- The AI panel's log is the space chat's virtual list (`VirtualChat`, docs/spaces.md
+  "Rows"), so a long thread stays fast: one row per turn (a question of yours
+  or a skill run, with the replies under it), keyed by its first message's id,
+  with the answer still being written as a pinned tail row. Only rows near the
+  view are mounted. It keeps its place per PR (turn and offset), and "Answered
+  · View" from the diff scrolls to the reply's row through the list, then the
+  message glows. Typing in the composer re-renders the composer only. A panel
+  with no height (hidden) keeps its rows and place, and reopens where it was.
+- The AI panel's box has the same agent chip as a space's: the agent the panel
+  talks to, with its model and effort (⌘⇧/ cycles the effort). Questions go to
+  that agent, which starts as `agents.chat`; model and effort are the agent's
+  `agents.<id>.*` settings, shared with spaces. When more than one agent is
+  installed and enabled, "Skills on: …" beside the chip picks the agents a
+  skill runs on (all of them by default; the chat agent always included). With
+  one, it is not shown.
+- Chat history (the panel's and a space's) names the agent on a reply only
+  when the conversation has replies from more than one agent; with one, no
+  reply carries a tag, whichever agent it is.
 - Attachments: a question can carry files (images, PDFs, anything), same as
   a space's chat (docs/spaces.md "Attachments"). The stored question keeps
   them; the agent gets their paths listed after the question.
@@ -965,7 +1029,7 @@ Claude runner; the others follow in M4 behind the same runner trait.
 
 | Part | Plan |
 | --- | --- |
-| Screens | Inbox + peek, My PRs, All PRs (list ↔ board), Tasks, Review (groups │ diff │ AI/tasks/threads), Settings, Onboarding |
+| Screens | Inbox + peek, My PRs, All PRs (list ↔ board), Tasks, Review (groups │ diff │ AI/tasks/threads), Settings, Project settings (General │ Languages │ Config; from the workspace switcher), Onboarding |
 | Look | HeroUI, own colour tokens, Shiki highlighting, Geist fonts, Gravity UI icons |
 | Types | generated from the Rust contract, never hand-written |
 | State | MobX object pool fed by the sync stream; `resource()` for immutable data; no business logic in the UI |
@@ -1001,10 +1065,11 @@ merge to main @ 0.3.0 (no v0.3.0 yet)
                     latest.json {version, notes, url, signature}
                     └─▶ GitHub Release v0.3.0 on JeanIsahakyan/theodore (public)
 
-app ──▶ on launch + every 6 h
+app ──▶ on launch + every 6 h (wall clock, so sleep doesn't stretch it)
         GET github.com/JeanIsahakyan/theodore/releases/latest/download/latest.json
         newer? ─▶ download in background ─▶ verify signature
-               ─▶ "Restart to update" (never forced)
+               ─▶ "Restart to update" (never forced); a notification again
+                  every 24 h while it waits, window in the background
                ─▶ restart waits until: no agent running, no outbox item
                   pending (failed ones don't count)
 ```
@@ -1013,7 +1078,7 @@ app ──▶ on launch + every 6 h
 | --- | --- |
 | Mechanism | `tauri-plugin-updater` + `tauri-plugin-process`; manifest from GitHub Releases, no server |
 | Signing key | generated once, private key + password in CI secrets, public key in `tauri.conf.json`. **Never rotated**: a new key orphans every installed build |
-| Channels | `stable` = `/releases/latest/` (GitHub skips pre-releases there); `beta` = a fixed pre-release tag `channel-beta` whose `latest.json` is overwritten. Setting `updates.channel`. `staging` = pre-release `channel-staging`, rebuilt on every push to `staging`: the only channel of a staging build, never offered to any other |
+| Channels | `stable` = `/releases/latest/` (GitHub skips pre-releases there); `beta` = a fixed pre-release tag `channel-beta` whose `latest.json` is overwritten. Setting `updates.channel`. `staging` = pre-release `channel-staging`, rebuilt on every push to `staging`: the only channel of a staging build, never offered to any other. A nightly polls nothing: no feed publishes one |
 | Versioning | semver; the tag must equal the version in `Cargo.toml` and `tauri.conf.json` (CI check) |
 | Tags | never re-tag a published release; ship a new patch instead |
 | Data | SQLite migrations forward-only; DB copied to `theodore.db.bak-<version>` before migrating; downgrade not supported |

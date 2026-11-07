@@ -13,6 +13,7 @@ import {
   Folder,
   Sparkles,
   TriangleExclamation,
+  Xmark,
 } from '@gravity-ui/icons';
 import { Button, Card, Chip, Typography } from '@heroui/react';
 import { observer } from 'mobx-react-lite';
@@ -28,7 +29,8 @@ import { api } from '../../core/api';
 import { useWorkspaces } from '../../stores/context';
 import { Spinner } from '../bits';
 import { projectLabel } from '../Projects';
-import { LAYER_LABEL, fileStatus, groupEntries } from './commands';
+import { STORAGE_NS } from '../../stores/UiStore';
+import { LAYER_LABEL, fileStatus, groupEntries, settingUp } from './commands';
 
 const LAYER_COLOR: Record<ConfigLayer, 'default' | 'accent' | 'warning'> = {
   global: 'default',
@@ -44,21 +46,31 @@ function LayerBadge({ layer }: { layer: ConfigLayer }) {
   );
 }
 
-/** The space page's empty-state nudge: no `spaces:` commands are
+const dismissedKey = (project: string) =>
+  `${STORAGE_NS}theodore-setup-assist-dismissed:${project}`;
+
+/** The space page's nudge above the composer: no `spaces:` commands are
  *  configured for this project yet, so there's nothing to run or check.
  *  "Set up with agent" sends the space's own agent a turn to look at the
  *  repo and write them (docs/config.md §2, §8); the normal trust prompt
- *  applies to whatever it proposes, same as any other repo config. */
+ *  applies to whatever it proposes, same as any other repo config. Not while
+ *  a turn runs or setup is on; dismissed per project. */
 export const SpaceSetupAssistHint = observer(function SpaceSetupAssistHint({
   space,
   config,
 }: {
-  space: Pick<Space, 'id' | 'status'>;
+  space: Pick<Space, 'id' | 'project' | 'status' | 'setup'>;
   config: Pick<SpaceConfigView, 'commands'> | null;
 }) {
   const [busy, setBusy] = useState(false);
+  const [dismissed, setDismissed] = useState(
+    () => localStorage.getItem(dismissedKey(space.project)) === '1',
+  );
   if (
+    dismissed ||
     space.status === 'archived' ||
+    space.status === 'running' ||
+    settingUp(space) ||
     config == null ||
     config.commands.length > 0
   ) {
@@ -74,20 +86,34 @@ export const SpaceSetupAssistHint = observer(function SpaceSetupAssistHint({
       setBusy(false);
     }
   };
+  const dismiss = () => {
+    localStorage.setItem(dismissedKey(space.project), '1');
+    setDismissed(true);
+  };
   return (
-    <div className="space-setup-assist-hint flex items-center gap-2 text-xs text-muted">
-      <span className="flex-1">
+    <div className="space-setup-assist-hint flex items-center gap-2 px-2 text-xs text-muted">
+      <span className="min-w-0 flex-1 truncate">
         This project has no setup, run or check commands yet.
       </span>
       <Button
         size="sm"
-        variant="secondary"
-        className="space-setup-assist shrink-0"
+        variant="ghost"
+        className="space-setup-assist h-6 shrink-0 px-2 text-xs"
         isPending={busy}
         onPress={() => void run()}
       >
         <Sparkles className="size-3.5" />
         Set up with agent
+      </Button>
+      <Button
+        size="sm"
+        variant="ghost"
+        isIconOnly
+        aria-label="Dismiss"
+        className="size-5 min-w-0 shrink-0"
+        onPress={dismiss}
+      >
+        <Xmark className="size-3" />
       </Button>
     </div>
   );

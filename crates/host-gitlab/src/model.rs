@@ -13,13 +13,16 @@ pub(crate) struct GlUser {
     pub avatar_url: Option<String>,
 }
 
-/// The bits of a GitLab issue `get_issue` / `my_open_issues` read.
+/// The bits of a GitLab issue `get_issue` / `open_issues` read.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct GlIssue {
     pub iid: u64,
     pub title: String,
     pub description: Option<String>,
     pub web_url: String,
+    /// `opened` or `closed`.
+    #[serde(default)]
+    pub state: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -3,6 +3,7 @@
 //! writing to the folder's own `.git` — and reviewing one of their branches
 //! without a host PR.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use theodore_contract::{
@@ -14,6 +15,7 @@ use theodore_ports::{InboxSection, NewAction, SyncActionCode};
 
 use crate::core::Core;
 use crate::error::{AppError, AppResult};
+use crate::usecases::reconcile::SearchedRows;
 
 impl Core {
     pub async fn list_host_repos(&self) -> AppResult<Vec<HostRepo>> {
@@ -98,7 +100,8 @@ impl Core {
 
     /// Fetches/refreshes the project's cache, keeps `default_branch` and the
     /// host's own repo metadata fresh, and — for a host project — writes its
-    /// open, recently merged and recently closed PRs as `pr` rows. Stamps
+    /// open, recently merged and recently closed PRs as `pr` rows, and asks
+    /// after stored rows the open search no longer returns. Stamps
     /// `last_fetched_at` unconditionally (local projects included), for the
     /// header's "fetched Nm ago".
     pub async fn refresh_project(&self, id: &str) -> AppResult<()> {
@@ -195,19 +198,26 @@ impl Core {
                 ),
             ];
             let mut by_id = std::collections::HashMap::new();
+            // Set only by a complete `is:open` answer: nothing else says
+            // what a row missing from it means.
+            let mut open_found = None;
             for (query, cap) in queries {
                 match self
                     .0
                     .deps
                     .host
-                    .search_repo(&project.repo, &InboxSection::Query(query))
+                    .search_checked(Some(&project.repo), &InboxSection::Query(query))
                     .await
                 {
-                    Ok(summaries) => {
+                    Ok(found) => {
                         let summaries = if cap {
-                            recent(summaries, now, FOURTEEN_DAYS_MS, 30)
+                            recent(found.prs, now, FOURTEEN_DAYS_MS, 30)
                         } else {
-                            summaries
+                            if found.complete {
+                                let ids = found.prs.iter().map(|s| s.pr.id());
+                                open_found = Some(ids.collect::<HashSet<_>>());
+                            }
+                            found.prs
                         };
                         for summary in summaries {
                             by_id.entry(summary.pr.id().0).or_insert(summary);
@@ -216,12 +226,17 @@ impl Core {
                     Err(e) => warn(format!("project refresh failed: {e}")),
                 }
             }
+            // Whatever any search returned was just written.
+            if let Some(found) = &mut open_found {
+                found.extend(by_id.keys().cloned().map(PrId));
+            }
             let mut actions = Vec::with_capacity(by_id.len());
             for summary in by_id.into_values() {
                 let id = summary.pr.id().0;
                 if self.is_stale_summary(&id, summary.updated_at).await {
                     continue;
                 }
+                crate::poller::wake_if_pushed(self, &summary.pr.id(), &summary.head_sha).await;
                 let mut data =
                     serde_json::to_value(&summary).map_err(|e| AppError::Invalid(e.to_string()))?;
                 self.keep_inbox_reasons(&id, &mut data).await;
@@ -233,6 +248,13 @@ impl Core {
                 });
             }
             self.apply(actions).await?;
+            if let Some(found) = open_found
+                && self
+                    .reconcile_open_prs(SearchedRows::Repo(&project.repo), &found)
+                    .await?
+            {
+                self.refresh_stacks().await?;
+            }
         }
 
         self.apply(vec![NewAction {
@@ -315,10 +337,63 @@ impl Core {
 
         let _guard = self.0.open_lock.lock().await;
         let id = pr_ref.id();
-        if let Some(head) = self.0.current_head.read().await.get(&id).cloned() {
-            return Ok(theodore_contract::OpenPrResponse { pr: id, head });
+        let open = self.0.current_head.read().await.get(&id).cloned();
+        if let Some(head) = open {
+            // A push moves it outside the lock, as the poller does.
+            drop(_guard);
+            return self.follow_branch(&project, &id, pr_ref, &base, head).await;
         }
         self.open_local(&project, pr_ref, &base).await
+    }
+
+    /// An open branch review asked for again: a commit on the branch since
+    /// it opened moves it to the new head, the way a push moves a PR
+    /// (`poller::handle_push`). The branch unreadable: it stays where it is.
+    async fn follow_branch(
+        &self,
+        project: &Project,
+        id: &PrId,
+        pr_ref: PrRef,
+        base: &str,
+        head: theodore_domain::Sha,
+    ) -> AppResult<theodore_contract::OpenPrResponse> {
+        let same = theodore_contract::OpenPrResponse {
+            pr: id.clone(),
+            head: head.clone(),
+        };
+        let Some(branch) = pr_ref.host_id.clone() else {
+            return Ok(same);
+        };
+        // The base it was opened against, not a default that changed since.
+        let base = match self.get_row(models::PR, &id.0).await {
+            Ok(Some(row)) => serde_json::from_value::<PrSummary>(row)
+                .map(|s| s.base_ref)
+                .unwrap_or_else(|_| base.to_string()),
+            _ => base.to_string(),
+        };
+        let Ok(repo_path) = self.ensure_project_cache(project).await else {
+            return Ok(same);
+        };
+        let Ok((detail, _)) = self
+            .0
+            .deps
+            .git
+            .describe_branch(&repo_path, &pr_ref.repo, pr_ref.number, &branch, &base)
+            .await
+        else {
+            return Ok(same);
+        };
+        let new_head = detail.summary.head_sha.clone();
+        if new_head == head {
+            return Ok(same);
+        }
+        self.apply_pr_detail(&detail).await?;
+        crate::poller::handle_push(self, id, &pr_ref, Some(head), new_head, detail).await;
+        let head = self.0.current_head.read().await.get(id).cloned();
+        Ok(theodore_contract::OpenPrResponse {
+            pr: id.clone(),
+            head: head.unwrap_or(same.head),
+        })
     }
 
     /// Closes a branch review (`open_branch`): drops its `pr`, `pr_detail`
@@ -513,7 +588,7 @@ impl Core {
                             action: SyncActionCode::C,
                             data: Some(serde_json::json!({
                                 "status": ProjectStatus::Error,
-                                "error": e.to_string(),
+                                "error": e.user_message(),
                             })),
                         }])
                         .await;

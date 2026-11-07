@@ -88,6 +88,7 @@ pub async fn open_root(ci: &CodeIntel, root: &Path, trust: TrustMode) -> Result<
         languages: vec![],
         focus_paths: vec![],
         lsp: None,
+        servers: Default::default(),
     })
     .await
     .with_context(|| format!("opening {}", root.display()))?;
@@ -149,7 +150,11 @@ pub fn settled(l: &LanguageStatus) -> bool {
     let grammar = match &l.grammar {
         InstallState::Installed { .. } | InstallState::System { .. } => l.index_percent >= 100,
         InstallState::Missing | InstallState::Downloading => l.files == 0,
-        InstallState::Unavailable | InstallState::Declined | InstallState::Failed { .. } => true,
+        InstallState::Unavailable
+        | InstallState::NeedsRuntime { .. }
+        | InstallState::TrustedOnly
+        | InstallState::Declined
+        | InstallState::Failed { .. } => true,
     };
     let server = match &l.server {
         Some(s) => s.state != ServerState::Warming,
@@ -165,6 +170,8 @@ fn install_name(s: &InstallState) -> &'static str {
         InstallState::System { .. } => "system",
         InstallState::Installed { .. } => "installed",
         InstallState::Unavailable => "unavailable",
+        InstallState::NeedsRuntime { .. } => "needs_runtime",
+        InstallState::TrustedOnly => "trusted_only",
         InstallState::Declined => "declined",
         InstallState::Failed { .. } => "failed",
     }
@@ -179,6 +186,7 @@ fn warm_language(l: &LanguageStatus) -> WarmLanguage {
         server: l.server.as_ref().map(|s| s.name.clone()),
         server_state: l.server.as_ref().map(|s| {
             match s.state {
+                ServerState::Off => "off",
                 ServerState::NotRunning => "not_running",
                 ServerState::Warming => "warming",
                 ServerState::Ready => "ready",

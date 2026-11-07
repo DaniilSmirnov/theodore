@@ -3,22 +3,31 @@ import { ArrowUpRightFromSquare, Xmark } from '@gravity-ui/icons';
 import { Button, Card, Chip, Tabs, Tooltip } from '@heroui/react';
 import { api } from '../core/api';
 import { Code, langOf } from '../highlight';
-import { countByKind, defaultTab, groupByFile } from './symbols/display';
+import {
+  countByKind,
+  defaultTab,
+  groupByFile,
+  sourceChip,
+} from './symbols/display';
 import { SymbolViewer } from './symbols/SymbolViewer';
-import type { HunkId, PrId, Sha, SymbolHit } from '../gen/contract';
+import type { DiffSide, HunkId, PrId, Sha, SymbolHit } from '../gen/contract';
 
 export interface SymbolPeekTarget {
   name: string;
   path: string;
+  /** On `side`: a head line, or a base line for a deletion. */
   line: number;
+  /** 1-based char column of the identifier. */
+  col: number;
+  side: DiffSide;
 }
 
 /**
  * VS Code-style peek under the line: go-to-definition / find-references.
- * There is no language server here — `find_symbol` greps the PR's head
- * worktree for whole-word matches and classifies each by per-language
- * declaration patterns (plan "symbols"), which is why a hit is a best
- * guess, not a type-checked jump.
+ * `find_symbol` asks code intelligence at the clicked head position (a
+ * base-side click, which has none in the head worktree, goes by name), or
+ * greps the PR's head worktree (plan "symbols"); the chip says which
+ * answered, since only a language server's hit is a type-checked jump.
  */
 export function SymbolPeek({
   pr,
@@ -45,12 +54,16 @@ export function SymbolPeek({
   // fresh initial values — no need to reset them here first.
   useEffect(() => {
     let live = true;
+    const head = target.side === 'head';
     api
       .findSymbol({
         pr,
         name: target.name,
         lang: null,
         from_path: target.path,
+        line: head ? target.line : null,
+        col: head ? target.col : null,
+        side: target.side,
       })
       .then((found) => {
         if (!live) return;
@@ -61,7 +74,7 @@ export function SymbolPeek({
     return () => {
       live = false;
     };
-  }, [pr, target.name, target.path]);
+  }, [pr, target]);
 
   const go = (hit: SymbolHit) => {
     const hunk = diffPaths.has(hit.path) ? findHunk(hit.path, hit.line) : null;
@@ -79,6 +92,7 @@ export function SymbolPeek({
   const defs = hits?.filter((h) => h.kind === 'definition') ?? [];
   const refs = hits?.filter((h) => h.kind === 'reference') ?? [];
   const shown = tab === 'def' ? defs : refs;
+  const chip = sourceChip(shown.length ? shown : (hits ?? []));
 
   return (
     <>
@@ -90,14 +104,14 @@ export function SymbolPeek({
           <code className="min-w-0 flex-1 truncate font-mono text-xs">
             {target.name}
           </code>
-          <Tooltip>
-            <Chip size="sm" variant="secondary" className="shrink-0">
-              git grep
-            </Chip>
-            <Tooltip.Content>
-              Matched by pattern, not a language server
-            </Tooltip.Content>
-          </Tooltip>
+          {chip && (
+            <Tooltip>
+              <Chip size="sm" variant="secondary" className="shrink-0">
+                {chip.label}
+              </Chip>
+              <Tooltip.Content>{chip.tip}</Tooltip.Content>
+            </Tooltip>
+          )}
           <Button
             isIconOnly
             size="sm"

@@ -62,6 +62,17 @@ theodore sandbox fire push-101                              # a timeline event, 
 
 PRs are `101` or `acme/storefront#101`.
 
+**A long chat without tokens.** Create a space in the sandbox, quit the app,
+then seed it and reopen:
+
+```sh
+theodore sandbox seed-chat "<space name or id>" --turns 300
+```
+
+It writes N stored turns (markdown, code, tables, tool steps of varying length)
+into `theodore.db`. It refuses a data dir that isn't a sandbox's, and a sandbox
+whose app is running.
+
 ## Faults
 
 | name | effect | `--value` |

@@ -85,11 +85,29 @@ pub fn write_alive(root: &Path, scenario: &str) -> SandboxResult<()> {
     )
 }
 
-/// The running sandbox's heartbeat, if it is fresh.
+/// The running sandbox's heartbeat, if it is fresh and its process is
+/// still there: a sandbox that quit a moment ago left a fresh heartbeat,
+/// but nothing runs it any more.
 pub fn alive(root: &Path) -> Option<Alive> {
     let text = std::fs::read_to_string(dir(root).join("alive.json")).ok()?;
     let alive: Alive = serde_json::from_str(&text).ok()?;
-    (now_ms() - alive.at < ALIVE_STALE_MS).then_some(alive)
+    (now_ms() - alive.at < ALIVE_STALE_MS && running(alive.pid)).then_some(alive)
+}
+
+/// Whether process `pid` exists (`kill -0`). When that can't be told, it is
+/// taken as running: the heartbeat's age still decides.
+fn running(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(true)
 }
 
 /// Pending requests, oldest first; each is removed once read.
@@ -152,4 +170,31 @@ pub fn send(root: &Path, action: Action, timeout: Duration) -> SandboxResult<Res
         "the sandbox didn't answer within {}s",
         timeout.as_secs()
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sandbox_that_quit_is_not_alive_however_fresh_its_heartbeat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_alive(root, "demo").unwrap();
+        assert!(alive(root).is_some(), "this process is running");
+
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let gone = child.id();
+        child.wait().unwrap();
+        write_atomic(
+            &dir(root).join("alive.json"),
+            &Alive {
+                pid: gone,
+                at: now_ms(),
+                scenario: "demo".into(),
+            },
+        )
+        .unwrap();
+        assert!(alive(root).is_none(), "its process quit");
+    }
 }

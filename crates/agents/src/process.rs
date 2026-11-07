@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use theodore_ports::agent::{
-    AGENT_OFFLINE_CODE, AgentError, AgentEvent, AgentRun, SteerMessage, is_connection_failure,
-    offline_message,
+    AGENT_OFFLINE_CODE, AGENT_SIGNED_OUT_CODE, AgentError, AgentEvent, AgentRun, SteerMessage,
+    is_auth_failure, is_connection_failure, offline_message, signed_out_message,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
@@ -452,8 +452,8 @@ async fn run_loop(
                                 continue;
                             }
                             terminal_sent |= terminal;
-                            let (ev, offline) = classify_offline(ev, &log.agent, "");
-                            log_terminal(&log, &ev, None, offline);
+                            let (ev, failure) = classify_failure(ev, &log.agent, "");
+                            log_terminal(&log, &ev, None, failure);
                             if tx.send(ev).await.is_err() {
                                 return;
                             }
@@ -499,7 +499,7 @@ async fn run_loop(
                         message: offline_message(&log.agent),
                         stderr_tail: String::new(),
                     };
-                    log_terminal(&log, &ev, None, true);
+                    log_terminal(&log, &ev, None, Failure::Offline);
                     let _ = tx.send(ev).await;
                     break;
                 }
@@ -547,44 +547,81 @@ async fn run_loop(
             },
         };
         let ev = parser.on_exit(success, &tail_str);
-        let (ev, offline) = if cancelled {
-            (ev, false)
+        let (ev, failure) = if cancelled {
+            (ev, Failure::Crash)
         } else {
-            classify_offline(ev, &log.agent, &tail_str)
+            classify_failure(ev, &log.agent, &tail_str)
         };
         if !cancelled {
-            log_terminal(&log, &ev, Some((code, &tail_str)), offline);
+            log_terminal(&log, &ev, Some((code, &tail_str)), failure);
         }
         let _ = tx.send(ev).await;
     }
 }
 
+/// Why an agent run ended in an `Error`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Failure {
+    /// Anything else: logged as `agent.crashed`.
+    Crash,
+    /// The CLI couldn't reach its servers (the network, not the agent).
+    Offline,
+    /// The CLI has no valid credentials (the user's to fix).
+    SignedOut,
+}
+
 /// An `Error` whose message or stderr says the CLI couldn't reach its
-/// servers becomes the plain offline message (stderr kept for the log);
-/// the flag says whether it did. Anything else passes through.
-fn classify_offline(ev: AgentEvent, agent: &str, stderr: &str) -> (AgentEvent, bool) {
-    match ev {
+/// servers becomes the plain offline message, and one that says it isn't
+/// signed in becomes a sentence with the command to fix it (`codex
+/// login`). The raw text moves to `stderr_tail`, which is only logged.
+/// Anything else passes through.
+fn classify_failure(ev: AgentEvent, agent: &str, stderr: &str) -> (AgentEvent, Failure) {
+    let AgentEvent::Error {
+        message,
+        stderr_tail,
+    } = ev
+    else {
+        return (ev, Failure::Crash);
+    };
+    let said = |f: fn(&str) -> bool| f(&message) || f(&stderr_tail) || f(stderr);
+    if said(is_connection_failure) {
+        let ev = AgentEvent::Error {
+            message: offline_message(agent),
+            stderr_tail,
+        };
+        return (ev, Failure::Offline);
+    }
+    if said(is_auth_failure) {
+        let stderr_tail = if stderr_tail.is_empty() {
+            message
+        } else {
+            format!("{message}\n{stderr_tail}")
+        };
+        let ev = AgentEvent::Error {
+            message: signed_out_message(agent),
+            stderr_tail,
+        };
+        return (ev, Failure::SignedOut);
+    }
+    (
         AgentEvent::Error {
             message,
             stderr_tail,
-        } if is_connection_failure(&message)
-            || is_connection_failure(&stderr_tail)
-            || is_connection_failure(stderr) =>
-        {
-            let ev = AgentEvent::Error {
-                message: offline_message(agent),
-                stderr_tail,
-            };
-            (ev, true)
-        }
-        ev => (ev, false),
-    }
+        },
+        Failure::Crash,
+    )
 }
 
 /// Logs how a run ended: `info` when done, `agent.crashed` with the exit
 /// code and the end of stderr when it failed, `agent.offline` (info: the
-/// network, not the agent) when it couldn't reach its servers.
-fn log_terminal(log: &RunLog, ev: &AgentEvent, exit: Option<(Option<i32>, &str)>, offline: bool) {
+/// network, not the agent) when it couldn't reach its servers, and
+/// `agent.signed_out` (info: the user's to fix) when it has no credentials.
+fn log_terminal(
+    log: &RunLog,
+    ev: &AgentEvent,
+    exit: Option<(Option<i32>, &str)>,
+    failure: Failure,
+) {
     match ev {
         AgentEvent::Done { .. } => {
             tracing::info!(agent = %log.agent, duration_ms = log.ms(), "agent run done");
@@ -598,7 +635,7 @@ fn log_terminal(log: &RunLog, ev: &AgentEvent, exit: Option<(Option<i32>, &str)>
                 None => (None, stderr_tail.as_str()),
             };
             let tail = tail_of(tail, LOGGED_STDERR_TAIL);
-            if offline {
+            if failure == Failure::Offline {
                 tracing::info!(
                     error.code = AGENT_OFFLINE_CODE,
                     agent = %log.agent,
@@ -607,6 +644,19 @@ fn log_terminal(log: &RunLog, ev: &AgentEvent, exit: Option<(Option<i32>, &str)>
                     exit_code = code,
                     stderr_tail = tail,
                     "agent couldn't reach its servers"
+                );
+                return;
+            }
+            if failure == Failure::SignedOut {
+                // The raw error (a 401 and its headers) is in `stderr_tail`.
+                tracing::info!(
+                    error.code = AGENT_SIGNED_OUT_CODE,
+                    agent = %log.agent,
+                    agent_version = %log.version,
+                    duration_ms = log.ms(),
+                    exit_code = code,
+                    stderr_tail = tail,
+                    "agent isn't signed in"
                 );
                 return;
             }
@@ -770,5 +820,80 @@ mod bounded_io_tests {
         assert_eq!(line, "no newline");
         assert!(!truncated);
         assert!(read_line_capped(&mut reader, 1024).await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn error(message: &str, stderr_tail: &str) -> AgentEvent {
+        AgentEvent::Error {
+            message: message.into(),
+            stderr_tail: stderr_tail.into(),
+        }
+    }
+
+    #[test]
+    fn a_401_becomes_the_sign_in_sentence_and_the_raw_error_is_kept_for_the_log() {
+        let raw = "unexpected status 401 Unauthorized: Missing bearer or basic authentication in \
+                   header, url: https://api.openai.com/v1/responses, cf-ray: 9a1";
+        let (ev, failure) = classify_failure(error(raw, ""), "codex", "");
+        assert_eq!(failure, Failure::SignedOut);
+        assert_eq!(
+            ev,
+            error(
+                "Codex isn't signed in. Run `codex login` in a terminal.",
+                raw
+            )
+        );
+    }
+
+    #[test]
+    fn each_agent_gets_its_own_command() {
+        let (ev, _) = classify_failure(
+            error("Invalid API key · Please run /login", ""),
+            "claude",
+            "",
+        );
+        assert_eq!(
+            ev,
+            error(
+                "Claude isn't signed in. Run `claude auth login` in a terminal.",
+                "Invalid API key · Please run /login"
+            )
+        );
+        let (ev, failure) =
+            classify_failure(error("exit 1", ""), "gemini", "Please set an Auth method");
+        assert_eq!(failure, Failure::SignedOut);
+        let AgentEvent::Error {
+            message,
+            stderr_tail,
+        } = ev
+        else {
+            panic!("not an error");
+        };
+        assert!(
+            message.starts_with("Gemini isn't signed in. Run `gemini`"),
+            "{message}"
+        );
+        assert_eq!(stderr_tail, "exit 1");
+    }
+
+    #[test]
+    fn offline_and_other_errors_are_unchanged() {
+        let (ev, failure) = classify_failure(error("fetch failed", ""), "claude", "");
+        assert_eq!(failure, Failure::Offline);
+        assert_eq!(ev, error(&offline_message("claude"), ""));
+        let boom = error("agent exited with 2", "boom");
+        assert_eq!(
+            classify_failure(boom.clone(), "codex", ""),
+            (boom, Failure::Crash)
+        );
+        let done = AgentEvent::Stalled;
+        assert_eq!(
+            classify_failure(done.clone(), "codex", "401 Unauthorized"),
+            (done, Failure::Crash)
+        );
     }
 }

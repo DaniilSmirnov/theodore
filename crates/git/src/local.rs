@@ -72,6 +72,58 @@ impl GitCli {
         Ok(out.is_ok())
     }
 
+    pub(crate) async fn is_tracked_op(&self, folder: &Path, path: &str) -> GitResult<bool> {
+        let askpass = self.ensure_askpass()?;
+        let out = GitProc {
+            cwd: folder,
+            askpass: &askpass,
+            args: &["ls-files", "--error-unmatch", "--", path],
+            token: None,
+            stdin: None,
+        }
+        .run_raw()
+        .await?;
+        Ok(out.status == 0)
+    }
+
+    pub(crate) async fn exclude_locally_op(&self, folder: &Path, pattern: &str) -> GitResult<()> {
+        let askpass = self.ensure_askpass()?;
+        let out = GitProc {
+            cwd: folder,
+            askpass: &askpass,
+            args: &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "info/exclude",
+            ],
+            token: None,
+            stdin: None,
+        }
+        .run_text()
+        .await?;
+        let path = std::path::PathBuf::from(out.trim());
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(GitError::Io(e)),
+        };
+        if text.lines().any(|l| l.trim() == pattern) {
+            return Ok(());
+        }
+        if let Some(dir) = path.parent() {
+            tokio::fs::create_dir_all(dir).await.map_err(GitError::Io)?;
+        }
+        let sep = if text.is_empty() || text.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        tokio::fs::write(&path, format!("{text}{sep}{pattern}\n"))
+            .await
+            .map_err(GitError::Io)
+    }
+
     pub(crate) async fn remove_repo_op(&self, repo: &RepoRef) -> GitResult<()> {
         let askpass = self.ensure_askpass()?;
         let repo_dir = self.repo_dir(repo)?;

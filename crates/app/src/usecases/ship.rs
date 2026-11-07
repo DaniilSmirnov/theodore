@@ -19,8 +19,10 @@ use theodore_contract::{
     Ephemeral, Project, ShipAction, ShipKind, ShipSpaceRequest, Space, SpaceShipped, SpaceStatus,
     ToastLevel, models,
 };
-use theodore_domain::{Author, HostKind, PrRef, PrState, PrSummary, RepoRef, Sha};
-use theodore_ports::{GitError, Identity, NewAction, NewPr, SpaceCommit, SyncActionCode};
+use theodore_domain::{HostKind, PrRef, PrState, PrSummary, RepoRef, Sha};
+use theodore_ports::{
+    GitError, Identity, NewAction, NewPr, SpaceCommit, SyncActionCode, shipped_ref,
+};
 
 use crate::core::Core;
 use crate::error::{AppError, AppResult};
@@ -166,16 +168,24 @@ impl Core {
                         "this space already has a PR; Push sends new turns to it".into(),
                     ));
                 }
-                let title = title_or(req.title.as_deref(), &space);
-                let message = commit_message(&title, &space.goal);
+                // After a Continue, what the turns since changed; else the goal.
+                let about = self.round_about(&space, &project, &repo_path, &head).await;
+                let title = title_or(req.title.as_deref(), &about);
+                let message = commit_message(&title, &about.goal);
                 let shipped = self
                     .push_squashed(&space, &project, &repo_path, &head, &message, &author)
                     .await?;
+                // On record before the fill, which can take a minute: quit
+                // now and a retry finds its own push, not a branch name taken.
+                self.apply(vec![
+                    self.patch(&space.id, serde_json::json!({ "shipped": shipped })),
+                ])
+                .await?;
                 // The repo's PR template when it has one, and a link back.
                 let body = self
-                    .space_pr_body(&space, &repo_path, &head, pr_body(&space.goal))
+                    .space_pr_body(&about, &repo_path, &head, pr_body(&title, &about.goal))
                     .await;
-                let body = with_closes(body, space.issue);
+                let body = with_closes(body, self.issue_to_close(&space, &project.repo).await);
                 let payload = CreateSpacePrPayload {
                     space: space.id.clone(),
                     repo: project.repo.clone(),
@@ -187,12 +197,8 @@ impl Core {
                         draft: req.action == ShipAction::OpenDraftPr,
                     },
                 };
-                self.apply_with_outbox(
-                    vec![self.patch(&space.id, serde_json::json!({ "shipped": shipped }))],
-                    "create_space_pr",
-                    to_json(&payload)?,
-                )
-                .await?;
+                self.apply_with_outbox(vec![], "create_space_pr", to_json(&payload)?)
+                    .await?;
             }
             ShipAction::Push => {
                 let Some(pr) = space.pr.clone() else {
@@ -203,7 +209,7 @@ impl Core {
                 }
                 let title = match req.title.as_deref().map(str::trim) {
                     Some(t) if !t.is_empty() => t.to_string(),
-                    _ => self.push_title(&space).await,
+                    _ => self.push_title(&space, &project, &repo_path, &head).await,
                 };
                 let shipped = self
                     .push_squashed(&space, &project, &repo_path, &head, &title, &author)
@@ -239,6 +245,7 @@ impl Core {
     /// | last ship | remote branch | new commit |
     /// | --- | --- | --- |
     /// | none | absent | `base` + head's tree |
+    /// | none | exists, at the space's own last squash | as `s` = that squash |
     /// | none | exists | refused: the name is taken |
     /// | `s` | at `s.sha` or absent | `s.sha` + head's tree |
     /// | `s` | moved to `t` | `t` + the turns since `s.head` (3-way) |
@@ -276,6 +283,28 @@ impl Core {
             .as_ref()
             .filter(|s| s.how == ShipKind::Pr)
             .or(synthetic.as_ref());
+        // Quit between a push and writing `shipped`: the tip is this space's
+        // own squash, and new turns go on top of it.
+        let interrupted = match (last, &tip) {
+            (None, Some(t))
+                if git
+                    .resolve_ref(repo_path, &shipped_ref(&space.id))
+                    .await
+                    .is_ok_and(|own| &own == t) =>
+            {
+                let same = git.same_tree(repo_path, t, head).await.unwrap_or(false);
+                Some(SpaceShipped {
+                    how: ShipKind::Pr,
+                    branch: space.branch.clone(),
+                    sha: t.clone(),
+                    head: if same { head.clone() } else { t.clone() },
+                    pushes: 1,
+                    at: space.created_at,
+                })
+            }
+            _ => None,
+        };
+        let last = last.or(interrupted.as_ref());
         let commit = |parent: &Sha, replay_from: Option<Sha>| SpaceCommit {
             head: head.clone(),
             parent: parent.clone(),
@@ -412,10 +441,43 @@ impl Core {
     ) -> AppResult<Identity> {
         // A local folder's own config (a per-repo identity) counts first.
         let config_from = project.path.as_deref().map_or(repo_path, Path::new);
+        self.author_identity(config_from, project.repo.host).await
+    }
+
+    /// `ship_author` for a commit pushed to an open PR (a committed
+    /// suggestion, an applied fix): the PR's project's folder config when
+    /// there is one, else the PR's clone.
+    pub(crate) async fn pr_commit_author(
+        &self,
+        pr: &theodore_domain::PrId,
+        repo: &RepoRef,
+    ) -> AppResult<Identity> {
+        let store = self.0.deps.store.clone();
+        let project = tokio::task::spawn_blocking(move || store.all(models::PROJECT))
+            .await
+            .map_err(AppError::join)??
+            .into_iter()
+            .filter_map(|r| serde_json::from_value::<Project>(r.data).ok())
+            .find(|p| &p.repo == repo);
+        let clone = {
+            let head = self.0.current_head.read().await.get(pr).cloned();
+            let revisions = self.0.revisions.read().await;
+            head.and_then(|h| revisions.get(&(pr.clone(), h)).map(|e| e.repo_path.clone()))
+        };
+        let config_from = project
+            .as_ref()
+            .and_then(|p| p.path.clone())
+            .map(PathBuf::from)
+            .or(clone)
+            .ok_or_else(|| AppError::Invalid("pr is not open".into()))?;
+        self.author_identity(&config_from, repo.host).await
+    }
+
+    async fn author_identity(&self, config_from: &Path, host: HostKind) -> AppResult<Identity> {
         if let Some(id) = self.0.deps.git.user_identity(config_from).await? {
             return Ok(id);
         }
-        if project.repo.host == HostKind::Github
+        if host == HostKind::Github
             && let Ok(me) = self.0.deps.host.viewer_for(HostKind::Github).await
         {
             return Ok(Identity {
@@ -428,26 +490,57 @@ impl Core {
         ))
     }
 
-    /// The default Push message: your latest message since the last push.
-    async fn push_title(&self, space: &Space) -> String {
-        let since = space.shipped.as_ref().map_or(0, |s| s.at);
-        let store = self.0.deps.store.clone();
-        let key = crate::usecases::spaces::space_chat_key(&space.id).0;
-        let rows =
-            tokio::task::spawn_blocking(move || store.query(models::CHAT_MESSAGE, "pr", &key))
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .unwrap_or_default();
-        let latest = rows
-            .into_iter()
-            .filter_map(|r| serde_json::from_value::<theodore_contract::ChatMessage>(r.data).ok())
-            .filter(|m| m.author == Author::Me && m.at >= since)
-            .max_by_key(|m| m.at);
-        latest
-            .map(|m| first_line(&m.text))
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| format!("Update {}", space.name))
+    /// The space as this round's PR is about: itself before any Continue;
+    /// after one, its goal is what the round's net change does
+    /// (`change_summary`): the title, then whole sentences under it.
+    pub(crate) async fn round_about(
+        &self,
+        space: &Space,
+        project: &Project,
+        repo_path: &Path,
+        head: &Sha,
+    ) -> Space {
+        let Some(round) = space.rounds.last() else {
+            return space.clone();
+        };
+        let summary = self
+            .change_summary(space, project, repo_path, &space.base_sha, head, round.at)
+            .await;
+        Space {
+            goal: summary.message(),
+            ..space.clone()
+        }
+    }
+
+    /// The default Push message: what the turns since the last push changed,
+    /// net (`change_summary`) — the title, then whole sentences under it.
+    async fn push_title(
+        &self,
+        space: &Space,
+        project: &Project,
+        repo_path: &Path,
+        head: &Sha,
+    ) -> String {
+        let last = space.shipped.as_ref().filter(|s| s.how == ShipKind::Pr);
+        let since = last.map_or(0, |s| s.at);
+        let from = last
+            .map(|s| &s.head)
+            .or(space.fork_sha.as_ref())
+            .unwrap_or(&space.base_sha);
+        self.change_summary(space, project, repo_path, from, head, since)
+            .await
+            .message()
+    }
+
+    /// The issue this PR closes (`Space::issue`), unless it's closed
+    /// already: the host says so, or — when the host can't say — an
+    /// earlier round's PR of this space closed it as it merged.
+    async fn issue_to_close(&self, space: &Space, repo: &RepoRef) -> Option<u64> {
+        let n = space.issue?;
+        match self.0.deps.host.get_issue(repo, n).await {
+            Ok(issue) => (!issue.closed).then_some(n),
+            Err(_) => space.rounds.is_empty().then_some(n),
+        }
     }
 
     /// The outbox opened (or found) the space's PR: link it and fetch it so
@@ -622,9 +715,9 @@ fn title_or(edited: Option<&str>, space: &Space) -> String {
         .unwrap_or_else(|| space.name.clone())
 }
 
-/// Title, then the whole goal when it says more than the title does.
+/// Title, then what the goal says beyond it (`pr_body`).
 fn commit_message(title: &str, goal: &str) -> String {
-    let body = pr_body(goal);
+    let body = pr_body(title, goal);
     if body.is_empty() || body == title {
         title.to_string()
     } else {
@@ -632,8 +725,17 @@ fn commit_message(title: &str, goal: &str) -> String {
     }
 }
 
-fn pr_body(goal: &str) -> String {
+/// What the goal says beyond the title: the paragraphs after it when the
+/// goal opens with the title as a paragraph of its own (a round's change
+/// summary), else the whole goal when it says more than one short line.
+fn pr_body(title: &str, goal: &str) -> String {
     let goal = goal.trim();
+    if let Some(rest) = goal
+        .strip_prefix(title)
+        .and_then(|r| r.strip_prefix("\n\n"))
+    {
+        return rest.trim().to_string();
+    }
     if goal.lines().filter(|l| !l.trim().is_empty()).count() <= 1
         && goal.chars().count() <= TITLE_CHARS
     {
@@ -678,11 +780,15 @@ mod tests {
     #[test]
     fn a_short_goal_is_the_whole_message() {
         assert_eq!(commit_message("Retry", "Retry"), "Retry");
-        assert_eq!(pr_body("Retry"), "");
+        assert_eq!(pr_body("Retry", "Retry"), "");
         assert_eq!(
             commit_message("Retry", "Retry\nwith backoff"),
             "Retry\n\nRetry\nwith backoff"
         );
+        // A round's summary: the title once, the sentences under it.
+        let round = "Add t3 notes\n\n- Add notes/t3.md.";
+        assert_eq!(commit_message("Add t3 notes", round), round);
+        assert_eq!(pr_body("Add t3 notes", round), "- Add notes/t3.md.");
     }
 
     #[test]

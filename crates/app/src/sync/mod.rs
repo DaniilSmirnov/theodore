@@ -21,6 +21,15 @@ use crate::wire::{to_wire_action, to_wire_row};
 impl Core {
     pub async fn bootstrap(&self, scope: BootstrapScope) -> AppResult<Bootstrap> {
         let store = self.0.deps.store.clone();
+        // Read before the rows: a write between them is then replayed by
+        // `catch_up` from this id, not lost. Replaying one the rows already
+        // hold ends up the same.
+        let last_sync_id = {
+            let store = store.clone();
+            tokio::task::spawn_blocking(move || store.last_sync_id())
+                .await
+                .map_err(AppError::join)??
+        };
         let rows = match scope {
             BootstrapScope::Global => tokio::task::spawn_blocking(move || {
                 let mut out = Vec::new();
@@ -71,6 +80,7 @@ impl Core {
                     for m in [
                         models::HUNK_READ,
                         models::FILE_VIEWED,
+                        models::CHECK_TICK,
                         models::THREAD,
                         models::DRAFT,
                         models::FINDING,
@@ -85,10 +95,6 @@ impl Core {
                 .map_err(AppError::join)??
             }
         };
-        let store = self.0.deps.store.clone();
-        let last_sync_id = tokio::task::spawn_blocking(move || store.last_sync_id())
-            .await
-            .map_err(AppError::join)??;
         Ok(Bootstrap {
             last_sync_id,
             rows: rows.into_iter().map(to_wire_row).collect(),
@@ -220,6 +226,8 @@ fn op_to_new_action(op: &MutationOp) -> NewAction {
 
 #[cfg(test)]
 mod tests {
+    use theodore_contract::BootstrapScope;
+    use theodore_domain::PrId;
     use theodore_ports::{NewAction, Store, SyncActionCode};
 
     use super::test_support::sqlite_deps;
@@ -282,6 +290,25 @@ mod tests {
         assert!(!frame.resync_required);
         assert_eq!(frame.actions.len(), 2); // ids 4 and 5
         assert_eq!(frame.last_sync_id, 5);
+    }
+
+    /// A write landing while the rows are read: the bootstrap's id stands
+    /// before it, so `catch_up` from that id still delivers it.
+    #[tokio::test]
+    async fn bootstrap_id_is_read_before_its_rows() {
+        let f = fixtures();
+        let (core, _recv) = Core::start(f.deps());
+
+        let store = f.store.clone();
+        f.store.before_next_read(Box::new(move || {
+            put(store.as_ref(), "written-during-read", 1);
+        }));
+        let scope = BootstrapScope::Pr(PrId("space:s".into()));
+        let boot = core.bootstrap(scope).await.unwrap();
+
+        let frame = core.catch_up(boot.last_sync_id).await.unwrap();
+        let ids: Vec<&str> = frame.actions.iter().map(|a| a.model_id.as_str()).collect();
+        assert!(ids.contains(&"written-during-read"), "{ids:?}");
     }
 
     /// An implementation that never compacts (`oldest_sync_id` -> `None`

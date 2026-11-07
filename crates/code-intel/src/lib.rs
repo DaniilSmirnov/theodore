@@ -18,7 +18,7 @@
 //!                           (downloads only in install())
 //! ```
 //!
-//! Trust: [`LspPolicy`] has one switch per [`TrustMode`] — review runs
+//! Trust: [`LspPolicy`] has one switch per [`TrustMode`](theodore_ports::TrustMode) — review runs
 //! (off by default: most servers can run a PR's code) and spaces (on). The
 //! one gate is `servers::allowed`; [`CodeIntel::set_options`] applies a
 //! change live, stopping the sessions it no longer allows.
@@ -46,15 +46,15 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use theodore_code_intel_lsp::{Located, LspPool, LspSession, SessionOptions};
 use theodore_code_intel_syntax::{
-    Indexer, IndexerConfig, SyntaxIndex, byte_offset, file_entry, git_snapshot, preview,
-    text_search,
+    Indexer, IndexerConfig, SyntaxIndex, byte_offset, dirty_paths, file_entry, git_snapshot,
+    preview, text_search,
 };
 use theodore_code_intel_toolchain::{OnBytes, Toolchain};
 use theodore_ports::code_intel::{
     Answer, CodeHit, CodeIntelError, CodeIntelLimits, CodeIntelPort, CodeIntelResult, CodeSymbol,
     CodeSymbolKind, Diagnostic, Hover, InstallItem, InstallProgress, InstallProgressFn,
     InstallProgressState, InstallState, LanguageId, LanguageStatus, Location, LspPolicy, Position,
-    ServerState, ServerStatus, Source, TextEdit, TrustMode, Workspace,
+    ServerState, ServerStatus, Source, TextEdit, Workspace,
 };
 
 pub use grammars::GrammarSource;
@@ -72,6 +72,10 @@ const MAX_HITS: usize = 200;
 const INDEX_WAIT: Duration = Duration::from_secs(2);
 /// Names from the focus files used to promote files that mention them.
 const MAX_FOCUS_NAMES: usize = 64;
+/// Files over the size limit read for an empty answer's note, at most.
+const NOTE_SKIPPED_SCAN: usize = 20;
+/// Files `git status` lists that a name question hashes again, at most.
+const MAX_DIRTY: usize = 2000;
 
 /// How often the index is checked against its size cap, besides on every
 /// open and close.
@@ -199,6 +203,7 @@ impl CodeIntelBuilder {
                 removed,
                 evicting: AtomicBool::new(false),
                 workspaces: Mutex::default(),
+                prefer: Mutex::default(),
             }),
         };
         let weak = Arc::downgrade(&ci.inner);
@@ -235,6 +240,8 @@ struct Inner {
     evicting: AtomicBool,
     /// By canonical root.
     workspaces: Mutex<HashMap<PathBuf, Arc<Ws>>>,
+    /// `Workspace::servers` of each open root: language → preferred server.
+    prefer: Mutex<HashMap<PathBuf, BTreeMap<String, String>>>,
 }
 
 /// Where an LSP question goes.
@@ -259,6 +266,14 @@ impl Notes {
     fn extend(&mut self, notes: impl IntoIterator<Item = String>) {
         for n in notes {
             self.push(n);
+        }
+    }
+
+    /// A server's failure. One that only doesn't answer this kind of
+    /// question (`Unsupported`, "method not found") is no news.
+    fn error(&mut self, e: CodeIntelError) {
+        if !matches!(e, CodeIntelError::Unsupported(_)) {
+            self.push(e.to_string());
         }
     }
 
@@ -327,18 +342,23 @@ impl CodeIntel {
             old_pool.shutdown_all().await;
         }
         let open: Vec<Arc<Ws>> = lock(&self.inner.workspaces).values().cloned().collect();
-        for w in open.into_iter().filter(|w| w.lsp.is_none()) {
+        for w in open.into_iter().filter(|w| lock(&w.lsp).is_none()) {
             let (was, now) = (allowed(old.lsp, w.trust), allowed(options.lsp, w.trust));
-            if !now {
-                if was {
-                    self.pool().release_root(&w.root).await;
-                }
-                for plan in lock(&w.servers).values_mut() {
-                    plan.resolved = None;
-                }
-            } else if !was || new_pool {
-                self.start_servers(&w).await;
+            self.apply_switch(&w, was, now, new_pool).await;
+        }
+    }
+
+    /// A worktree's policy went `was` → `now`: its servers follow.
+    async fn apply_switch(&self, w: &Ws, was: bool, now: bool, restart: bool) {
+        if !now {
+            if was {
+                self.pool().release_root(&w.root).await;
             }
+            for plan in lock(&w.servers).values_mut() {
+                plan.resolved = None;
+            }
+        } else if !was || restart {
+            self.start_servers(w).await;
         }
     }
 
@@ -419,7 +439,7 @@ impl CodeIntel {
 
     /// `w`'s own policy, else the default.
     fn policy_for(&self, w: &Ws) -> LspPolicy {
-        w.lsp.unwrap_or_else(|| self.policy())
+        lock(&w.lsp).unwrap_or_else(|| self.policy())
     }
 
     fn pool(&self) -> Arc<LspPool> {
@@ -462,7 +482,8 @@ impl CodeIntel {
         if let Ok(existing) = self.ws(&root) {
             let same = existing.repo_key == ws.repo_key
                 && existing.trust == ws.trust
-                && existing.requested == ws.languages;
+                && existing.requested == ws.languages
+                && lock(&self.inner.prefer).get(&root) == Some(&ws.servers);
             if same {
                 self.focus(&existing, focus);
                 return Ok(());
@@ -470,6 +491,7 @@ impl CodeIntel {
             self.close_ws(&root).await;
         }
 
+        let servers_wanted = ws.servers.clone();
         let only = (!ws.languages.is_empty()).then(|| ws.languages.iter().cloned().collect());
         let lang_of = language_of(self.inner.toolchain.manifest().clone(), only);
         let snapshot = {
@@ -482,10 +504,11 @@ impl CodeIntel {
             root: root.clone(),
             repo_key: ws.repo_key,
             trust: ws.trust,
-            lsp: ws.lsp,
+            lsp: Mutex::new(ws.lsp),
             requested: ws.languages,
             language_of: lang_of,
             servers: Mutex::default(),
+            dirty: Mutex::default(),
             tasks: Mutex::default(),
         });
         {
@@ -497,6 +520,7 @@ impl CodeIntel {
             }
             map.insert(root.clone(), w.clone());
         }
+        lock(&self.inner.prefer).insert(root.clone(), servers_wanted);
         self.focus(&w, focus);
         tracing::info!(target: "code_intel", root = %root.display(), trust = ?w.trust, languages = ?w.languages(), "workspace open");
         self.start_servers(&w).await;
@@ -513,6 +537,32 @@ impl CodeIntel {
         for server in w.servers_by_name().into_keys() {
             self.attach(w, &server).await;
         }
+    }
+
+    /// [`CodeIntelPort::warm`]. Stops at the cap: warming must not push out
+    /// a server someone is using, only to be pushed out in turn.
+    async fn warm_ws(&self, root: &Path) {
+        let Ok(w) = self.ws(root) else { return };
+        if !allowed(self.policy_for(&w), w.trust) {
+            return;
+        }
+        let pool = self.pool();
+        for server in w.servers_by_name().into_keys() {
+            if pool.get(&w.pool_key, &w.root, &server).await.is_none() && pool.has_room().await {
+                self.attach(&w, &server).await;
+            }
+        }
+    }
+
+    /// [`CodeIntelPort::set_lsp`].
+    async fn set_ws_lsp(&self, root: &Path, on: bool) {
+        let Ok(w) = self.ws(root) else { return };
+        let was = allowed(self.policy_for(&w), w.trust);
+        *lock(&w.lsp) = Some(LspPolicy {
+            review: on,
+            spaces: on,
+        });
+        self.apply_switch(&w, was, on, false).await;
     }
 
     /// Index `paths` first, then files mentioning the names they define.
@@ -546,7 +596,18 @@ impl CodeIntel {
     /// (Re)decide `lang`'s server for `w`. Probes; downloads nothing.
     async fn plan_server(&self, w: &Ws, lang: &LanguageId) {
         let policy = self.policy_for(w);
-        let Some(plan) = servers::plan(&self.inner.toolchain, lang, &w.root, policy, w.trust).await
+        let prefer = lock(&self.inner.prefer)
+            .get(&w.root)
+            .and_then(|p| p.get(lang.as_str()).cloned());
+        let Some(plan) = servers::plan(
+            &self.inner.toolchain,
+            lang,
+            prefer.as_deref(),
+            &w.root,
+            policy,
+            w.trust,
+        )
+        .await
         else {
             return;
         };
@@ -583,6 +644,7 @@ impl CodeIntel {
             map.remove(root).or_else(|| map.remove(&canonical(root)))
         };
         if let Some(w) = w {
+            lock(&self.inner.prefer).remove(&w.root);
             w.shut();
             self.pool().release_root(&w.root).await;
             self.spawn_evict();
@@ -600,7 +662,7 @@ impl CodeIntel {
             return Route::Not(Some(denied_note(w.trust).into()));
         }
         if plan.resolved.is_none() {
-            return Route::Not(Some(format!("{name} not installed")));
+            return Route::Not(Some(servers::not_resolved_note(&plan)));
         }
         let session = match self.pool().get(&w.pool_key, &w.root, &name).await {
             Some(s) => s,
@@ -619,7 +681,7 @@ impl CodeIntel {
         match session.state() {
             ServerState::Ready => Route::Ready(session),
             ServerState::Warming => Route::Not(Some(format!("{name} warming up"))),
-            ServerState::NotRunning | ServerState::Failed => {
+            ServerState::Off | ServerState::NotRunning | ServerState::Failed => {
                 Route::Not(Some(format!("{name} not running")))
             }
         }
@@ -646,8 +708,85 @@ impl CodeIntel {
         notes
     }
 
-    /// Wait (briefly) until `path` is indexed.
+    /// `path` as it is on disk now: hashed again, and reindexed when its
+    /// content is not the snapshot's (or removed when gone). A file the
+    /// agent wrote with its own Edit tool reaches here unannounced.
+    async fn refresh_file(&self, w: &Ws, path: &str) {
+        let had = w.index.snapshot().get(path).map(|f| f.blob_sha.clone());
+        let (r, p, lang_of) = (w.root.clone(), path.to_string(), w.language_of.clone());
+        match blocking(move || file_entry(&r, &p, &*lang_of).map_err(CodeIntelError::from)).await {
+            Ok(Some(entry)) if had.as_ref() != Some(&entry.blob_sha) => w.index.update_file(entry),
+            Ok(None) if had.is_some() => w.index.remove_file(path),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(target: "code_intel", path, error = %e, "re-reading a file"),
+        }
+    }
+
+    /// Files written since the snapshot and never reported (a new file of
+    /// this turn, an edit by the agent's own tool): what `git status` lists
+    /// now, and what it listed last time, is hashed again; changed ones go
+    /// into the snapshot and are indexed first (briefly waited for). Ignored
+    /// files stay out, as in the snapshot itself.
+    async fn refresh_dirty(&self, w: &Ws) {
+        let before: Vec<String> = lock(&w.dirty).iter().cloned().collect();
+        let (root, lang_of) = (w.root.clone(), w.language_of.clone());
+        let read = blocking(move || {
+            let now = dirty_paths(&root).map_err(CodeIntelError::from)?;
+            let mut paths: Vec<String> = now.clone();
+            paths.extend(before.into_iter().filter(|p| !now.contains(p)));
+            paths.truncate(MAX_DIRTY);
+            let entries = paths
+                .into_iter()
+                .map(|p| {
+                    let e = file_entry(&root, &p, &*lang_of).ok().flatten();
+                    (p, e)
+                })
+                .collect::<Vec<_>>();
+            Ok((now, entries))
+        })
+        .await;
+        let (now, entries) = match read {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(target: "code_intel", error = %e, "git status");
+                return;
+            }
+        };
+        *lock(&w.dirty) = now.into_iter().collect();
+        let snap = w.index.snapshot();
+        let mut files: BTreeMap<String, theodore_code_intel_syntax::FileEntry> = snap
+            .files()
+            .iter()
+            .map(|f| (f.path.clone(), f.clone()))
+            .collect();
+        let mut changed = Vec::new();
+        for (path, entry) in entries {
+            let had = files.get(&path).map(|f| f.blob_sha.clone());
+            match entry {
+                Some(e) if had.as_ref() != Some(&e.blob_sha) => {
+                    changed.push(path.clone());
+                    files.insert(path, e);
+                }
+                None if had.is_some() => {
+                    files.remove(&path);
+                }
+                _ => {}
+            }
+        }
+        if files.len() == snap.files().len() && changed.is_empty() {
+            return;
+        }
+        w.index
+            .update_snapshot(theodore_code_intel_syntax::Snapshot::new(
+                snap.root().to_path_buf(),
+                files.into_values().collect(),
+            ));
+        let _ = tokio::time::timeout(INDEX_WAIT, w.index.index_now(&changed)).await;
+    }
+
+    /// Wait (briefly) until `path`, as it is on disk now, is indexed.
     async fn wait_indexed(&self, w: &Ws, path: &str) {
+        self.refresh_file(w, path).await;
         let paths = [path.to_string()];
         let _ = tokio::time::timeout(INDEX_WAIT, w.index.index_now(&paths)).await;
     }
@@ -700,6 +839,7 @@ impl CodeIntel {
         kind: Option<CodeSymbolKind>,
     ) -> CodeIntelResult<Answer<CodeSymbol>> {
         let w = self.ws(root)?;
+        self.refresh_dirty(&w).await;
         let mut notes = Notes::default();
         let mut lsp: Vec<CodeSymbol> = Vec::new();
         let mut answered: HashSet<LanguageId> = HashSet::new();
@@ -713,11 +853,16 @@ impl CodeIntel {
                         );
                         answered.extend(langs);
                     }
-                    Err(e) => notes.push(e.to_string()),
+                    Err(e) => notes.error(e),
                 },
                 Route::Not(n) => notes.extend(n),
             }
         }
+        // A Markdown heading or a TOML key is not a definition of code; the
+        // file's own symbols still list them.
+        let manifest = self.inner.toolchain.manifest();
+        let code = |s: &CodeSymbol| w.language(&s.path).is_none_or(|l| is_code(manifest, &l));
+        let (lsp, mut prose): (Vec<CodeSymbol>, Vec<CodeSymbol>) = lsp.into_iter().partition(code);
         // Syntax answers for the languages no server answered for; all of
         // them when the servers found nothing.
         if lsp.is_empty() {
@@ -750,8 +895,72 @@ impl CodeIntel {
         let mut items = lsp;
         items.extend(syntax);
         items.extend(text);
+        let (mut items, more_prose): (Vec<CodeSymbol>, Vec<CodeSymbol>) =
+            items.into_iter().partition(code);
+        prose.extend(more_prose);
         items.truncate(MAX_HITS);
+        if items.is_empty() {
+            if !prose.is_empty() {
+                let mut paths: Vec<&str> = prose.iter().map(|s| s.path.as_str()).collect();
+                paths.dedup();
+                let more = if paths.len() > NOTE_EXTERNAL {
+                    ", …"
+                } else {
+                    ""
+                };
+                paths.truncate(NOTE_EXTERNAL);
+                notes.push(format!(
+                    "in prose or data files, not code: {}{more}",
+                    paths.join(", ")
+                ));
+            }
+            notes.extend(self.skipped_mentions(&w, name).await);
+        }
         Ok(self.answer(&w, items, source, notes))
+    }
+
+    /// "not searched, over code_intel.max_file_kb: a.ts, …": the code files
+    /// left out for their size that mention `name`, so an empty answer
+    /// doesn't read as "defined nowhere".
+    async fn skipped_mentions(&self, w: &Ws, name: &str) -> Option<String> {
+        let manifest = self.inner.toolchain.manifest();
+        let big: Vec<String> = w
+            .index
+            .progress()
+            .too_large
+            .into_iter()
+            .filter(|p| w.language(p).is_some_and(|l| is_code(manifest, &l)))
+            .take(NOTE_SKIPPED_SCAN)
+            .collect();
+        if big.is_empty() || name.is_empty() {
+            return None;
+        }
+        let (root, name) = (w.root.clone(), name.to_string());
+        let found = blocking(move || {
+            Ok(big
+                .into_iter()
+                .filter(|p| read_inside(&root, p).is_ok_and(|t| t.contains(&name)))
+                .collect::<Vec<_>>())
+        })
+        .await
+        .unwrap_or_default();
+        if found.is_empty() {
+            return None;
+        }
+        let shown: Vec<&str> = found
+            .iter()
+            .take(NOTE_EXTERNAL)
+            .map(String::as_str)
+            .collect();
+        let more = if found.len() > shown.len() {
+            ", …"
+        } else {
+            ""
+        };
+        Some(format!(
+            "not searched, over code_intel.max_file_kb: {}{more}",
+            shown.join(", ")
+        ))
     }
 
     async fn file_symbols_in(
@@ -769,7 +978,7 @@ impl CodeIntel {
                     return Ok(self.answer(&w, syms, Source::Lsp, notes));
                 }
                 Ok(_) => {}
-                Err(e) => notes.push(e.to_string()),
+                Err(e) => notes.error(e),
             },
             Route::Not(n) => notes.extend(n),
         }
@@ -846,7 +1055,7 @@ impl CodeIntel {
                     return Ok(self.answer(&w, hits, Source::Lsp, notes));
                 }
                 Ok(_) => notes.push(format!("{}: no definition; matched by name", s.server())),
-                Err(e) => notes.push(e.to_string()),
+                Err(e) => notes.error(e),
             },
             Route::Not(n) => notes.extend(n),
         }
@@ -897,7 +1106,7 @@ impl CodeIntel {
                     return Ok(self.answer(&w, hits, Source::Lsp, notes));
                 }
                 Ok(_) => notes.push(format!("{}: no references; matched by name", s.server())),
-                Err(e) => notes.push(e.to_string()),
+                Err(e) => notes.error(e),
             },
             Route::Not(n) => notes.extend(n),
         }
@@ -948,7 +1157,7 @@ impl CodeIntel {
                         asked = true;
                         match session_diagnostics(&s, &w.root, Some(&p)).await {
                             Ok(d) => items = d,
-                            Err(e) => notes.push(e.to_string()),
+                            Err(e) => notes.error(e),
                         }
                     }
                     Route::Not(n) => notes.extend(n),
@@ -961,7 +1170,7 @@ impl CodeIntel {
                             asked = true;
                             match session_diagnostics(&s, &w.root, None).await {
                                 Ok(d) => items.extend(d),
-                                Err(e) => notes.push(e.to_string()),
+                                Err(e) => notes.error(e),
                             }
                         }
                         Route::Not(n) => notes.extend(n),
@@ -1091,20 +1300,24 @@ impl CodeIntel {
             first_error = Some(e);
         }
 
-        // The preferred server, downloaded only if it is not on the machine.
-        // Resolved outside any worktree: a worktree's own binaries are
-        // never what gets installed.
-        let neutral = tc.root().to_path_buf();
-        if let Some((server, state)) = tc
-            .server_for(language, None, &neutral, TrustMode::Review)
-            .await
-        {
-            let on_disk = matches!(
+        // The preferred server, downloaded only if it is not on the machine
+        // and can run here. A project that names one wins (the first open
+        // worktree of the language that does).
+        let prefer: Option<String> = lock(&self.inner.prefer)
+            .values()
+            .find_map(|p| p.get(language.as_str()).cloned());
+        let mut fetched: Option<String> = None;
+        if let Some((server, state)) = tc.server_to_install(language, prefer.as_deref()).await {
+            let fetch = !matches!(
                 state,
-                InstallState::System { .. } | InstallState::Installed { .. }
+                InstallState::System { .. }
+                    | InstallState::Installed { .. }
+                    | InstallState::NeedsRuntime { .. }
+                    | InstallState::TrustedOnly
             );
-            if !on_disk && server.download_for(tc.platform()).is_some() {
+            if fetch && server.download_for(tc.platform()).is_some() {
                 self.mark_downloading(&server.name);
+                fetched = Some(server.name.clone());
                 let report = Reporter::new(
                     progress.clone(),
                     language,
@@ -1123,16 +1336,27 @@ impl CodeIntel {
         // Every open workspace with the language picks both up.
         let open: Vec<Arc<Ws>> = lock(&self.inner.workspaces).values().cloned().collect();
         for w in open {
-            if !w.languages().contains(language) {
-                continue;
+            // `mark_downloading` marked every language of that server, in
+            // every worktree: each has to read where it stands now.
+            let sharing: Vec<LanguageId> = lock(&w.servers)
+                .iter()
+                .filter(|(l, p)| *l != language && Some(&p.spec.name) == fetched.as_ref())
+                .map(|(l, _)| l.clone())
+                .collect();
+            for l in &sharing {
+                self.plan_server(&w, l).await;
             }
-            let progress = w.index.progress();
-            if grammar_ok && progress.missing_languages.contains(language) {
-                w.index.refresh_grammar(language);
-            }
-            self.plan_server(&w, language).await;
-            if let Some(plan) = w.plan(language) {
-                self.attach(&w, &plan.spec.name).await;
+            if w.languages().contains(language) {
+                let progress = w.index.progress();
+                if grammar_ok && progress.missing_languages.contains(language) {
+                    w.index.refresh_grammar(language);
+                }
+                self.plan_server(&w, language).await;
+                if let Some(plan) = w.plan(language) {
+                    self.attach(&w, &plan.spec.name).await;
+                }
+            } else if let Some(server) = fetched.as_deref().filter(|_| !sharing.is_empty()) {
+                self.attach(&w, server).await;
             }
         }
         first_error.map_or(Ok(()), Err)
@@ -1155,23 +1379,19 @@ impl CodeIntel {
             parsed.push(language.clone());
         }
         let open: Vec<Arc<Ws>> = lock(&self.inner.workspaces).values().cloned().collect();
-        let users: Vec<String> = open
+        let users: Vec<PathBuf> = open
             .iter()
             .filter(|w| {
                 let langs = w.languages();
                 parsed.iter().any(|l| langs.contains(l))
             })
-            .map(|w| w.root.display().to_string())
+            .map(|w| w.root.clone())
             .collect();
-        if let Some(first) = users.first() {
-            let more = match users.len() {
-                1 => String::new(),
-                n => format!(" and {} more", n - 1),
-            };
-            return Err(CodeIntelError::Other(format!(
-                "{language} is in use by an open worktree ({first}{more}); \
-                 close it, or remove the language later"
-            )));
+        if !users.is_empty() {
+            return Err(CodeIntelError::InUse {
+                language: language.to_string(),
+                roots: users,
+            });
         }
 
         // Servers: every one of the language Theodore downloads. Their
@@ -1236,12 +1456,7 @@ impl CodeIntel {
             tracing::debug!(target: "code_intel", path, "file_changed: path outside the workspace");
             return;
         };
-        let (r, p, lang_of) = (w.root.clone(), path.clone(), w.language_of.clone());
-        match blocking(move || file_entry(&r, &p, &*lang_of).map_err(CodeIntelError::from)).await {
-            Ok(Some(entry)) => w.index.update_file(entry),
-            Ok(None) => w.index.remove_file(&path),
-            Err(e) => tracing::warn!(target: "code_intel", path, error = %e, "file_changed"),
-        }
+        self.refresh_file(&w, &path).await;
         // Tell a running server; do not start one for this.
         let Some(plan) = w.language(&path).and_then(|l| w.plan(&l)) else {
             return;
@@ -1301,13 +1516,14 @@ impl CodeIntel {
             .into_iter()
             .map(|(language, shas)| {
                 let server = w.plan(&language).map(|p| ServerStatus {
+                    hint: p.spec.hint.clone(),
                     state: if allowed(policy, w.trust) {
                         running
                             .get(&p.spec.name)
                             .copied()
                             .unwrap_or(ServerState::NotRunning)
                     } else {
-                        ServerState::NotRunning
+                        ServerState::Off
                     },
                     name: p.spec.name,
                     install: p.install,
@@ -1585,6 +1801,14 @@ impl CodeIntelPort for CodeIntel {
 
     async fn file_changed(&self, root: &Path, path: &str) {
         self.changed(root, path).await
+    }
+
+    async fn warm(&self, root: &Path) {
+        self.warm_ws(root).await
+    }
+
+    async fn set_lsp(&self, root: &Path, on: bool) {
+        self.set_ws_lsp(root, on).await
     }
 
     async fn status(&self, root: &Path) -> CodeIntelResult<Vec<LanguageStatus>> {

@@ -79,6 +79,13 @@ pub enum SandboxCommand {
     Fire { event: String },
     /// Faults, timeline and PR count of the running sandbox.
     Status,
+    /// With the sandbox's app closed: N stored turns (markdown, tool steps) in
+    /// one of its spaces, by id or name, to try a long chat without tokens.
+    SeedChat {
+        space: String,
+        #[arg(long, default_value_t = 300)]
+        turns: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -115,7 +122,7 @@ fn parse_at(at: &str) -> anyhow::Result<(String, u32)> {
 /// The action a subcommand sends; `None` for the local-only ones.
 pub fn action_for(cmd: &SandboxCommand) -> anyhow::Result<Option<Action>> {
     Ok(Some(match cmd {
-        SandboxCommand::Init { .. } => return Ok(None),
+        SandboxCommand::Init { .. } | SandboxCommand::SeedChat { .. } => return Ok(None),
         SandboxCommand::Push {
             pr,
             files,
@@ -230,6 +237,11 @@ pub fn run(args: &SandboxArgs) -> anyhow::Result<()> {
         .data_dir
         .clone()
         .unwrap_or_else(theodore_runtime::sandbox_data_dir);
+    if let SandboxCommand::SeedChat { space, turns } = &args.command {
+        let id = crate::sandbox_seed::seed_chat(&data_dir, space, *turns)?;
+        println!("seeded {turns} turns in space {id}");
+        return Ok(());
+    }
     let root = theodore_sandbox::root_of(&data_dir);
     let action = action_for(&args.command)?.expect("not init");
     if matches!(action, Action::Status) && control::alive(&root).is_none() {

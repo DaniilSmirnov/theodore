@@ -163,7 +163,9 @@ impl Core {
         let data_dir = self.0.deps.data_dir.clone();
         if let Some(folder) = &project.path {
             let folder = Path::new(folder);
-            return config::read_layers(&data_dir, Some(folder), Some(folder)).await;
+            let mut layers = config::read_layers(&data_dir, Some(folder), None).await;
+            layers.push(self.folder_local_layer(folder).await);
+            return layers;
         }
         let mut layers = config::read_layers(&data_dir, None, None).await;
         if let Some(rev) = rev
@@ -179,12 +181,89 @@ impl Core {
         layers
     }
 
+    /// A local folder's personal file. Committed, it isn't personal: anyone
+    /// who can push wrote it, so it counts as the repo's and gets the repo's
+    /// limits (no `lsp`, commands wait for "Run commands from this repo?").
+    pub(crate) async fn folder_local_layer(&self, folder: &Path) -> LayerText {
+        let mut layer = config::read_local_layer(&folder.join(config::LOCAL_FILE)).await;
+        if self
+            .0
+            .deps
+            .git
+            .is_tracked(folder, config::LOCAL_FILE)
+            .await
+            .unwrap_or(false)
+        {
+            layer.layer = ConfigLayer::Repo;
+        }
+        layer
+    }
+
     /// The config a space runs with: its project's layers (a host
     /// project's repo file at the space's base) and the trust state.
     pub(crate) async fn space_config_of(&self, space: &Space, project: &Project) -> SpaceConfig {
         let layers = self.project_layers(project, Some(&space.base_sha)).await;
         self.config_with_trust(&layers, project, space.commands_denied)
             .await
+    }
+
+    /// The config with the repo layer read from the space's own worktree
+    /// (the personal file stays the checkout's), when that file sets the
+    /// effective `spaces.setup`. Only for setup's Retry (docs/config.md §2):
+    /// `run`, `check` and `archive` stay on `space_config_of`.
+    async fn worktree_setup_config(&self, space: &Space, project: &Project) -> Option<SpaceConfig> {
+        let layer = config::read_repo_layer(Path::new(&space.worktree)).await;
+        layer.text.as_ref()?;
+        let mut layers = self.project_layers(project, Some(&space.base_sha)).await;
+        match layers.iter().position(|l| l.layer == ConfigLayer::Repo) {
+            Some(repo) => layers[repo] = layer,
+            // After the global file, always first.
+            None => layers.insert(1.min(layers.len()), layer),
+        }
+        // A denial was about the base's commands, and a set it allowed
+        // still has to match by hash.
+        let cfg = self.config_with_trust(&layers, project, false).await;
+        (cfg.merged.layer_of(&command_key(SpaceCommandKind::Setup)) == Some(ConfigLayer::Repo))
+            .then_some(cfg)
+    }
+
+    /// What a Retry of setup runs with: the worktree's config when its repo
+    /// commands differ from the base's (`true`), else the base's.
+    pub(crate) async fn retry_setup_config(
+        &self,
+        space: &Space,
+        project: &Project,
+    ) -> (SpaceConfig, bool) {
+        let base = self.space_config_of(space, project).await;
+        let hash = |c: &SpaceConfig| c.repo.as_ref().map(|r| r.hash.clone());
+        match self.worktree_setup_config(space, project).await {
+            Some(own) if hash(&own) != hash(&base) => (own, true),
+            _ => (base, false),
+        }
+    }
+
+    /// The config `setup` runs with: the base's, or after a Retry that took
+    /// it from there, the worktree's (the base's once that file is gone).
+    pub(crate) async fn setup_config_of(&self, space: &Space, project: &Project) -> SpaceConfig {
+        if space.setup.as_ref().is_some_and(|s| s.from_worktree)
+            && let Some(own) = self.worktree_setup_config(space, project).await
+        {
+            return own;
+        }
+        self.space_config_of(space, project).await
+    }
+
+    /// The config "Run commands from this repo?" asks about for `space`.
+    pub(crate) async fn prompt_config_of(&self, space: &Space, project: &Project) -> SpaceConfig {
+        let waiting = space
+            .setup
+            .as_ref()
+            .is_some_and(|s| s.status == theodore_contract::SetupStatus::Waiting);
+        if waiting {
+            self.setup_config_of(space, project).await
+        } else {
+            self.space_config_of(space, project).await
+        }
     }
 
     pub(crate) async fn config_with_trust(
@@ -530,9 +609,15 @@ impl Core {
 }
 
 /// Copies `patterns` (paths relative to `root`; `*` / `?` allowed in the
-/// last segment) into `dest`. Returns notes for what wasn't copied.
-pub(crate) fn copy_into(root: &Path, dest: &Path, patterns: &[String]) -> Vec<String> {
+/// last segment) into `dest`. Returns notes for what wasn't copied, and the
+/// files that were.
+pub(crate) fn copy_into(
+    root: &Path,
+    dest: &Path,
+    patterns: &[String],
+) -> (Vec<String>, Vec<String>) {
     let mut notes = Vec::new();
+    let mut files = Vec::new();
     for pattern in patterns {
         let rel = Path::new(pattern);
         let safe = !pattern.is_empty()
@@ -571,16 +656,18 @@ pub(crate) fn copy_into(root: &Path, dest: &Path, patterns: &[String]) -> Vec<St
             notes.push(format!("copy: nothing matches {pattern}"));
         }
         for m in matches {
-            if let Err(e) = copy_path(&root.join(&m), &dest.join(&m)) {
+            if let Err(e) = copy_path(root, dest, &m, &mut files) {
                 notes.push(format!("copy: {}: {e}", m.display()));
             }
         }
     }
-    notes
+    (notes, files)
 }
 
-fn copy_path(from: &Path, to: &Path) -> std::io::Result<()> {
-    let meta = std::fs::symlink_metadata(from).map_err(|_| {
+/// `rel` from under `root` to under `dest`; each file copied goes on `files`.
+fn copy_path(root: &Path, dest: &Path, rel: &Path, files: &mut Vec<String>) -> std::io::Result<()> {
+    let (from, to) = (root.join(rel), dest.join(rel));
+    let meta = std::fs::symlink_metadata(&from).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "not found in the project")
     })?;
     if meta.file_type().is_symlink() {
@@ -592,14 +679,18 @@ fn copy_path(from: &Path, to: &Path) -> std::io::Result<()> {
             if std::fs::symlink_metadata(e.path()).is_ok_and(|m| m.file_type().is_symlink()) {
                 continue;
             }
-            copy_path(&e.path(), &to.join(e.file_name()))?;
+            copy_path(root, dest, &rel.join(e.file_name()), files)?;
         }
         return Ok(());
     }
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::copy(from, to).map(|_| ())
+    std::fs::copy(from, to)?;
+    if let Some(rel) = rel.to_str() {
+        files.push(rel.to_string());
+    }
+    Ok(())
 }
 
 /// `*` (any run) and `?` (one character) within one path segment.
@@ -654,7 +745,9 @@ mod copy_tests {
             .into_iter()
             .map(String::from)
             .collect();
-        let notes = copy_into(root.path(), dest.path(), &patterns);
+        let (notes, mut files) = copy_into(root.path(), dest.path(), &patterns);
+        files.sort();
+        assert_eq!(files, [".env", ".env.local", "conf/sub/k.pem"]);
         assert_eq!(
             std::fs::read_to_string(dest.path().join(".env")).unwrap(),
             "A=1"

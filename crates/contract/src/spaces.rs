@@ -138,6 +138,13 @@ pub struct Space {
     pub sent_feedback: Vec<SentFeedback>,
     pub created_at: Millis,
     pub updated_at: Millis,
+    /// When the space last had something for you: a turn ended or failed
+    /// (a plan is ready when its turn ends), or a question came. The ●
+    /// compares this, not `updated_at`, which other writes bump too. Always
+    /// written with `updated_at`, which the page's seen mark stores. `None`
+    /// on spaces with no such event since it was added.
+    #[serde(default)]
+    pub attention_at: Option<Millis>,
     /// A short chat title the chat agent proposed from the goal, shown
     /// instead of its raw first line (`ui/src/ui/space/spaces.ts`'s
     /// `defaultTitle`); `None` until that run lands or when it failed.
@@ -371,8 +378,8 @@ pub struct CreateSpaceRequest {
     pub start_from: Option<SpaceStart>,
 }
 
-/// New space's "From an issue" picker: the project's own open issues
-/// assigned to the viewer (`HostAdapter::my_open_issues`).
+/// New space's "From an issue" picker: the project's open issues, the
+/// viewer's own first (`HostAdapter::open_issues`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 pub struct ProjectIssuesRequest {
     pub project: String,

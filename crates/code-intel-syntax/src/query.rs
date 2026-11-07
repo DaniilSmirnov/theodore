@@ -352,6 +352,14 @@ impl SyntaxIndex {
             }
             Err(e) => return Err(e.into()),
         };
+        // The ranges are those of the indexed blob: other bytes on disk
+        // would make them point anywhere.
+        let indexed = snap.get(path).map(|f| f.blob_sha.as_str());
+        if indexed != Some(crate::snapshot::blob_sha(text.as_bytes()).as_str()) {
+            return Err(
+                CodeIntelError::Other(format!("{path} changed since it was indexed")).into(),
+            );
+        }
         let (Some(start), Some(end)) = (
             byte_offset(&text, sym.range.start),
             byte_offset(&text, sym.range.end),

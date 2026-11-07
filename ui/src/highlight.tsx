@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import Markdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
@@ -592,7 +593,7 @@ export function rich(text: string): ReactNode[] {
  *  footnotes) for PR descriptions, comments and agent replies. Raw HTML goes
  *  through GitHub's own allowlist (`<details>`, `<summary>`, `<kbd>`,
  *  `<sub>`, `<br>`…); scripts, styles and event handlers never render. */
-export function Md({ text }: { text: string }) {
+export const Md = memo(function Md({ text }: { text: string }) {
   return (
     <div className="rich md">
       <Markdown
@@ -604,7 +605,7 @@ export function Md({ text }: { text: string }) {
       </Markdown>
     </div>
   );
-}
+});
 
 /** HTML comments (e.g. Theodore's idempotency markers) never show. */
 export function stripHtmlComments(text: string): string {

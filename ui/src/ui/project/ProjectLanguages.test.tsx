@@ -1,7 +1,12 @@
 import { act } from 'react';
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { click, mount, settle, type Mounted } from '../../test/dom';
-import type { CodeIntelStatus, Project } from '../../gen/contract';
+import type {
+  CodeInstall,
+  CodeIntelStatus,
+  CodeLanguage,
+  Project,
+} from '../../gen/contract';
 import { setTransport } from '../../core/transport';
 import { RootStore } from '../../stores/RootStore';
 import { RootStoreProvider } from '../../stores/context';
@@ -42,6 +47,7 @@ const STATUS: CodeIntelStatus = {
           version: null,
         },
         state: 'ready',
+        hint: null,
       },
       index_percent: 100,
     },
@@ -53,6 +59,7 @@ const STATUS: CodeIntelStatus = {
         name: 'clangd',
         install: { state: 'missing' },
         state: 'not_running',
+        hint: null,
       },
       index_percent: 40,
     },
@@ -120,6 +127,21 @@ describe('ProjectLanguages', () => {
     expect(transport.calls[0]!.args).toEqual({ project: PROJECT.id });
   });
 
+  it('a server off for reviews says so while spaces are on', async () => {
+    const [rust] = STATUS.languages;
+    transport.onCall('code_intel_status', () => ({
+      ...STATUS,
+      languages: [{ ...rust!, server: { ...rust!.server!, state: 'off' } }],
+    }));
+    await render();
+    const chip = [...m!.host.querySelectorAll('[title]')].find(
+      (e) => e.textContent === 'Off for reviews',
+    );
+    expect(chip?.getAttribute('title')).toBe(
+      'Language servers start in this project’s spaces',
+    );
+  });
+
   it('a switch writes this project’s setting', async () => {
     transport.onCall('code_intel_status', () => STATUS);
     transport.onCall('code_intel_set_lsp', () => null);
@@ -179,6 +201,70 @@ describe('ProjectLanguages', () => {
         .slice(before)
         .filter((c) => c.cmd === 'code_intel_status'),
     ).toHaveLength(1);
+  });
+
+  it('says what a server needs, with nothing to install', async () => {
+    const row = (
+      language: string,
+      name: string,
+      install: CodeInstall,
+      hint: string | null = null,
+    ): CodeLanguage => ({
+      language,
+      files: 2,
+      grammar: { state: 'installed', version: '1' },
+      server: { name, install, state: 'not_running', hint },
+      index_percent: 100,
+    });
+    transport.onCall('code_intel_status', () => ({
+      ...STATUS,
+      languages: [
+        row('java', 'jdtls', {
+          state: 'needs_runtime',
+          runtime: 'java',
+          min: '21',
+          found: '17.0.2',
+        }),
+        row(
+          'ruby',
+          'ruby-lsp',
+          { state: 'unavailable' },
+          'gem install ruby-lsp',
+        ),
+        row('kotlin', 'kotlin-lsp', { state: 'trusted_only' }),
+      ],
+    }));
+    await render();
+    const text = m!.host.textContent;
+    expect(text).toContain('Needs Java 21+');
+    expect(text).toContain('Found 17.0.2');
+    expect(text).toContain('gem install ruby-lsp');
+    expect(text).not.toContain('No download for this Mac');
+    expect(text).toContain('Spaces only');
+    // Their grammars are in, and none of these can be fetched.
+    expect(m!.host.querySelectorAll('.code-install')).toHaveLength(0);
+    expect(m!.host.querySelectorAll('.code-decline')).toHaveLength(0);
+  });
+
+  it('a language with no grammar reads as text search, not as a failure', async () => {
+    transport.onCall('code_intel_status', () => ({
+      ...STATUS,
+      languages: [
+        {
+          language: 'css',
+          files: 8,
+          grammar: { state: 'unavailable' },
+          server: null,
+          index_percent: 0,
+        },
+      ],
+    }));
+    await render();
+    const text = m!.host.textContent;
+    expect(text).toContain('Text search');
+    expect(text).not.toContain('Unavailable');
+    expect(text).not.toContain('% indexed');
+    expect(m!.host.querySelectorAll('.code-install')).toHaveLength(0);
   });
 
   it('Remove asks first, then removes', async () => {

@@ -2,7 +2,7 @@
  *  chevron in its header (#51). A Viewed flip clears a hand fold. */
 import { act } from 'react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { click, mount, type Mounted } from '../test/dom';
+import { click, mount, settle, type Mounted } from '../test/dom';
 import { FakeTransport } from '../test/fakeTransport';
 import { setTransport } from '../core/transport';
 import type { FileDiff, Hunk, Revision } from '../gen/contract';
@@ -119,6 +119,10 @@ beforeEach(() => {
   // Viewed writes through the sync queue; no transport means rollback.
   const t = new FakeTransport();
   t.onCall('transact', () => ({ status: 'ok', last_sync_id: 1 }));
+  // The head file, for context lines: line n reads `line n`.
+  t.onCall('get_file', () =>
+    Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join('\n'),
+  );
   setTransport(t);
 });
 afterEach(() => {
@@ -167,6 +171,29 @@ describe('DiffPane folds a file', () => {
     expect(m.host.querySelector('#H-a1')).not.toBeNull();
   });
 
+  it('opens a Viewed file when J/K comes back to the hunk it folded on', async () => {
+    const f = await open(false, 'a0');
+    m = f;
+    await click(viewedToggle());
+    expect(folded()).not.toBeNull();
+    await f.focus(null);
+    expect(folded()).not.toBeNull();
+    await f.focus('a0');
+    expect(folded()).toBeNull();
+    expect(m.host.querySelector('#H-a0')).not.toBeNull();
+  });
+
+  it('keeps a hand fold when focus leaves, and opens on a jump back', async () => {
+    const f = await open(false, 'a0');
+    m = f;
+    await click(chevron());
+    expect(folded()).not.toBeNull();
+    await f.focus(null);
+    expect(folded()).not.toBeNull();
+    await f.focus('a0');
+    expect(folded()).toBeNull();
+  });
+
   it('folds and unfolds by hand from the chevron, without touching Viewed', async () => {
     m = await open();
     await click(chevron());
@@ -204,6 +231,46 @@ describe('DiffPane folds a file', () => {
     await g.focus(null);
     expect(folded()).toBeNull();
     expect(hunks()).toBe(1);
+  });
+
+  it('keeps the context lines it loaded when folded and opened again', async () => {
+    m = await open();
+    const contextLines = () => m!.host.querySelectorAll('.ln.t-ctx').length;
+    const load = [...m.host.querySelectorAll('button')].find((b) =>
+      b.textContent?.startsWith('Load 39 lines'),
+    );
+    await click(load);
+    await settle();
+    const loaded = contextLines();
+    expect(loaded).toBeGreaterThan(0);
+
+    await click(chevron());
+    expect(folded()).not.toBeNull();
+    await click(chevron());
+    await settle();
+    expect(contextLines()).toBe(loaded);
+  });
+
+  it('counts the drafts a folded file hides', async () => {
+    const store = new RootStore();
+    seed(store, true);
+    store.sync.pool.put('draft', 'd1', {
+      id: 'd1',
+      pr: PR,
+      anchor: {
+        rev: HEAD,
+        path: PATH,
+        side: 'new',
+        line: 1,
+        start_line: null,
+        start_side: null,
+      },
+      body: 'fix this',
+      source: { kind: 'me' },
+      outdated: false,
+    });
+    m = await mount(tree(store, rev, null));
+    expect(folded()!.textContent).toContain('1 draft');
   });
 
   it('drops a hand override when Viewed flips', async () => {

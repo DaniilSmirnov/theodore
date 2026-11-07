@@ -285,3 +285,52 @@ async fn interdiff_file_filter_excludes_other_paths() {
         .expect("interdiff");
     assert_eq!(some.len(), 4);
 }
+
+/// A last-seen sha that isn't in the repo (force-pushed away, a fresh
+/// clone) answers a typed "commit not found" the UI falls back from by
+/// forgetting it, not git's "Invalid symmetric difference expression".
+#[tokio::test]
+async fn interdiff_from_a_commit_not_in_the_repo_is_commit_not_found() {
+    let fx = setup();
+    let f = fixtures();
+    let git_cli = theodore_git::GitCli::new(fx.root.clone(), std::sync::Arc::new(NoAuth));
+    let deps = crate::Deps {
+        git: std::sync::Arc::new(git_cli),
+        ..f.deps()
+    };
+
+    let pr_ref = testkit::sample_pr_ref("acme", "widget", 1);
+    let base = Sha::new(fx.base_sha.clone());
+    let head = Sha::new(fx.head_sha.clone());
+    let detail = testkit::sample_pr_detail(&pr_ref, &base, &head);
+    f.host.push_get_pr(Ok(Fetched::Modified {
+        etag: Some("etag-1".into()),
+        value: detail,
+    }));
+
+    let (core, _recv) = Core::start(deps);
+    let resp = core
+        .open_pr(OpenPrRequest {
+            url: "https://github.com/acme/widget/pull/1".into(),
+        })
+        .await
+        .expect("open_pr");
+
+    let stale = "b6cef3e".repeat(5) + "b6cef";
+    let err = core
+        .interdiff(InterdiffRequest {
+            pr: resp.pr.clone(),
+            base_sha: Sha::new(stale.clone()),
+            file: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            crate::AppError::Git(theodore_ports::GitError::MissingCommit(s)) if *s == stale
+        ),
+        "{err:?}"
+    );
+    assert!(err.is_expected());
+}

@@ -72,8 +72,8 @@ impl SandboxHost {
                     Err(HostError::RateLimited { reset_at })
                 }
             } else if f.server_errors && self.world.random() < f.server_error_rate {
-                Err(HostError::Network(
-                    "sandbox: server error 502 Bad Gateway (server_errors fault)".into(),
+                Err(HostError::Server(
+                    "sandbox: 502 Bad Gateway (server_errors fault)".into(),
                 ))
             } else if f.not_found
                 && let Some(pr) = pr

@@ -76,6 +76,7 @@ impl Core {
             .space_reset(&wt.path, &space.id, &to)
             .await
             .map_err(|e| busy_refusal("undo", e))?;
+        self.spawn_space_code_changed(wt.path.clone(), space.head_sha.clone(), to.sha.clone());
         let mut log = space.turn_log.clone();
         for t in log[i..].iter_mut() {
             t.undone = true;
@@ -186,6 +187,7 @@ impl Core {
                 "{first} is already as it was {said}"
             )));
         }
+        self.spawn_space_code_changed(wt.path.clone(), space.head_sha.clone(), cp.sha.clone());
 
         let id = uuid::Uuid::new_v4().to_string();
         let now = self.0.deps.clock.now();
@@ -204,6 +206,11 @@ impl Core {
             failed: None,
             attachments: vec![],
             queued: None,
+            activity: vec![],
+            duration_ms: None,
+            changed_files: vec![],
+            model: None,
+            text_in_steps: false,
         };
         let mut log = space.turn_log.clone();
         log.push(SpaceTurn {
@@ -287,8 +294,8 @@ fn refusal(space: &Space) -> Result<(), String> {
 
 /// The index in `turn_log` a rewind would start undoing at — `from`, or
 /// the last turn not undone yet — or why it can't: not while a turn runs,
-/// not on an archived space, not once the space moved past its last turn,
-/// and not over a turn that already shipped.
+/// not on an archived space, not once the space moved past its last turn or
+/// between the turns going back, and not over a turn that already shipped.
 pub(crate) fn rewindable(space: &Space, from: Option<usize>) -> Result<usize, String> {
     refusal(space)?;
     let log = &space.turn_log;
@@ -302,6 +309,21 @@ pub(crate) fn rewindable(space: &Space, from: Option<usize>) -> Result<usize, St
     }
     if log[last].after != space.head_sha {
         return Err("the space moved since its last turn".into());
+    }
+    // A clean update from base or Continue moves the space without a turn.
+    // Going back over one would put the old tree on the new base, and the
+    // next ship would revert what the base gained.
+    let mut live = log[i..=last].iter().filter(|t| !t.undone);
+    let mut previous = live.next().map(|t| &t.after);
+    for t in live {
+        if previous != Some(&t.before) {
+            return Err(
+                "the space moved on between these turns (an update from base, or Continue); \
+                 it can't go back past that"
+                    .into(),
+            );
+        }
+        previous = Some(&t.after);
     }
     if let Some(shipped) = &space.shipped {
         // Shipped from a checkpoint at or before turn `i`'s start: nothing

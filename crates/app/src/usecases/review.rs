@@ -9,6 +9,10 @@ use crate::outbox::{DraftComment, SubmitReviewPayload};
 
 use crate::core::Core;
 
+/// How long `submit_review` waits for the host before leaving the write to
+/// the outbox.
+const SUBMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
 impl Core {
     pub async fn submit_review(&self, req: SubmitReviewRequest) -> AppResult<()> {
         self.ensure_open(&req.pr).await?;
@@ -26,6 +30,9 @@ impl Core {
         let mut outdated = 0usize;
         let comments: Vec<DraftComment> = rows
             .iter()
+            // A submitted draft is archived, not deleted: it was posted
+            // already and is neither sent again nor counted as skipped.
+            .filter(|r| !r.archived)
             .filter_map(|r| {
                 let draft: Draft = serde_json::from_value(r.data.clone()).ok()?;
                 if draft.outdated {
@@ -65,11 +72,17 @@ impl Core {
         };
         let payload_json =
             serde_json::to_value(&payload).map_err(|e| AppError::Invalid(e.to_string()))?;
-        self.enqueue_outbox("submit_review", payload_json).await?;
+        // Waits for the host, briefly: a refusal ("Can not approve your own
+        // pull request") fails the command, so the UI keeps you on the PR
+        // with the reason; still going after that, it lands in the
+        // background like any outbox write.
+        let landed = self
+            .enqueue_and_wait("submit_review", payload_json, SUBMIT_WAIT)
+            .await;
         theodore_telemetry::product(theodore_telemetry::ProductEvent::ReviewSubmitted {
             comments: comment_count,
             review_event,
         });
-        Ok(())
+        landed
     }
 }

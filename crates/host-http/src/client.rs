@@ -428,9 +428,7 @@ impl HttpClient {
                             duration_ms = started.elapsed().as_millis() as u64,
                             "host server error after retries"
                         );
-                        return Err(HostError::Network(format!(
-                            "server error {status} after retries"
-                        )));
+                        return Err(HostError::Server(format!("{status} after retries")));
                     }
 
                     let text = resp.text().await.map_err(|e| {
@@ -515,7 +513,7 @@ impl HttpClient {
     /// top of `execute`), not whatever `self.token` reads now — the two can
     /// differ if the token was swapped while this response was in flight.
     fn attach_body(&self, err: HostError, body: &str, token: Option<&str>) -> HostError {
-        let msg = redact(token, body);
+        let msg = redact(token, &error_message(body));
         match err {
             HostError::NotFound(_) => HostError::NotFound(msg),
             HostError::Conflict(_) => HostError::Conflict(msg),
@@ -533,6 +531,56 @@ impl HttpClient {
         self.clock
             .sleep(Duration::from_millis(exp / 2 + jitter))
             .await;
+    }
+}
+
+/// The words a person should see from an error body: its `message` (GitHub,
+/// GitLab) or `error` (GitLab), with GitHub's per-field `errors[].message`
+/// appended, instead of the raw JSON. A body that isn't JSON, or has none
+/// of these, is kept as it came.
+///
+/// ```text
+/// {"message":"Review cannot be requested from pull request author.",…}
+///   → Review cannot be requested from pull request author.
+/// {"message":"Validation Failed","errors":[{"message":"A pull request already exists…"}]}
+///   → Validation Failed: A pull request already exists…
+/// ```
+fn error_message(body: &str) -> String {
+    let trimmed = body.trim();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return trimmed.to_string();
+    };
+    // GitLab's `message` can be a list, or a map of field → list.
+    fn words(v: &serde_json::Value) -> Option<String> {
+        let text = match v {
+            serde_json::Value::String(s) => s.trim().to_string(),
+            serde_json::Value::Array(items) => items
+                .iter()
+                .filter_map(words)
+                .collect::<Vec<_>>()
+                .join("; "),
+            serde_json::Value::Object(map) => match map.get("message") {
+                Some(m) => words(m)?,
+                None => map
+                    .iter()
+                    .filter_map(|(field, v)| words(v).map(|w| format!("{field} {w}")))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            },
+            _ => return None,
+        };
+        (!text.is_empty()).then_some(text)
+    }
+    let head = v
+        .get("message")
+        .and_then(words)
+        .or_else(|| v.get("error").and_then(words));
+    let details = v.get("errors").and_then(words);
+    match (head, details) {
+        (Some(h), Some(d)) if h != d => format!("{h}: {d}"),
+        (Some(h), _) => h,
+        (None, Some(d)) => d,
+        (None, None) => trimmed.to_string(),
     }
 }
 

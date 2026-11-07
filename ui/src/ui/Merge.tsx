@@ -42,6 +42,7 @@ import type {
 } from '../gen/contract';
 import { mergePr, updateBranch } from '../actions';
 import { api } from '../core/api';
+import { mergeInfoProblem, useMergeInfoState } from './mergeInfo';
 import { useRootStore } from '../stores/context';
 import { Btn, Spinner } from './bits';
 
@@ -62,6 +63,20 @@ export const METHOD: Record<MergeMethod, string> = {
   rebase: 'Rebase and merge',
 };
 
+/** What `method` does, said of the PR's own base branch: a stacked PR
+ *  lands on another branch, not on main. */
+export function methodHint(method: MergeMethod, base: string): string {
+  const onto = base || 'the base branch';
+  switch (method) {
+    case 'squash':
+      return `one commit on ${onto}; branch history is squashed`;
+    case 'merge':
+      return `all commits + a merge commit on ${onto}`;
+    case 'rebase':
+      return `branch commits on top of ${onto}, no merge commit`;
+  }
+}
+
 const AGENTS: AgentId[] = ['claude', 'codex', 'gemini'];
 
 export const STATE_LABEL: Record<MergeInfo['state'], string> = {
@@ -69,17 +84,24 @@ export const STATE_LABEL: Record<MergeInfo['state'], string> = {
   blocked: 'Blocked by required checks or reviews',
   behind: 'Out of date with the base branch',
   dirty: 'Has merge conflicts',
-  unstable: 'Checks are still running',
+  unstable: "Some checks aren't passing",
   unknown: "GitHub hasn't finished checking yet",
 };
 
 interface Gate {
   ok: boolean;
   label: string;
+  /** Not ok, but the host merges anyway (failing checks it doesn't
+   *  require): shown as a warning, doesn't hold the merge. */
+  warn?: boolean;
 }
 
+/** The gates that hold the merge: not ok, and not just a warning. */
+export const blockingGates = (gates: Gate[]): Gate[] =>
+  gates.filter((g) => !g.ok && !g.warn);
+
 /** Everything that stands between this PR and a merge, from data we actually have. */
-function gatesFor(
+export function gatesFor(
   store: ReturnType<typeof useRootStore>,
   pr: PrId,
   info: MergeInfo | null,
@@ -91,6 +113,9 @@ function gatesFor(
   const checks = detail?.checks ?? [];
   const failing = checks.filter((c) => c.status === 'fail').length;
   const pending = checks.filter((c) => c.status === 'pending').length;
+  // `clean`/`unstable`: the host would merge now, failing checks or not —
+  // they're none it requires (no protection on the base, say).
+  const hostMerges = info?.state === 'clean' || info?.state === 'unstable';
   const gates: Gate[] = [];
   if (summary) {
     gates.push({
@@ -102,6 +127,7 @@ function gatesFor(
     });
     gates.push({
       ok: failing === 0,
+      warn: failing > 0 && hostMerges,
       label: failing
         ? `${failing} ${failing === 1 ? 'check' : 'checks'} failing`
         : pending
@@ -124,10 +150,11 @@ function gatesFor(
     });
   }
   if (toVerify) gates.push({ ok: false, label: `${toVerify} tasks to verify` });
-  // `dirty` is the host's word for the conflicts gate above — don't list it twice.
+  // `dirty` is the host's word for the conflicts gate above, `unstable`
+  // for the checks gate — don't list either twice.
   if (
     info &&
-    info.state !== 'clean' &&
+    !hostMerges &&
     info.state !== 'unknown' &&
     !(info.state === 'dirty' && summary?.conflicts)
   ) {
@@ -149,8 +176,9 @@ export const MergeDialog = observer(function MergeDialog({
 }) {
   const store = useRootStore();
   const summary = store.models.prSummaries.get(pr);
-  const [info, setInfo] = useState<MergeInfo | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  // Asked again on a backoff while the dialog is open: a host having
+  // trouble (a 502) recovers on its own, said in a sentence meanwhile.
+  const { info, error: loadError } = useMergeInfoState(pr, 'dialog');
   const [method, setMethod] = useState<MergeMethod>('squash');
   const [title, setTitle] = useState(summary ? `${summary.title}` : '');
   const [body, setBody] = useState('');
@@ -164,32 +192,25 @@ export const MergeDialog = observer(function MergeDialog({
     null,
   );
 
+  // The host's pick (your last method, else the repo's default), once its
+  // first answer is in.
+  const [picked, setPicked] = useState(false);
   useEffect(() => {
-    let live = true;
-    void api
-      .mergeInfo(pr)
-      .then((i) => {
-        if (!live) return;
-        setInfo(i);
-        // The host's pick (your last method, else the repo's default).
-        const d = i.default_method;
-        if (d && (!i.allowed_methods.length || i.allowed_methods.includes(d))) {
-          setMethod(d);
-        } else if (
-          i.allowed_methods.length &&
-          !i.allowed_methods.includes(method)
-        ) {
-          setMethod(i.allowed_methods[0]!);
-        }
-      })
-      .catch(
-        (e) => live && setLoadError(e instanceof Error ? e.message : String(e)),
-      );
-    return () => {
-      live = false;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pr]);
+    if (!info || picked) return;
+    setPicked(true);
+    const d = info.default_method;
+    if (
+      d &&
+      (!info.allowed_methods.length || info.allowed_methods.includes(d))
+    ) {
+      setMethod(d);
+    } else if (
+      info.allowed_methods.length &&
+      !info.allowed_methods.includes(method)
+    ) {
+      setMethod(info.allowed_methods[0]!);
+    }
+  }, [info, picked, method]);
 
   useEffect(() => {
     if (!summary?.conflicts) return;
@@ -207,7 +228,8 @@ export const MergeDialog = observer(function MergeDialog({
 
   const local = summary.pr.repo.host === 'local';
   const gates = gatesFor(store, pr, info);
-  const blocked = gates.filter((g) => !g.ok);
+  const blocked = blockingGates(gates);
+  const warnings = gates.filter((g) => !g.ok && g.warn);
   const behindOrDirty = info?.state === 'behind' || info?.state === 'dirty';
   const canMergeNow = !local && !!info && blocked.length === 0;
   const allowedMethods = info?.allowed_methods ?? [];
@@ -293,12 +315,14 @@ export const MergeDialog = observer(function MergeDialog({
             </Modal.Heading>
           </Modal.Header>
           <Modal.Body className="flex flex-col gap-3">
-            {loadError && (
-              <Alert status="danger">
+            {loadError != null && (
+              <Alert status="warning" className="merge-info-problem">
                 <Alert.Indicator />
                 <Alert.Content>
-                  <Alert.Title>Can't check merge status</Alert.Title>
-                  <Alert.Description>{loadError}</Alert.Description>
+                  <Alert.Title>Can't check merge status yet</Alert.Title>
+                  <Alert.Description>
+                    {mergeInfoProblem(summary.pr.repo.host, loadError)}
+                  </Alert.Description>
                 </Alert.Content>
               </Alert>
             )}
@@ -444,11 +468,7 @@ export const MergeDialog = observer(function MergeDialog({
                     <div>
                       <b className="text-sm">{METHOD[m]}</b>
                       <div className="text-xs text-muted">
-                        {m === 'squash'
-                          ? 'one commit on main; branch history is squashed'
-                          : m === 'merge'
-                            ? 'all commits + a merge commit'
-                            : 'branch commits on top of main, no merge commit'}
+                        {methodHint(m, summary.base_ref)}
                       </div>
                     </div>
                   </Radio.Content>
@@ -477,11 +497,13 @@ export const MergeDialog = observer(function MergeDialog({
             <span className="text-xs text-muted empty:hidden">
               {blocked.length
                 ? `Can't merge yet: ${blocked.map((g) => g.label.toLowerCase()).join('; ')}.${info?.auto_merge_allowed ? ' Auto-merge will merge once everything is resolved.' : ''}`
-                : canMergeNow
-                  ? 'All checks passed.'
-                  : local
-                    ? 'No PR to merge.'
-                    : ''}
+                : canMergeNow && warnings.length
+                  ? `GitHub allows the merge: ${warnings.map((g) => g.label.toLowerCase()).join('; ')}.`
+                  : canMergeNow
+                    ? 'All checks passed.'
+                    : local
+                      ? 'No PR to merge.'
+                      : ''}
             </span>
             <div className="flex flex-wrap justify-end gap-2">{footer}</div>
           </Modal.Footer>

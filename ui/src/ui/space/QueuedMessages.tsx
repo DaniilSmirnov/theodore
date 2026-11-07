@@ -9,13 +9,17 @@ import type { ChatMessage, QueuedAction, Space } from '../../gen/contract';
 import { api } from '../../core/api';
 import { MessageAttachments } from '../attachments';
 import { heldReason } from './queue';
+import { isSending } from './send';
 
 export function QueuedMessages({
   space,
   queued,
+  keyOf = (id) => id,
 }: {
   space: Space;
   queued: ChatMessage[];
+  /** A message's row key, when it differs from its id. */
+  keyOf?: (id: string) => string;
 }) {
   if (!queued.length) return null;
   const held = heldReason(space, queued);
@@ -23,7 +27,7 @@ export function QueuedMessages({
     <div className="space-queue flex flex-col gap-3">
       {held && <span className="text-xs text-warning">{held}</span>}
       {queued.map((m) => (
-        <QueuedMessage key={m.id} space={space} m={m} />
+        <QueuedMessage key={keyOf(m.id)} space={space} m={m} />
       ))}
     </div>
   );
@@ -32,14 +36,30 @@ export function QueuedMessages({
 function QueuedMessage({ space, m }: { space: Space; m: ChatMessage }) {
   const [editing, setEditing] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // What you just did shows at once; the core's row catches up, or it undoes.
+  const [cancelled, setCancelled] = useState(false);
+  const [sendingNow, setSendingNow] = useState(false);
+  const [edited, setEdited] = useState<{ from: string; text: string } | null>(
+    null,
+  );
   const held = !!m.queued?.held;
   const archived = space.status === 'archived';
+  const shownText = edited?.from === m.text ? edited.text : m.text;
   const act = (action: QueuedAction) => {
+    const draft = editing;
     setBusy(true);
+    setEditing(null);
+    if (action.kind === 'cancel') setCancelled(true);
+    if (action.kind === 'send') setSendingNow(true);
+    if (action.kind === 'edit') setEdited({ from: m.text, text: action.text });
     void api
       .spaceQueued({ space: space.id, message: m.id, action })
-      .then(() => setEditing(null))
-      .catch(() => {})
+      .catch(() => {
+        setCancelled(false);
+        setSendingNow(false);
+        setEdited(null);
+        setEditing(draft);
+      })
       .finally(() => setBusy(false));
   };
   const save = () => {
@@ -47,15 +67,17 @@ function QueuedMessage({ space, m }: { space: Space; m: ChatMessage }) {
     if (text === m.text) setEditing(null);
     else act({ kind: 'edit', text });
   };
+  if (cancelled) return null;
+  const actionable = !isSending(m);
   return (
     <div className="queued-message flex flex-col gap-1 opacity-70">
       <span className="flex items-center gap-1.5 text-xs text-muted">
         you
         <span className="rounded-full bg-default px-1.5 text-[10px]">
-          {held ? 'held' : 'queued'}
+          {sendingNow || !actionable ? 'sending' : held ? 'held' : 'queued'}
         </span>
         <span className="flex-1" />
-        {editing === null && !archived && (
+        {editing === null && !archived && actionable && (
           <>
             {(held || space.status !== 'running') && (
               <Button
@@ -73,13 +95,13 @@ function QueuedMessage({ space, m }: { space: Space; m: ChatMessage }) {
               variant="tertiary"
               className="h-6 px-2 text-xs"
               isDisabled={busy}
-              onPress={() => setEditing(m.text)}
+              onPress={() => setEditing(shownText)}
             >
               Edit
             </Button>
           </>
         )}
-        {editing === null && (
+        {editing === null && actionable && (
           <Button
             size="sm"
             variant="tertiary"
@@ -93,7 +115,7 @@ function QueuedMessage({ space, m }: { space: Space; m: ChatMessage }) {
       </span>
       {editing === null ? (
         <span className="whitespace-pre-wrap text-sm leading-relaxed">
-          {m.text}
+          {shownText}
         </span>
       ) : (
         <div className="flex flex-col gap-1.5">

@@ -8,8 +8,8 @@ use std::time::Duration;
 use serde_json::json;
 use theodore_contract::{
     AddProjectRequest, ChatMessage, CreateSpaceRequest, Project, SentFeedback, ShipAction,
-    ShipSpaceRequest, Space, SpaceFeedback, SpaceFeedbackRequest, SpaceSendRequest, SpaceStatus,
-    models,
+    ShipSpaceRequest, Space, SpaceFeedback, SpaceFeedbackRequest, SpaceMode, SpaceSendRequest,
+    SpaceStatus, TurnStep, models,
 };
 use theodore_domain::{AgentId, Author, PrId, Sha, Usage};
 use theodore_ports::{AgentEvent, AgentRequest, NewAction, Store, SyncActionCode};
@@ -980,4 +980,597 @@ async fn a_short_space_switch_needs_no_summary() {
     let s = send(&f, &core, &s.id, "Have a look", Some(AgentId::Gemini)).await;
     assert_eq!(summary_calls(&f), 0);
     assert_eq!(space(&f, &s.id).handoff_summary, None);
+}
+
+// ── a turn's activity ───────────────────────────────────────────────────────
+
+fn said(text: &str) -> AgentEvent {
+    AgentEvent::Text { text: text.into() }
+}
+
+fn tool(id: &str, name: &str, input: serde_json::Value) -> AgentEvent {
+    AgentEvent::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        input,
+    }
+}
+
+fn result(id: &str, ok: bool) -> AgentEvent {
+    AgentEvent::ToolResult {
+        id: id.into(),
+        ok,
+        output: String::new(),
+    }
+}
+
+fn finished(text: &str) -> AgentEvent {
+    AgentEvent::Done {
+        final_text: text.into(),
+        usage: Usage::default(),
+    }
+}
+
+fn text_step(text: &str) -> TurnStep {
+    TurnStep::Text {
+        text: text.into(),
+        parent: None,
+    }
+}
+
+fn tool_step(name: &str, target: Option<&str>, ok: Option<bool>) -> TurnStep {
+    TurnStep::Tool {
+        name: name.into(),
+        target: target.map(Into::into),
+        ok,
+        id: None,
+        parent: None,
+        detail: None,
+        summary: None,
+        added: None,
+        removed: None,
+        background: false,
+    }
+}
+
+/// The steps as these tests compare them: what a call is, not its id or what
+/// its input and result add (`turn_steps` tests those).
+fn plain(steps: &[TurnStep]) -> Vec<TurnStep> {
+    steps
+        .iter()
+        .map(|s| match s {
+            TurnStep::Tool {
+                name, target, ok, ..
+            } => tool_step(name, target.as_deref(), *ok),
+            other => other.clone(),
+        })
+        .collect()
+}
+
+fn only_reply(f: &Fixtures, id: &str) -> ChatMessage {
+    transcript(f, id)
+        .into_iter()
+        .find(|m| m.author != Author::Me)
+        .expect("a reply")
+}
+
+/// What the agent said on the way stays, in order with its tools; what it
+/// ended on is the reply, and only the reply.
+#[tokio::test]
+async fn a_turn_keeps_its_steps_in_order_without_repeating_the_reply() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    f.agents.push_script(vec![
+        AgentEvent::Thinking {
+            text: "Where is it?".into(),
+        },
+        AgentEvent::TextDelta {
+            text: "Reading the ".into(),
+        },
+        said("Reading the config."),
+        tool(
+            "t1",
+            "Read",
+            json!({ "file_path": "/repo/src/config/load.rs" }),
+        ),
+        result("t1", true),
+        said("Now running it."),
+        tool("t2", "Bash", json!({ "command": "cargo test\nmore" })),
+        result("t2", false),
+        tool("t3", "mcp__space-tools__ask_user", json!({})),
+        said("All done."),
+        finished("All done."),
+    ]);
+    let s = core
+        .create_space(request(&project, "Run it"))
+        .await
+        .unwrap();
+    let s = idle(&f, &s.id).await;
+
+    let reply = only_reply(&f, &s.id);
+    assert_eq!(reply.text, "All done.");
+    assert_eq!(
+        plain(&reply.activity),
+        vec![
+            TurnStep::Thinking {
+                text: "Where is it?".into(),
+                parent: None,
+            },
+            text_step("Reading the config."),
+            tool_step("Read", Some("config/load.rs"), Some(true)),
+            text_step("Now running it."),
+            tool_step("Bash", Some("cargo test"), Some(false)),
+            // Never answered, and by what it does rather than its raw id.
+            tool_step("ask you", None, None),
+        ]
+    );
+    assert!(reply.duration_ms.is_some());
+
+    // Only the reply holds them: your own message has none.
+    let question = transcript(&f, &s.id)
+        .into_iter()
+        .find(|m| m.author == Author::Me)
+        .unwrap();
+    assert!(question.activity.is_empty());
+    assert_eq!(question.duration_ms, None);
+}
+
+/// A result that joins several with blank lines repeats each of them.
+#[tokio::test]
+async fn a_final_text_joining_results_leaves_none_of_them_in_the_steps() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    f.agents.push_script(vec![
+        said("Looking."),
+        tool("t1", "Read", json!({ "file_path": "a.rs" })),
+        said(" First result. "),
+        tool("t2", "Read", json!({ "file_path": "b.rs" })),
+        said("Second result."),
+        finished("First result.\n\nSecond result."),
+    ]);
+    let s = core.create_space(request(&project, "Join")).await.unwrap();
+    let s = idle(&f, &s.id).await;
+
+    let reply = only_reply(&f, &s.id);
+    assert_eq!(reply.text, "First result.\n\nSecond result.");
+    assert!(!reply.text_in_steps);
+    assert_eq!(
+        plain(&reply.activity),
+        vec![
+            text_step("Looking."),
+            tool_step("Read", Some("a.rs"), None),
+            tool_step("Read", Some("b.rs"), None),
+        ]
+    );
+}
+
+/// No final text: the reply holds every block, and the steps keep them where
+/// they came, the block cut off last.
+#[tokio::test]
+async fn a_stopped_turn_keeps_what_it_wrote_in_the_order_it_came() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    f.agents.push_script_then_hang(vec![
+        said("I found the cause."),
+        tool("t1", "Edit", json!({ "file_path": "src/a.rs" })),
+        AgentEvent::TextDelta {
+            text: "Now fixing".into(),
+        },
+    ]);
+    let s = core
+        .create_space(request(&project, "Long job"))
+        .await
+        .unwrap();
+    wait_until(|| f.agents.requests().iter().any(|r| r.stream_text)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    core.space_stop(&s.id).await.unwrap();
+    let s = idle(&f, &s.id).await;
+
+    let reply = only_reply(&f, &s.id);
+    assert_eq!(reply.failed.as_deref(), Some("stopped"));
+    assert_eq!(reply.text, "I found the cause.\n\nNow fixing");
+    assert!(reply.text_in_steps);
+    assert_eq!(
+        plain(&reply.activity),
+        vec![
+            text_step("I found the cause."),
+            tool_step("Edit", Some("src/a.rs"), None),
+            text_step("Now fixing"),
+        ]
+    );
+}
+
+/// A CLI that only sends `Text`: the blocks are the reply.
+#[tokio::test]
+async fn a_run_without_a_final_text_is_its_blocks_joined() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    f.agents
+        .push_script(vec![said("One."), said("Two."), finished("")]);
+    let s = core
+        .create_space(request(&project, "Blocks"))
+        .await
+        .unwrap();
+    let s = idle(&f, &s.id).await;
+
+    let reply = only_reply(&f, &s.id);
+    assert_eq!(reply.text, "One.\n\nTwo.");
+    assert!(reply.text_in_steps);
+    assert_eq!(reply.activity, vec![text_step("One."), text_step("Two.")]);
+}
+
+/// The reply stores what the turn changed, from git between its checkpoints,
+/// and the model it asked for.
+#[tokio::test]
+async fn a_reply_stores_what_its_turn_changed() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    let s = space_in_session(&f, &core, &project).await;
+    let before = space(&f, &s.id).head_sha;
+    f.git.set_numstat(vec![theodore_ports::FileStat {
+        path: "src/a.rs".into(),
+        additions: 3,
+        deletions: 1,
+    }]);
+    f.git.push_checkpoint(Sha("after-the-turn".into()));
+    f.agents.push_script(vec![
+        tool("t1", "Edit", json!({ "file_path": "src/a.rs" })),
+        finished("Changed it."),
+    ]);
+    core.space_send(SpaceSendRequest {
+        space: s.id.clone(),
+        text: "Change it".into(),
+        agent: None,
+        model: Some("opus".into()),
+        mode: None,
+        attachments: None,
+    })
+    .await
+    .unwrap();
+    let s = idle(&f, &s.id).await;
+
+    let reply = transcript(&f, &s.id)
+        .into_iter()
+        .find(|m| m.text == "Changed it.")
+        .unwrap();
+    assert_eq!(
+        reply.changed_files,
+        vec![theodore_contract::TurnFile {
+            path: "src/a.rs".into(),
+            additions: 3,
+            deletions: 1,
+        }]
+    );
+    assert_eq!(reply.model.as_deref(), Some("opus"));
+    assert_eq!(
+        f.git.numstat_calls.lock().unwrap().last().unwrap(),
+        &(before, Sha("after-the-turn".into()))
+    );
+}
+
+/// Git failing leaves it empty and the turn alone; a turn that changed
+/// nothing doesn't ask.
+#[tokio::test]
+async fn changed_files_never_fail_a_turn() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    let s = space_in_session(&f, &core, &project).await;
+    f.git.push_checkpoint(Sha("after-the-turn".into()));
+    f.agents.push_script(vec![finished("Changed it.")]);
+    let s = send(&f, &core, &s.id, "Change it", None).await;
+    let reply = transcript(&f, &s.id)
+        .into_iter()
+        .find(|m| m.text == "Changed it.")
+        .unwrap();
+    assert!(reply.failed.is_none());
+    assert!(reply.changed_files.is_empty());
+    assert!(!f.git.numstat_calls.lock().unwrap().is_empty());
+
+    f.git.numstat_calls.lock().unwrap().clear();
+    f.agents.push_script(vec![finished("Nothing to do.")]);
+    let s = send(&f, &core, &s.id, "Again", None).await;
+    assert!(s.error.is_none());
+    assert!(f.git.numstat_calls.lock().unwrap().is_empty());
+}
+
+/// Parallel calls and a subagent, the way the runner reports them: each
+/// result marks its own call, nothing the subagent did is the turn's own, and
+/// its text never reaches the reply.
+#[tokio::test]
+async fn a_subagent_is_stored_under_its_call_and_results_mark_their_own() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    let nested = |event| AgentEvent::Nested {
+        parent: "ag".into(),
+        event: Box::new(event),
+    };
+    f.agents.push_script(vec![
+        tool("t1", "Bash", json!({ "command": "one" })),
+        tool(
+            "ag",
+            "Agent",
+            json!({ "description": "Look around", "prompt": "…" }),
+        ),
+        nested(tool("r1", "Read", json!({ "file_path": "a.rs" }))),
+        nested(result("r1", true)),
+        nested(said("It says so.")),
+        result("ag", true),
+        result("t1", false),
+        finished(""),
+    ]);
+    let s = core.create_space(request(&project, "Look")).await.unwrap();
+    let s = idle(&f, &s.id).await;
+
+    let reply = only_reply(&f, &s.id);
+    assert_eq!(reply.text, "", "a subagent's text isn't the reply");
+    let parents_oks: Vec<_> = reply
+        .activity
+        .iter()
+        .map(|s| match s {
+            TurnStep::Tool {
+                name, parent, ok, ..
+            } => (name.as_str(), parent.as_deref(), *ok),
+            TurnStep::Text { parent, .. } => ("text", parent.as_deref(), None),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        parents_oks,
+        [
+            ("Bash", None, Some(false)),
+            ("Agent", None, Some(true)),
+            ("Read", Some("ag"), Some(true)),
+            ("text", Some("ag"), None),
+        ]
+    );
+}
+
+/// Rows stored before the new step fields, and before changed files, load.
+#[test]
+fn an_older_step_loads() {
+    let row: ChatMessage = serde_json::from_value(json!({
+        "id": "m1",
+        "pr": "space:s1",
+        "author": { "kind": "agent", "agent": "claude" },
+        "text": "Added it.",
+        "refs": [],
+        "at": 1,
+        "activity": [
+            { "kind": "text", "text": "Hm." },
+            { "kind": "thinking", "text": "Where?" },
+            { "kind": "tool", "name": "Read", "target": "a.rs", "ok": true },
+        ],
+        "duration_ms": 12,
+    }))
+    .unwrap();
+    assert_eq!(
+        row.activity,
+        vec![
+            text_step("Hm."),
+            TurnStep::Thinking {
+                text: "Where?".into(),
+                parent: None,
+            },
+            tool_step("Read", Some("a.rs"), Some(true)),
+        ]
+    );
+    assert!(row.changed_files.is_empty());
+    assert_eq!(row.model, None);
+    assert!(!row.text_in_steps);
+}
+
+/// A final text takes over from deltas no whole block ever confirmed.
+#[tokio::test]
+async fn a_final_text_replaces_the_deltas_before_it() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    f.agents.push_script(vec![
+        AgentEvent::TextDelta {
+            text: "All ".into(),
+        },
+        AgentEvent::TextDelta {
+            text: "done.".into(),
+        },
+        finished("All done."),
+    ]);
+    let s = core
+        .create_space(request(&project, "Deltas"))
+        .await
+        .unwrap();
+    let s = idle(&f, &s.id).await;
+    assert_eq!(only_reply(&f, &s.id).text, "All done.");
+}
+
+/// A run that finds its session gone starts over: only the retry's steps
+/// count, and replaying the transcript carries replies, never their steps.
+#[tokio::test]
+async fn a_retried_run_starts_its_steps_over_and_prompts_never_hear_them() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    f.agents.push_script(vec![
+        AgentEvent::Session { id: "s1".into() },
+        said("A note on the way."),
+        tool("t0", "Read", json!({ "file_path": "first.rs" })),
+        said("Added the guard."),
+        finished("Added the guard."),
+    ]);
+    let s = core.create_space(request(&project, "Guard")).await.unwrap();
+    let s = idle(&f, &s.id).await;
+    assert_eq!(only_reply(&f, &s.id).activity.len(), 2);
+
+    f.agents.push_script(vec![
+        tool("t1", "Read", json!({ "file_path": "lost.rs" })),
+        AgentEvent::Error {
+            message: "No conversation found with session ID: s1".into(),
+            stderr_tail: String::new(),
+        },
+    ]);
+    f.agents.push_script(vec![
+        tool("t2", "Read", json!({ "file_path": "kept.rs" })),
+        said("Logged it."),
+        finished("Logged it."),
+    ]);
+    let s = send(&f, &core, &s.id, "Also log it", None).await;
+
+    let reply = transcript(&f, &s.id)
+        .into_iter()
+        .find(|m| m.text == "Logged it.")
+        .unwrap();
+    assert_eq!(
+        plain(&reply.activity),
+        vec![tool_step("Read", Some("kept.rs"), None)]
+    );
+    let retried = f.agents.last_request().unwrap();
+    assert!(retried.prompt.contains("Added the guard."));
+    assert!(!retried.prompt.contains("A note on the way."));
+    assert!(!retried.prompt.contains("first.rs"));
+}
+
+/// A plan handed in is the reply; what the run wrote isn't repeated by it.
+#[tokio::test]
+async fn a_handed_in_plan_leaves_the_written_text_in_the_steps() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    let s = space_in_session(&f, &core, &project).await;
+    f.agents.push_script(vec![
+        said("Writing the plan."),
+        AgentEvent::Plan {
+            text: "1. Do it".into(),
+        },
+        finished(""),
+    ]);
+    core.space_send(SpaceSendRequest {
+        space: s.id.clone(),
+        text: "Plan it".into(),
+        agent: None,
+        model: None,
+        mode: Some(SpaceMode::Plan),
+        attachments: None,
+    })
+    .await
+    .unwrap();
+    let s = idle(&f, &s.id).await;
+
+    let reply = transcript(&f, &s.id)
+        .into_iter()
+        .find(|m| m.text == "1. Do it")
+        .unwrap();
+    assert_eq!(reply.activity, vec![text_step("Writing the plan.")]);
+}
+
+/// A plan made of the text it wrote is the reply, not steps that may fold.
+#[tokio::test]
+async fn a_plan_in_its_text_blocks_stays_the_reply() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    let s = space_in_session(&f, &core, &project).await;
+    f.agents.push_script(vec![said("1. Do it"), finished("")]);
+    core.space_send(SpaceSendRequest {
+        space: s.id.clone(),
+        text: "Plan it".into(),
+        agent: None,
+        model: None,
+        mode: Some(SpaceMode::Plan),
+        attachments: None,
+    })
+    .await
+    .unwrap();
+    let s = idle(&f, &s.id).await;
+
+    let reply = transcript(&f, &s.id)
+        .into_iter()
+        .find(|m| m.text == "1. Do it" && m.author != Author::Me)
+        .unwrap();
+    assert!(!reply.text_in_steps);
+    assert!(reply.activity.is_empty());
+}
+
+/// Rows stored before steps existed still load.
+#[test]
+fn an_older_chat_row_has_no_steps() {
+    let row: ChatMessage = serde_json::from_value(json!({
+        "id": "m1",
+        "pr": "space:s1",
+        "author": { "kind": "agent", "agent": "claude" },
+        "text": "Added it.",
+        "refs": [],
+        "at": 1,
+    }))
+    .unwrap();
+    assert!(row.activity.is_empty());
+    assert_eq!(row.duration_ms, None);
+}
+
+#[tokio::test]
+async fn a_steps_file_is_named_from_the_worktree_not_by_its_directory() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    let s = space_in_session(&f, &core, &project).await;
+    let wt = space(&f, &s.id).worktree;
+    f.agents.push_script(vec![
+        AgentEvent::ToolCall {
+            id: "1".into(),
+            name: "Read".into(),
+            input: serde_json::json!({ "file_path": format!("{wt}/package.json") }),
+        },
+        AgentEvent::Done {
+            final_text: "Read it.".into(),
+            usage: Usage::default(),
+        },
+    ]);
+    let s = send(&f, &core, &s.id, "Read it", None).await;
+    let reply = transcript(&f, &s.id)
+        .into_iter()
+        .rfind(|m| m.text == "Read it." && m.author != theodore_domain::Author::Me)
+        .unwrap();
+    assert!(
+        matches!(
+            reply.activity.as_slice(),
+            [theodore_contract::TurnStep::Tool { target: Some(t), .. }] if t == "package.json"
+        ),
+        "{:?}",
+        reply.activity
+    );
+}
+
+/// The ● (docs/spaces.md §3): only a turn's end is news, not every write
+/// that bumps `updated_at`.
+#[tokio::test]
+async fn only_a_turn_ending_stamps_attention() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    let s = core.create_space(request(&project, "")).await.unwrap();
+    assert_eq!(s.attention_at, None);
+
+    f.clock.advance(1_000);
+    turn(&f, &core, &s.id, "go", "done", "head1").await;
+    wait_until(|| space(&f, &s.id).attention_at.is_some()).await;
+    let ended = space(&f, &s.id);
+    assert_eq!(ended.attention_at, Some(ended.updated_at));
+
+    f.clock.advance(1_000);
+    core.set_space_pinned(&s.id, true).await.unwrap();
+    core.space_pr_opened(&s.id, &crate::testkit::sample_pr_ref("o", "r", 7))
+        .await;
+    let later = space(&f, &s.id);
+    assert_eq!(later.attention_at, ended.attention_at);
+    assert!(later.updated_at > ended.updated_at, "the write did bump it");
+
+    f.clock.advance(1_000);
+    f.agents.push_script(vec![AgentEvent::Error {
+        message: "boom".into(),
+        stderr_tail: String::new(),
+    }]);
+    core.space_send(SpaceSendRequest {
+        space: s.id.clone(),
+        text: "again".into(),
+        agent: None,
+        model: None,
+        mode: None,
+        attachments: None,
+    })
+    .await
+    .unwrap();
+    wait_until(|| space(&f, &s.id).status == SpaceStatus::Failed).await;
+    wait_until(|| space(&f, &s.id).attention_at > ended.attention_at).await;
 }

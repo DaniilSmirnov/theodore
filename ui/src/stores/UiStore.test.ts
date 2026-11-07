@@ -125,10 +125,36 @@ describe('UiStore settings tab', () => {
     ui.go({ name: 'prs' });
     ui.go({ name: 'settings', page: 'agents' });
     ui.go({ name: 'review', pr: 'github:o/r#1' });
-    ui.go({ name: 'settings', page: 'projects' });
+    ui.go({ name: 'settings', page: 'about' });
     expect(ui.tabs.filter((t) => t.name === 'settings')).toEqual([
-      { name: 'settings', page: 'projects' },
+      { name: 'settings', page: 'about' },
     ]);
-    expect(ui.route).toEqual({ name: 'settings', page: 'projects' });
+    expect(ui.route).toEqual({ name: 'settings', page: 'about' });
+  });
+});
+
+describe('UiStore project settings', () => {
+  const at = (section: 'general' | 'languages' | 'config') =>
+    ({ name: 'project-settings', project: 'github:o/r', section }) as const;
+
+  it('leaves in one step after moving between its sections', () => {
+    localStorage.clear();
+    const ui = new UiStore();
+    ui.go({ name: 'prs' });
+    ui.go(at('general'));
+    ui.go(at('languages'));
+    ui.go(at('config'));
+    ui.goBack();
+    expect(ui.route).toEqual({ name: 'prs' });
+  });
+
+  it('closes a removed project’s tabs', () => {
+    localStorage.clear();
+    const ui = new UiStore();
+    ui.go({ name: 'prs' });
+    ui.go(at('general'));
+    ui.closeProjectSettings('github:o/r');
+    expect(ui.tabs.some((t) => t.name === 'project-settings')).toBe(false);
+    expect(ui.tabs.length).toBeGreaterThan(0);
   });
 });

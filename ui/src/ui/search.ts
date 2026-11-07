@@ -47,6 +47,6 @@ export function findScopeFor(
 ): SearchScope | null {
   if (routeName === 'inbox' || routeName === 'prs') return 'prs';
   if (routeName === 'review' || routeName === 'space') return null;
-  if (routeName === 'settings') return null;
+  if (routeName === 'settings' || routeName === 'project-settings') return null;
   return spacesOn ? 'spaces' : null;
 }

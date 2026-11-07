@@ -94,6 +94,7 @@ fn missing_server(lang: &str, server: &str) -> LanguageStatus {
             name: server.into(),
             install: InstallState::Missing,
             state: ServerState::NotRunning,
+            hint: None,
         }),
         index_percent: 40,
     }
@@ -266,6 +267,21 @@ async fn code_intel_off_in_config_opens_nothing_and_lists_no_tools() {
     );
 }
 
+/// `code_intel.servers`: a preference in a config file reaches the port.
+#[tokio::test]
+async fn a_preferred_server_reaches_the_port() {
+    let e = code_env().await;
+    e.global("code_intel: {languages: [rust], servers: {python: pyright}}");
+    let s = e.create("").await;
+    let want = format!("open {} Trusted [rust]", s.worktree);
+    wait_until(|| e.f.code_intel.calls().contains(&want)).await;
+    let servers = e.f.code_intel.last_servers.lock().unwrap().clone();
+    assert_eq!(
+        servers,
+        std::collections::BTreeMap::from([("python".to_string(), "pyright".to_string())])
+    );
+}
+
 #[tokio::test]
 async fn a_space_is_trusted_unless_repo_commands_wait_for_approval() {
     let e = code_env().await;
@@ -393,6 +409,78 @@ async fn a_turn_reindexes_the_files_it_changed() {
         })
     })
     .await;
+}
+
+/// How many times `path` in `root` was reported changed to the port.
+pub(crate) fn reindexed(f: &Fixtures, root: &str, path: &str) -> usize {
+    let want = format!("file_changed {root} {path}");
+    f.code_intel.calls().iter().filter(|c| **c == want).count()
+}
+
+/// Every diff from now on (the fake's) changes only `path`.
+pub(crate) fn diffs_touch(f: &Fixtures, path: &str) {
+    f.git.set_revision(testkit::two_hunk_revision(
+        &Sha::new("a"),
+        &Sha::new("b"),
+        path,
+    ));
+}
+
+/// Undo, Back to here and Revert rewrite the worktree outside a turn: the
+/// files they moved are reindexed too (a file gone after Undo leaves no
+/// symbol behind).
+#[tokio::test]
+async fn undo_back_to_here_and_revert_reindex_the_files_they_moved() {
+    let e = code_env().await;
+    let s = e.create("").await;
+    let root = s.worktree.clone();
+    wait_until(|| opened(&e, &format!("open {root}"))).await;
+    diffs_touch(&e.f, "src/turn.ts");
+    for (i, head) in ["turn1", "turn2", "turn3"].into_iter().enumerate() {
+        e.f.git.push_checkpoint(Sha::new(head));
+        e.f.agents.push_script(done("ok"));
+        e.core
+            .space_send(SpaceSendRequest {
+                space: s.id.clone(),
+                text: "go".into(),
+                agent: None,
+                model: None,
+                mode: Some(theodore_contract::SpaceMode::Edit),
+                attachments: None,
+            })
+            .await
+            .unwrap();
+        e.until(&s.id, |s| s.run.is_none() && s.head_sha.0 == head)
+            .await;
+        wait_until(|| reindexed(&e.f, &root, "src/turn.ts") == i + 1).await;
+    }
+
+    diffs_touch(&e.f, "src/extra.ts");
+    e.core.undo_space_turn(&s.id).await.unwrap();
+    wait_until(|| reindexed(&e.f, &root, "src/extra.ts") == 1).await;
+
+    diffs_touch(&e.f, "src/back.ts");
+    let reply = e.space(&s.id).turn_log[0].reply.clone();
+    e.core
+        .rewind_space(theodore_contract::RewindSpaceRequest {
+            space: s.id.clone(),
+            reply,
+        })
+        .await
+        .unwrap();
+    wait_until(|| reindexed(&e.f, &root, "src/back.ts") == 1).await;
+
+    diffs_touch(&e.f, "src/reverted.ts");
+    e.f.git.push_checkpoint(Sha::new("revert1"));
+    e.core
+        .revert_space_file(theodore_contract::RevertSpaceFileRequest {
+            space: s.id.clone(),
+            paths: vec!["src/reverted.ts".into()],
+            from: theodore_contract::SpaceRevertFrom::Base,
+        })
+        .await
+        .unwrap();
+    wait_until(|| reindexed(&e.f, &root, "src/reverted.ts") == 1).await;
 }
 
 // ── code_intel.lsp ──────────────────────────────────────────────────────────
@@ -542,9 +630,13 @@ async fn a_switch_writes_the_projects_local_file_over_the_global_default() {
     );
     assert!(status.lsp.spaces.on && status.lsp.spaces.from_config.is_none());
     assert_eq!(
-        std::fs::read_to_string(folder.join(".gitignore")).unwrap(),
-        ".theodore/config.local.yaml\n",
+        *e.f.git.excluded.lock().unwrap(),
+        vec![".theodore/config.local.yaml".to_string()],
         "the personal file stays out of commits"
+    );
+    assert!(
+        !folder.join(".gitignore").exists(),
+        "a switch changes nothing in the checkout"
     );
     assert_eq!(
         std::fs::read_to_string(&global).unwrap(),
@@ -593,6 +685,37 @@ async fn a_switch_keeps_the_rest_of_the_local_file_and_refuses_what_it_cant_edit
         .await
         .unwrap_err();
     assert!(matches!(err, AppError::NotFound(_)), "{err}");
+}
+
+/// A repo that commits its local file: that file is read as the repo's,
+/// whose `lsp` keys are ignored, so a switch written there would change a
+/// tracked file and do nothing. Refused, pointing at the global file.
+#[tokio::test]
+async fn a_switch_refuses_a_committed_local_file() {
+    let e = code_env().await;
+    let folder = PathBuf::from(e.project.path.clone().unwrap());
+    let local = folder.join(".theodore/config.local.yaml");
+    let committed = "spaces:\n  ports: 2\n";
+    e.repo_file(".theodore/config.local.yaml", committed);
+    e.f.git
+        .tracked
+        .lock()
+        .unwrap()
+        .push(".theodore/config.local.yaml".into());
+    let err = e
+        .core
+        .code_intel_set_lsp(set_lsp(&e.project.id, SPACES, false))
+        .await
+        .unwrap_err();
+    let global = e.f.data_dir.path().join("config.yaml");
+    let msg = err.to_string();
+    assert!(matches!(err, AppError::Invalid(_)), "{err}");
+    assert!(msg.contains("commits .theodore/config.local.yaml"), "{msg}");
+    assert!(msg.contains("code_intel.lsp.spaces"), "{msg}");
+    assert!(msg.contains(&global.display().to_string()), "{msg}");
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), committed);
+    assert!(!global.exists(), "nothing written for you");
+    assert!(e.f.git.excluded.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -672,9 +795,9 @@ async fn the_old_app_wide_switch_still_counts_below_the_files() {
 }
 
 #[tokio::test]
-async fn a_switch_reopens_the_worktrees_it_changes() {
+async fn a_switch_reaches_the_worktrees_open_now() {
     let e = code_env().await;
-    // A space served once is reopened when its policy changes.
+    // A space keeps its index and only its servers follow the switch.
     let s = e.create("").await;
     let open = format!("open {} Trusted []", s.worktree);
     wait_until(|| e.f.code_intel.calls().contains(&open)).await;
@@ -688,17 +811,134 @@ async fn a_switch_reopens_the_worktrees_it_changes() {
             .count()
     };
     assert_eq!(count(&e), 1, "unchanged: not reopened");
+    let switched = |e: &Env, on: bool| {
+        let call = format!("set_lsp {} {on}", s.worktree);
+        e.f.code_intel
+            .calls()
+            .iter()
+            .filter(|c| **c == call)
+            .count()
+    };
     e.core
         .code_intel_set_lsp(set_lsp(&e.project.id, SPACES, false))
         .await
         .unwrap();
+    assert_eq!(switched(&e, false), 1, "{:?}", e.f.code_intel.calls());
+    // The next use finds it as the switch left it.
     e.core.code_status(&scope).await.unwrap();
-    assert_eq!(count(&e), 2, "{:?}", e.f.code_intel.calls());
-    assert!(
-        e.f.code_intel
-            .calls()
-            .contains(&format!("close {}", s.worktree))
-    );
+    assert_eq!(count(&e), 1, "{:?}", e.f.code_intel.calls());
+
+    // The review switch does not concern a trusted space.
+    e.core
+        .code_intel_set_lsp(set_lsp(&e.project.id, REVIEW, true))
+        .await
+        .unwrap();
+    assert_eq!(switched(&e, true), 0, "{:?}", e.f.code_intel.calls());
+
+    e.core
+        .code_intel_set_lsp(set_lsp(&e.project.id, SPACES, true))
+        .await
+        .unwrap();
+    assert_eq!(switched(&e, true), 1, "{:?}", e.f.code_intel.calls());
+}
+
+#[tokio::test]
+async fn using_a_worktree_again_brings_its_servers_back() {
+    let e = code_env().await;
+    let s = e.create("").await;
+    let open = format!("open {} Trusted []", s.worktree);
+    wait_until(|| e.f.code_intel.calls().contains(&open)).await;
+    let warm = format!("warm {}", s.worktree);
+    assert!(!e.f.code_intel.calls().contains(&warm));
+    e.core
+        .code_status(&CodeScope::Space(s.id.clone()))
+        .await
+        .unwrap();
+    wait_until(|| e.f.code_intel.calls().contains(&warm)).await;
+}
+
+#[tokio::test]
+async fn the_status_reads_every_worktree_of_the_project_and_warms_it() {
+    let e = code_env().await;
+    let (a, b) = (e.create("").await, e.create("").await);
+    for s in [&a, &b] {
+        let open = format!("open {} Trusted []", s.worktree);
+        wait_until(|| e.f.code_intel.calls().contains(&open)).await;
+    }
+    e.core.code_intel_status(&e.project.id).await.unwrap();
+    let calls = e.f.code_intel.calls();
+    for s in [&a, &b] {
+        for what in ["warm", "status"] {
+            let call = format!("{what} {}", s.worktree);
+            assert!(calls.contains(&call), "{call} not in {calls:?}");
+        }
+    }
+}
+
+#[test]
+fn a_language_shows_its_most_alive_server_and_its_largest_worktree() {
+    let with = |state, files, index_percent| LanguageStatus {
+        files,
+        index_percent,
+        server: Some(ServerStatus {
+            name: "rust-analyzer".into(),
+            install: InstallState::Installed {
+                version: "1".into(),
+            },
+            state,
+            hint: None,
+        }),
+        ..missing_server("rust", "rust-analyzer")
+    };
+    let state = |l: &LanguageStatus| l.server.as_ref().unwrap().state;
+    let merged = |pairs: Vec<LanguageStatus>| {
+        let mut out = Vec::new();
+        for l in pairs {
+            crate::usecases::code_intel::merge_statuses(&mut out, vec![l]);
+        }
+        assert_eq!(out.len(), 1);
+        out.remove(0)
+    };
+
+    // The review worktree's switch is off; the space's server answers.
+    let l = merged(vec![
+        with(ServerState::Off, 10, 100),
+        with(ServerState::Ready, 3, 50),
+    ]);
+    assert_eq!(state(&l), ServerState::Ready);
+    assert_eq!((l.files, l.index_percent), (10, 100));
+
+    for (a, b, want) in [
+        (
+            ServerState::Ready,
+            ServerState::NotRunning,
+            ServerState::Ready,
+        ),
+        (
+            ServerState::NotRunning,
+            ServerState::Warming,
+            ServerState::Warming,
+        ),
+        (
+            ServerState::Failed,
+            ServerState::NotRunning,
+            ServerState::Failed,
+        ),
+        (
+            ServerState::Off,
+            ServerState::NotRunning,
+            ServerState::NotRunning,
+        ),
+    ] {
+        let l = merged(vec![with(a, 1, 1), with(b, 1, 1)]);
+        assert_eq!(state(&l), want, "{a:?} + {b:?}");
+    }
+
+    // A review says "Spaces only"; the space can still install it.
+    let mut review = with(ServerState::NotRunning, 1, 1);
+    review.server.as_mut().unwrap().install = InstallState::TrustedOnly;
+    let l = merged(vec![review, missing_server("rust", "rust-analyzer")]);
+    assert_eq!(l.server.unwrap().install, InstallState::Missing);
 }
 
 #[tokio::test]
@@ -726,6 +966,68 @@ async fn the_lsp_policy_reads_review_and_spaces_apart() {
 
 // ── install ─────────────────────────────────────────────────────────────────
 
+/// A server that can't run here is neither downloaded nor offered: not by
+/// `always`, not by `ask`.
+#[tokio::test]
+async fn a_server_that_cannot_run_is_never_installed_or_suggested() {
+    let mut e = code_env().await;
+    let with = |lang: &str, name: &str, install: InstallState| LanguageStatus {
+        server: Some(ServerStatus {
+            name: name.into(),
+            install,
+            state: ServerState::NotRunning,
+            hint: None,
+        }),
+        ..missing_server(lang, name)
+    };
+    *e.f.code_intel.status.lock().unwrap() = vec![
+        with(
+            "java",
+            "jdtls",
+            InstallState::NeedsRuntime {
+                runtime: "java".into(),
+                min: "21".into(),
+                found: Some("17.0.2".into()),
+            },
+        ),
+        with("kotlin", "kotlin-lsp", InstallState::TrustedOnly),
+        with("ruby", "ruby-lsp", InstallState::Unavailable),
+    ];
+    let root = Path::new("/tmp/wt");
+
+    e.core
+        .code_install_flow(root, InstallPolicy::Always, None)
+        .await;
+    assert!(
+        !e.f.code_intel
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("install")),
+        "{:?}",
+        e.f.code_intel.calls()
+    );
+
+    e.core
+        .code_install_flow(root, InstallPolicy::Ask, None)
+        .await;
+    no_ephemeral(&mut e.recv, suggestion).await;
+
+    // What the row reads: the state and the hint, through the contract.
+    *e.f.code_intel.status.lock().unwrap() = vec![LanguageStatus {
+        server: Some(ServerStatus {
+            name: "ruby-lsp".into(),
+            install: InstallState::Unavailable,
+            state: ServerState::NotRunning,
+            hint: Some("gem install ruby-lsp".into()),
+        }),
+        ..missing_server("ruby", "ruby-lsp")
+    }];
+    let status = e.core.code_intel_status(&e.project.id).await.unwrap();
+    let server = status.languages[0].server.as_ref().unwrap();
+    assert_eq!(server.install, theodore_contract::CodeInstall::Unavailable);
+    assert_eq!(server.hint.as_deref(), Some("gem install ruby-lsp"));
+}
+
 #[tokio::test]
 async fn install_follows_the_policy_and_remembers_a_no() {
     let mut e = code_env().await;
@@ -739,6 +1041,7 @@ async fn install_follows_the_policy_and_remembers_a_no() {
                     version: None,
                 },
                 state: ServerState::Ready,
+                hint: None,
             }),
             ..missing_server("python", "ty")
         },
@@ -831,6 +1134,35 @@ async fn a_declined_language_is_not_suggested_and_install_forgets_the_no() {
         status.languages[0].server.as_ref().unwrap().install,
         theodore_contract::CodeInstall::Missing
     );
+}
+
+/// "Not now" on the collapsed toast declines every language at once: no
+/// write may overwrite another.
+#[tokio::test]
+async fn concurrent_declines_and_installs_keep_every_answer() {
+    let e = code_env().await;
+    e.core.code_intel_decline("go").await.unwrap();
+    let langs = ["cpp", "java", "kotlin", "python", "rust"];
+    let d = |i: usize| e.core.code_intel_decline(langs[i]);
+    let (a, b, c, d2, e2, installed) = tokio::join!(
+        d(0),
+        d(1),
+        d(2),
+        d(3),
+        d(4),
+        e.core.code_intel_install("go")
+    );
+    for r in [a, b, c, d2, e2, installed] {
+        r.unwrap();
+    }
+    let declined: Vec<String> = serde_json::from_value(
+        e.core
+            .setting_value_scoped(crate::usecases::code_intel::DECLINED_KEY, None)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(declined, langs, "install forgot go and kept the rest");
 }
 
 #[tokio::test]
@@ -967,12 +1299,99 @@ async fn replace_and_insert_edit_the_file_and_tell_the_port() {
     );
 }
 
+/// A symbol's range may start after its modifiers (`export`, `pub`): a body
+/// that repeats them replaces them too, never `export export function`.
+#[tokio::test]
+async fn a_body_with_the_symbols_modifiers_replaces_them() {
+    let e = code_env().await;
+    let (s, root) = edit_space(&e).await;
+    std::fs::write(
+        root.join("src/util.ts"),
+        "// util\nexport function greet() {\n  return 1;\n}\n",
+    )
+    .unwrap();
+    e.f.code_intel.symbols.lock().unwrap().push(symbol(
+        "src/util.ts",
+        "greet",
+        range((2, 8), (4, 2)),
+        range((2, 17), (2, 22)),
+    ));
+    e.f.code_intel
+        .bodies
+        .lock()
+        .unwrap()
+        .insert("greet".into(), "function greet() {\n  return 1;\n}".into());
+    let scope = CodeScope::Space(s.id.clone());
+    e.core
+        .code_replace_symbol(
+            &scope,
+            "src/util.ts",
+            "greet",
+            "export function greet() {\n  return 2;\n}",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("src/util.ts")).unwrap(),
+        "// util\nexport function greet() {\n  return 2;\n}\n"
+    );
+}
+
 fn rename_edit(path: &str, line: u32, from: u32, to: u32) -> TextEdit {
     TextEdit {
         path: path.into(),
         range: range((line, from), (line, to)),
         new_text: "simple".into(),
+        expect: None,
     }
+}
+
+/// A rename's edits say what each range held in the server's copy of the
+/// file: one that moved since (the agent's own Edit) is refused, whole,
+/// before anything is written.
+#[tokio::test]
+async fn a_rename_is_refused_when_a_file_moved_under_the_server() {
+    let e = code_env().await;
+    let (s, root) = edit_space(&e).await;
+    let a = "// a comment the agent added\nlet naïve = 1;\n";
+    std::fs::write(root.join("a.rs"), a).unwrap();
+    std::fs::write(root.join("b.rs"), "naïve\n").unwrap();
+    let held = |mut edit: TextEdit| {
+        edit.expect = Some("naïve".into());
+        edit
+    };
+    *e.f.code_intel.renames.lock().unwrap() = vec![
+        held(rename_edit("b.rs", 1, 1, 6)),
+        held(rename_edit("a.rs", 1, 5, 10)),
+    ];
+    let err = e
+        .core
+        .code_rename_symbol(
+            &CodeScope::Space(s.id.clone()),
+            "a.rs",
+            Position { line: 2, col: 5 },
+            "simple",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("a.rs changed since the language server read it; ask again"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), a);
+    assert_eq!(
+        std::fs::read_to_string(root.join("b.rs")).unwrap(),
+        "naïve\n"
+    );
+    assert!(
+        !e.f.code_intel
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("file_changed")),
+        "{:?}",
+        e.f.code_intel.calls()
+    );
 }
 
 #[tokio::test]
@@ -1055,6 +1474,7 @@ fn find(pr: &theodore_domain::PrId) -> FindSymbolRequest {
         from_path: Some("src/lib.rs".into()),
         line: None,
         col: None,
+        side: None,
     }
 }
 
@@ -1207,6 +1627,58 @@ async fn limits_come_from_the_global_file_only_and_apply_when_it_changes() {
         );
     }
     assert!(validate_layer(text, ConfigLayer::Global).is_empty());
+}
+
+/// A refused Remove names the space using the language, never a worktree
+/// path (which may be another project's).
+#[tokio::test]
+async fn a_refused_remove_names_the_space_not_its_path() {
+    let e = code_env().await;
+    let s = e.create("").await;
+    *e.f.code_intel.remove_error.lock().unwrap() = Some(CodeIntelError::InUse {
+        language: "typescript".into(),
+        roots: vec![PathBuf::from(&s.worktree), PathBuf::from("/tmp/review-wt")],
+    });
+    let err = e
+        .core
+        .code_intel_remove("typescript")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        format!(
+            "invalid request: typescript is in use: a space or review is using it \
+             (space “{}” and 1 review); close them, or remove it later",
+            s.name
+        )
+    );
+    assert!(!err.contains(&s.worktree), "{err}");
+}
+
+/// The language servers report a root by its real path: a data dir under
+/// a symlink (`/tmp` → `/private/tmp`) still names the space.
+#[tokio::test]
+async fn a_refused_remove_names_the_space_under_a_symlinked_data_dir() {
+    let e = code_env().await;
+    let s = e.create("").await;
+    let wt = PathBuf::from(&s.worktree);
+    assert!(wt.is_dir(), "{wt:?}");
+    let links = tempfile::tempdir().unwrap();
+    let alias = links.path().join("alias");
+    std::os::unix::fs::symlink(wt.parent().unwrap(), &alias).unwrap();
+    let through_link = alias.join(wt.file_name().unwrap());
+    *e.f.code_intel.remove_error.lock().unwrap() = Some(CodeIntelError::InUse {
+        language: "typescript".into(),
+        roots: vec![through_link],
+    });
+    let err = e
+        .core
+        .code_intel_remove("typescript")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(&format!("(space “{}”)", s.name)), "{err}");
 }
 
 #[tokio::test]

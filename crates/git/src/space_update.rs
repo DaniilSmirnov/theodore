@@ -5,7 +5,8 @@
 //! ```text
 //! space_merge         git merge <tip> ─┬─ clean ─▶ merge commit = checkpoint ─▶ Merged
 //!                                      └─ conflicts ─▶ left in progress ────▶ Conflicts
-//! space_merge_finish  no markers left in the listed files ─▶ add -A, commit ─▶ Merged
+//! space_merge_finish  no markers left in the listed files, staged or not
+//!                                                         ─▶ add -A, commit ─▶ Merged
 //!                     markers left ───────────────────────────────────────▶ Conflicts
 //! space_merge_abort   merge --abort, reset --hard <checkpoint>, clean -fd
 //! ```
@@ -126,6 +127,7 @@ impl GitCli {
         worktree: &Path,
         id: &str,
         tip: &Sha,
+        conflicts: &[String],
         message: &str,
     ) -> GitResult<SpaceMerge> {
         validate_space_id(id)?;
@@ -159,9 +161,17 @@ impl GitCli {
             };
         }
         // Resolved = no markers left in the file (or the file deleted);
-        // the agent needn't `git add` it, its sandbox may not let it.
+        // the agent needn't `git add` it, its sandbox may not let it. And
+        // adding it resolves nothing: a staged file is no longer unmerged,
+        // so the files the merge listed are read too.
+        let mut paths = unmerged(&git).await?;
+        for path in conflicts {
+            if !paths.contains(path) {
+                paths.push(path.clone());
+            }
+        }
         let mut left = Vec::new();
-        for path in unmerged(&git).await? {
+        for path in paths {
             match std::fs::read(worktree.join(&path)) {
                 Ok(text) if has_conflict_markers(&text) => left.push(path),
                 Ok(_) => {}

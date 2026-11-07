@@ -477,8 +477,14 @@ async fn a_running_space_queues_a_second_message_and_stops_cleanly() {
     let reply = chat.iter().find(|m| m.author != Author::Me).unwrap();
     assert_eq!(reply.failed.as_deref(), Some("stopped"));
     // Stop holds the queue: it waits for you, nothing runs on its own.
-    let queued = chat.iter().find(|m| m.id == queued_id).unwrap();
-    assert!(queued.queued.as_ref().is_some_and(|q| q.held));
+    // Written right after the space goes idle.
+    wait_until(|| {
+        transcript(&f, &s.id)
+            .iter()
+            .find(|m| m.id == queued_id)
+            .is_some_and(|m| m.queued.as_ref().is_some_and(|q| q.held))
+    })
+    .await;
     assert_eq!(f.agents.requests().len(), 1);
     // Edits made before the stop are still checkpointed.
     assert!(
@@ -486,6 +492,89 @@ async fn a_running_space_queues_a_second_message_and_stops_cleanly() {
             .1
             .ends_with("turn 1 (stopped)")
     );
+}
+
+#[tokio::test]
+async fn a_stopped_turn_keeps_what_the_agent_had_written() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    // A whole block, then one cut off mid-sentence.
+    f.agents.push_script_then_hang(vec![
+        AgentEvent::Text {
+            text: "I found the cause.".into(),
+        },
+        AgentEvent::TextDelta {
+            text: "Now fixing".into(),
+        },
+    ]);
+    let s = core
+        .create_space(request(&project, "Long job"))
+        .await
+        .unwrap();
+    wait_until(|| f.agents.requests().iter().any(|r| r.stream_text)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    core.space_stop(&s.id).await.unwrap();
+    let s = idle(&f, &s.id).await;
+    let chat = transcript(&f, &s.id);
+    let reply = chat.iter().find(|m| m.author != Author::Me).unwrap();
+    assert_eq!(reply.failed.as_deref(), Some("stopped"));
+    assert_eq!(reply.text, "I found the cause.\n\nNow fixing");
+}
+
+#[tokio::test]
+async fn a_note_goes_on_top_of_the_issue_it_starts_from() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    f.host.push_get_issue(Ok(theodore_ports::TrackedIssue {
+        number: 7,
+        title: "Login loops".into(),
+        body: "After SSO it redirects forever.".into(),
+        url: "https://example.test/7".into(),
+        closed: false,
+    }));
+    f.agents.push_script(done("ok", 0.0));
+    f.git.push_checkpoint(Sha::new("turn111"));
+    let s = core
+        .create_space(CreateSpaceRequest {
+            start_from: Some(theodore_contract::SpaceStart::Issue("7".into())),
+            ..request(&project, "use backoff")
+        })
+        .await
+        .unwrap();
+    assert!(s.goal.starts_with("use backoff"), "{}", s.goal);
+    assert!(s.goal.contains("#7 Login loops"), "{}", s.goal);
+    assert!(s.goal.contains("redirects forever"), "{}", s.goal);
+    assert_eq!(s.issue, Some(7));
+}
+
+#[tokio::test]
+async fn a_pr_start_compares_against_what_the_pr_targets() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    let pr = theodore_domain::PrRef {
+        repo: project.repo.clone(),
+        number: 9,
+        host_id: None,
+    };
+    let mut detail =
+        crate::testkit::sample_pr_detail(&pr, &Sha::new("base000"), &Sha::new("tip0000"));
+    detail.summary.base_ref = "develop".into();
+    f.git.set_resolve("develop", Sha::new("dev0000"));
+    f.git.set_resolve("dev0000", Sha::new("dev0000"));
+    f.host.push_get_pr(Ok(theodore_ports::Fetched::Modified {
+        etag: None,
+        value: detail,
+    }));
+    f.agents.push_script(done("ok", 0.0));
+    f.git.push_checkpoint(Sha::new("turn111"));
+    let s = core
+        .create_space(CreateSpaceRequest {
+            start_from: Some(theodore_contract::SpaceStart::Pr(9)),
+            ..request(&project, "note")
+        })
+        .await
+        .unwrap();
+    assert_eq!(s.base, "develop");
 }
 
 #[tokio::test]
@@ -601,6 +690,77 @@ async fn review_groups_the_space_diff() {
         .unwrap();
     assert_eq!(Some(opened.pr), space(&f, &s.id).review_pr);
     wait_until(|| f.grouper.last_agent().is_some()).await;
+}
+
+/// A turn after the space's review was grouped: the review moves to the new
+/// checkpoint without a regroup, and a file the old groups don't hold goes
+/// into a "Not grouped yet" group instead of showing in none.
+#[tokio::test]
+async fn a_file_new_since_the_grouping_is_in_a_catch_all_group() {
+    use crate::testkit::{hunk_ids, two_hunk_revision};
+    use theodore_domain::{Group, GroupId, GroupKind, Grouping};
+
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    let (base, head) = (Sha::new("base000"), Sha::new("head111"));
+    let first = two_hunk_revision(&base, &head, "index.html");
+    f.git.set_revision(first.clone());
+    f.grouper.set(Grouping {
+        rev: head.clone(),
+        groups: vec![Group {
+            id: GroupId::new("page"),
+            title: "The page".into(),
+            why: String::new(),
+            kind: GroupKind::Normal,
+            risk: None,
+            check: vec![],
+            hunks: hunk_ids(&first),
+            outliers: vec![],
+        }],
+        in_progress: false,
+    });
+    let s = core.create_space(request(&project, "")).await.unwrap();
+    let opened = core
+        .space_review(SpaceReviewRequest {
+            space: s.id.clone(),
+            group: true,
+        })
+        .await
+        .unwrap();
+    let grouping = |f: &Fixtures| -> Option<Grouping> {
+        f.store
+            .get(models::GROUPING, &opened.pr.0)
+            .unwrap()
+            .and_then(|r| serde_json::from_value(r.data).ok())
+    };
+    wait_until(|| grouping(&f).is_some_and(|g| !g.in_progress)).await;
+
+    // A feedback turn adds script.js.
+    let mut second = first.clone();
+    let script = two_hunk_revision(&base, &head, "script.js");
+    second.files.extend(script.files.clone());
+    f.git.set_revision(second);
+    f.agents.push_script(done("Added the script.", 0.0));
+    f.git.push_checkpoint(Sha::new("turn222"));
+    core.space_send(SpaceSendRequest {
+        space: s.id.clone(),
+        text: "add a script".into(),
+        agent: None,
+        model: None,
+        mode: None,
+        attachments: None,
+    })
+    .await
+    .unwrap();
+    idle(&f, &s.id).await;
+    wait_until(|| grouping(&f).is_some_and(|g| g.groups.iter().any(|g| g.id.0 == "ungrouped")))
+        .await;
+    let g = grouping(&f).unwrap();
+    assert_eq!(g.groups[0].hunks, hunk_ids(&first), "old groups stay");
+    let rest = g.groups.iter().find(|g| g.id.0 == "ungrouped").unwrap();
+    assert_eq!(rest.hunks, hunk_ids(&script));
+    assert_eq!(rest.title, "Not grouped yet");
+    assert_eq!(f.grouper.calls(), 1, "no agent run per turn");
 }
 
 #[tokio::test]

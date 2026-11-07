@@ -346,16 +346,19 @@ pub(crate) async fn get_issue(http: &HttpClient, project: &str, iid: u64) -> Hos
     Ok(http.get::<GlIssue>(&path).await?.value)
 }
 
-/// `GET /projects/:id/issues?state=opened&assignee_username=<login>`.
-pub(crate) async fn list_assigned_issues(
+/// `GET /projects/:id/issues?state=opened[&assignee_username=<login>]`.
+pub(crate) async fn list_open_issues(
     http: &HttpClient,
     project: &str,
-    login: &str,
+    assignee: Option<&str>,
 ) -> HostResult<Vec<GlIssue>> {
-    let path = format!(
-        "projects/{project}/issues?state=opened&assignee_username={}&per_page=50",
-        urlencode(login)
-    );
+    let path = match assignee {
+        Some(login) => format!(
+            "projects/{project}/issues?state=opened&assignee_username={}&per_page=50",
+            urlencode(login)
+        ),
+        None => format!("projects/{project}/issues?state=opened&per_page=50"),
+    };
     Ok(http.get::<Vec<GlIssue>>(&path).await?.value)
 }
 

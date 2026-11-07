@@ -810,6 +810,18 @@ pub async fn merge_space(
     op.run(async move { core.merge_space(req).await }).await
 }
 
+/// The space page's poll of its PR's checks: one conditional fetch.
+#[tauri::command]
+#[specta::specta]
+pub async fn refresh_space_pr(
+    op: crate::op::Op,
+    space: String,
+    core: State<'_, Arc<dyn CoreApi>>,
+) -> Result<(), CommandError> {
+    op.run(async move { core.refresh_space_pr(space).await })
+        .await
+}
+
 /// Continue after merge: a new branch on the base's fresh tip (§7).
 #[tauri::command]
 #[specta::specta]
@@ -1043,6 +1055,16 @@ pub async fn focus_window(op: crate::op::Op, app: AppHandle) -> Result<(), Comma
         })
     })
     .await
+}
+
+/// The UI listens for `open-space` from now on: the space a link asked for
+/// before that (a link that launched the app), if any.
+#[tauri::command]
+#[specta::specta]
+pub fn take_pending_space(
+    links: State<'_, crate::deep_link::SpaceLinks>,
+) -> Result<Option<String>, CommandError> {
+    Ok(links.ui_listens())
 }
 
 /// Shows a space's "turn finished" notification while the window is in the

@@ -123,6 +123,11 @@ impl Core {
             failed: None,
             attachments: attachments.clone(),
             queued: None,
+            activity: vec![],
+            duration_ms: None,
+            changed_files: vec![],
+            model: None,
+            text_in_steps: false,
         };
         let data = serde_json::to_value(&question).map_err(|e| AppError::Invalid(e.to_string()))?;
         self.apply(vec![NewAction {
@@ -482,6 +487,17 @@ async fn drive_skill_run(
             duration_ms = ms,
             "skill run couldn't reach the agent"
         );
+    } else if let Some(e) = &error
+        && theodore_ports::signed_out_message_in(e).is_some()
+    {
+        // The agent has no credentials: the user's to fix, not a bug.
+        tracing::info!(
+            error.code = theodore_ports::AGENT_SIGNED_OUT_CODE,
+            run = %run_id,
+            agent = last_agent.as_str(),
+            duration_ms = ms,
+            "skill run couldn't sign in to the agent"
+        );
     } else if let Some(e) = &error {
         tracing::warn!(
             error.code = "skill.failed",
@@ -546,6 +562,11 @@ pub(crate) async fn persist_failed_message(core: &Core, pr: &PrId, agent: AgentI
         failed: Some(text.to_string()),
         attachments: vec![],
         queued: None,
+        activity: vec![],
+        duration_ms: None,
+        changed_files: vec![],
+        model: None,
+        text_in_steps: false,
     };
     if let Ok(data) = serde_json::to_value(&message) {
         let _ = core
@@ -576,7 +597,7 @@ pub(crate) fn tool_log_line_with(name: &str, input: &serde_json::Value) -> Strin
 
 /// The part of a tool call worth showing: the first line of a command, a
 /// file's last two path segments, or a search pattern; 80 chars at most.
-fn tool_target(input: &serde_json::Value) -> Option<String> {
+pub(crate) fn tool_target(input: &serde_json::Value) -> Option<String> {
     let s = |k: &str| input.get(k).and_then(serde_json::Value::as_str);
     let raw = if let Some(c) = s("command") {
         c.lines().next().unwrap_or_default().trim().to_string()
@@ -610,6 +631,12 @@ fn tool_target(input: &serde_json::Value) -> Option<String> {
 }
 
 pub(crate) fn tool_log_line(name: &str) -> String {
+    format!("tool: {}", tool_label(name))
+}
+
+/// A tool as you read it: Theodore's own by what they do, any other by its
+/// name.
+pub(crate) fn tool_label(name: &str) -> &str {
     let own = [theodore_ports::REVIEW_TOOLS, theodore_ports::SPACE_TOOLS]
         .iter()
         .find_map(|server| {
@@ -617,7 +644,8 @@ pub(crate) fn tool_log_line(name: &str) -> String {
             name.strip_prefix(server)?.strip_prefix("__")
         })
         .unwrap_or(name);
-    let label = match own {
+    match own {
+        "ask_user" => "ask you",
         "run_check" => "run the check",
         "start_app" => "start the app",
         "stop_app" => "stop the app",
@@ -646,8 +674,7 @@ pub(crate) fn tool_log_line(name: &str) -> String {
         "insert_after_symbol" => "insert after a symbol",
         "rename_symbol" => "rename a symbol",
         _ => name,
-    };
-    format!("tool: {label}")
+    }
 }
 
 /// Revokes a run's MCP token when the run's driver returns. `pub(crate)`:
@@ -801,6 +828,11 @@ async fn drive_ask(
         failed: None,
         attachments: vec![],
         queued: None,
+        activity: vec![],
+        duration_ms: None,
+        changed_files: vec![],
+        model: None,
+        text_in_steps: false,
     };
     if let Ok(data) = serde_json::to_value(&reply) {
         let _ = core

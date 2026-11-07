@@ -7,13 +7,28 @@
 #              one-element argv only checks that the program exists.
 #   download   per platform; sha256 is required (an entry without it is
 #              dropped). redirect_hosts: the only hosts the URL may redirect to.
-#   launch     argv; "{bin}" is replaced by the resolved binary.
+#   launch     argv. "{bin}" (the resolved binary) and "{runtime}" (what passed
+#              `requires`) are whole arguments; "{dir}" (where the download was
+#              unpacked; never with `detect`) and "{data}" (writable, per worktree
+#              and trust mode, under the toolchain's root, never in the worktree;
+#              Remove deletes it) may sit inside one.
+#   requires   { runtime: node | java | ruby | php | dotnet | dotnet-sdk, min: 21
+#              or "8.2" }. Checked by running the runtime (§4.3): missing or too
+#              old, the server is skipped, found or downloaded alike, and nothing
+#              is downloaded for it. dotnet-sdk: that runtime and any SDK.
+#   hint       how to get it when Theodore can't; shown when nothing can serve.
+#   start_timeout_secs  replaces the initialize timeout (60 s) and the warm-up cap
+#              (180 s): a JVM importing a build takes minutes.
+#   ready_settle_secs   quiet time before it counts as warmed up (default 1.5 s),
+#              for a server slow to announce its work.
 #   review_init_options  merged over init_options in a review run (§8). They
 #              narrow what a server runs; they do not make it safe: rust-analyzer
 #              still runs `cargo metadata` (a PR's .cargo/config.toml
 #              `rustc-wrapper`, rust-toolchain.toml), typescript-language-server
 #              loads node_modules/typescript. Hence review runs start servers
 #              only when `code_intel.lsp.review` is on (off by default).
+#   trusted_only  runs the project's code with no option to turn that off: never
+#              started in a review run, even with `code_intel.lsp.review` on.
 # languages[]: globs match the file name (`*.rs`, `Dockerfile`); a glob with a
 #   `/` matches the repo-relative path. First language whose glob matches wins.
 #   tags_extends  a language whose tags query is prepended to this one's
@@ -67,13 +82,17 @@ servers:
     detect: [["pyright-langserver"]]
     launch: ["{bin}", "--stdio"]
     workspace_folders: true
-    requires: node
+    requires: { runtime: node, min: 14 }
+    hint: npm install -g pyright
 
   - name: typescript-language-server
     detect: [["typescript-language-server", "--version"]]
     launch: ["{bin}", "--stdio"]
     workspace_folders: true
-    requires: node
+    # The floor is the oldest a release of it supports: installed, its own
+    # version decides.
+    requires: { runtime: node, min: 18 }
+    hint: npm install -g typescript-language-server typescript
     review_init_options:
       plugins: []
       disableAutomaticTypingAcquisition: true
@@ -84,7 +103,8 @@ servers:
     # (crates/code-intel-toolchain/tests/tsgo_lsp.rs, run with --ignored)
     # against this crate's own package: it answers all three. Listed ahead
     # of typescript-language-server (docs/code-intel.md §11 open question
-    # resolved: default for TypeScript).
+    # resolved: default for TypeScript). It serves plain .js with no tsconfig
+    # or jsconfig too (tests/server_lsp.rs), hence first for JavaScript.
     version: "7.0.0-dev.20260707.2"
     detect: [["tsgo", "--version"]]
     download:
@@ -136,6 +156,7 @@ servers:
     detect: [["sourcekit-lsp"]]
     launch: ["{bin}"]
     workspace_folders: true
+    hint: Install Xcode or the Swift toolchain
 
   - name: zls
     # Upstream only publishes .tar.xz for darwin-arm64 (zigtools/zls
@@ -147,6 +168,7 @@ servers:
     detect: [["zls", "--version"]]
     launch: ["{bin}"]
     workspace_folders: true
+    hint: brew install zls
 
   - name: lua-language-server
     version: "3.19.2"
@@ -207,6 +229,164 @@ servers:
     launch: ["{bin}", "serve"]
     workspace_folders: true
 
+  - name: intelephense
+    # Detect-only on purpose. Its licence is proprietary ("personal,
+    # non-transferable", "by installing this software you agree"), for an
+    # individual using it with an IDE or editor: yours to accept, not a
+    # download behind Theodore's prompt or `install: always`. Parses PHP in
+    # JavaScript and runs none of the project's code, so it may serve
+    # reviews (a phpactor-tripping vendor/composer does nothing here).
+    # Keeps an index under ~/.config/intelephense, which Remove can't touch.
+    # `intelephense --version` waits on stdio: only check it exists.
+    detect: [["intelephense"]]
+    launch: ["{bin}", "--stdio"]
+    requires: { runtime: node, min: 20 }
+    hint: npm install -g intelephense
+
+  - name: phpactor
+    # MIT. A phar with a php shebang, so `{bin}` runs for a download and a
+    # system install alike; PATH brings the php that passed the check. Needs
+    # 8.2 (its vendor/composer/platform_check.php).
+    # Trusted only: it `require`s the project's vendor/composer/autoload_*.php
+    # (a marker file in them is written). `composer.enable: false`, through
+    # initializationOptions or --config-extra, did not stop that. A project's
+    # .phpactor.json it loads only after a trust prompt, and we answer none.
+    version: "2026.10.07.0"
+    detect: [["phpactor", "--version"]]
+    download:
+      darwin-arm64:
+        url: https://github.com/phpactor/phpactor/releases/download/2026.10.07.0/phpactor.phar
+        sha256: b28bf6166e016d539fc2f2aec18ef918b12590e436a6f1ccbdf30b5bbdbdb16b
+        size: 4815663
+        format: binary
+        bin: phpactor.phar
+        redirect_hosts: [release-assets.githubusercontent.com, objects.githubusercontent.com]
+    # The index goes under {data}, not ~/.cache/phpactor: Remove deletes it.
+    launch: ["{bin}", "language-server", '--config-extra={"indexer.index_path": "{data}/index"}']
+    requires: { runtime: php, min: "8.2" }
+    trusted_only: true
+
+  - name: ruby-lsp
+    # A gem with native dependencies and no standalone build: detect-only.
+    # Trusted only: on start it composes .ruby-lsp/Gemfile, runs Bundler and
+    # evaluates the project's Gemfile (a marker file in it is written), and
+    # loads add-ons from the bundle; there is no option to turn that off.
+    # That first start installs gems, hence the long timeout. A Gemfile with
+    # no Gemfile.lock makes it exit: the syntax layer answers.
+    detect: [["ruby-lsp", "--version"]]
+    launch: ["{bin}"]
+    requires: { runtime: ruby, min: 3 }
+    hint: gem install ruby-lsp
+    trusted_only: true
+    start_timeout_secs: 300
+
+  - name: jdtls
+    # Eclipse JDT LS, EPL-2.0. Pure Java, so the same tarball runs anywhere a
+    # JVM does; config_mac_arm makes this entry arm64 only. No `detect`: a
+    # system jdtls is a Python wrapper with another command line.
+    # `-configuration` must be writable and a running instance locks it, so
+    # the shipped one is a read-only parent of one per worktree. One process
+    # per worktree: Eclipse project names would collide across folders.
+    version: "1.63.0"
+    download:
+      darwin-arm64:
+        url: https://download.eclipse.org/jdtls/milestones/1.63.0/jdt-language-server-1.63.0-202610191322.tar.gz
+        sha256: b1f2abe0b3cccb462cf64fb4a5587c7d09df60cf8be7748b152cbd89d018bdc4
+        size: 51143565
+        format: tar.gz
+        bin: plugins/org.eclipse.equinox.launcher_1.8.0.v20260804-1928.jar
+    launch:
+      - "{runtime}"
+      - -Declipse.application=org.eclipse.jdt.ls.core.id1
+      - -Dosgi.bundles.defaultStartLevel=4
+      - -Declipse.product=org.eclipse.jdt.ls.core.product
+      - -Dosgi.sharedConfiguration.area={dir}/config_mac_arm
+      - -Dosgi.sharedConfiguration.area.readOnly=true
+      - -Dosgi.checkConfiguration=true
+      - -Dosgi.configuration.cascaded=true
+      # Without it .project, .classpath and .settings land in the worktree. A
+      # JVM property: as a setting in init_options it does nothing.
+      - -Djava.import.generatesMetadataFilesAtProjectRoot=false
+      # What its own bin/jdtls adds on Java 24+; harmless below.
+      - -Djdk.xml.maxGeneralEntitySizeLimit=0
+      - -Djdk.xml.totalEntitySizeLimit=0
+      - -Xmx2G
+      - --add-modules=ALL-SYSTEM
+      - --add-opens
+      - java.base/java.util=ALL-UNNAMED
+      - --add-opens
+      - java.base/java.lang=ALL-UNNAMED
+      - -jar
+      - "{bin}"
+      - -configuration
+      - "{data}/config"
+      - -data
+      - "{data}/workspace"
+    requires: { runtime: java, min: 21 }
+    start_timeout_secs: 600
+    # With its defaults it evaluates build.gradle and settings.gradle, and
+    # runs an annotation processor a .factorypath names; marker files in them
+    # are written. With these, neither is, and definition and references
+    # still answer: sources are read as loose files, with no dependencies.
+    review_init_options:
+      settings:
+        java:
+          import:
+            gradle: { enabled: false, wrapper: { enabled: false } }
+            maven: { enabled: false }
+            exclusions: ["**"]
+          autobuild: { enabled: false }
+
+  - name: kotlin-lsp
+    # JetBrains', Apache-2.0 repository, alpha, and "partially closed-source"
+    # by its README: the archive is theirs, fetched from their CDN. Brings
+    # its own JBR, so no `requires`, at a price: 360 MB down, 1.1 GB unpacked.
+    # `.sit` here is a plain zip. Sends nothing (--data-sharing defaults to none).
+    # Trusted only: it imports through Gradle or Maven, which evaluates the
+    # build (a marker file in settings.gradle.kts is written), with no
+    # documented switch.
+    version: "263.7084.0"
+    detect: [["kotlin-lsp", "--version"]]
+    download:
+      darwin-arm64:
+        url: https://download.jetbrains.com/language-server/kotlin-server/263.7084.0/kotlin-server-263.7084.0-aarch64.sit
+        sha256: b403bf8a54bd458e3ba6731cf8abb3340be08b439c03576dfc02b13faf3694b8
+        size: 360201117
+        format: zip
+        bin: kotlin-server-263.7084.0/bin/intellij-server
+        redirect_hosts: [download-cdn.jetbrains.com]
+    launch: ["{bin}", "--stdio", "--system-path={data}/system"]
+    trusted_only: true
+    start_timeout_secs: 600
+
+  - name: csharp-ls
+    # MIT, razzmatazz/csharp-language-server, a dotnet tool: its nupkg is a
+    # zip with a framework-dependent, any-architecture dll. Chosen because it
+    # is the one seen answering over plain stdio with an SDK alone. OmniSharp
+    # 2.0.0's arm64 build wants an arm64 .NET, and the machine tried had x64
+    # (Rosetta); Roslyn's roslyn-language-server is prerelease only, per
+    # platform, and its thin client did not start through `dotnet`. Neither
+    # was seen to answer, which says little against them on another machine.
+    # MSBuild needs an SDK, not just the runtime.
+    # No `detect`: a system tool has another command line.
+    # Trusted only: MSBuild evaluates the project and runs its targets (an
+    # <Exec> marker in a .csproj is written), and writes bin/ and obj/ into
+    # the worktree; there is no option to turn that off. It announces loading
+    # about 1.3 s after `initialized`: too close to the default settle.
+    version: "0.28.0"
+    download:
+      darwin-arm64:
+        url: https://api.nuget.org/v3-flatcontainer/csharp-ls/0.28.0/csharp-ls.0.28.0.nupkg
+        sha256: 8f815e4f22674106a8244beba07e4b4b062e31528e404aa8489312effb8c0e0c
+        size: 21643814
+        format: zip
+        bin: tools/net10.0/any/CSharpLanguageServer.dll
+    launch: ["{runtime}", "{bin}"]
+    requires: { runtime: dotnet-sdk, min: 10 }
+    trusted_only: true
+    start_timeout_secs: 300
+    ready_settle_secs: 5
+
 languages:
   - id: rust
     globs: ["*.rs"]
@@ -222,7 +402,7 @@ languages:
     servers: [tsgo, typescript-language-server]
   - id: javascript
     globs: ["*.js", "*.mjs", "*.cjs", "*.jsx"]
-    servers: [typescript-language-server]
+    servers: [tsgo, typescript-language-server]
   - id: python
     globs: ["*.py", "*.pyi"]
     servers: [ty, pyright]
@@ -244,6 +424,26 @@ languages:
   - id: lua
     globs: ["*.lua"]
     servers: [lua-language-server]
+  - id: php
+    globs: ["*.php", "*.phtml"]
+    servers: [intelephense, phpactor]
+
+  - id: ruby
+    globs: ["*.rb", "*.rake", "*.gemspec", "*.ru", "Gemfile", "Rakefile"]
+    servers: [ruby-lsp]
+
+  - id: java
+    globs: ["*.java"]
+    servers: [jdtls]
+
+  - id: kotlin
+    globs: ["*.kt", "*.kts"]
+    servers: [kotlin-lsp]
+
+  - id: csharp
+    globs: ["*.cs", "*.csx"]
+    servers: [csharp-ls]
+
   - id: json
     prose: true
     globs: ["*.json", "*.jsonc"]
@@ -268,3 +468,60 @@ languages:
     # is not in scope here); the grammar (when CI builds one — another
     # agent's grammars.toml entry) and text search still work without one.
     globs: ["*.sh", "*.bash", ".bashrc", ".bash_profile", ".bash_aliases"]
+
+  # Text-only languages: no grammar and no server (yet), listed so their
+  # files are code the text fallback searches (a code query finds `def
+  # foo`, `sub foo`, `defmodule Foo` by name, docs/code-intel.md §3). Adding
+  # a grammar or a server later is the same entry plus one line elsewhere.
+  # Appended after every language above: the first language whose glob
+  # matches wins, so none of these can take a file from an earlier one
+  # (`*.h` stays C, `*.kts` Kotlin).
+  - id: scala
+    globs: ["*.scala", "*.sc", "*.sbt"]
+  - id: elixir
+    globs: ["*.ex", "*.exs"]
+  - id: dart
+    globs: ["*.dart"]
+  - id: vue
+    globs: ["*.vue"]
+  - id: svelte
+    globs: ["*.svelte"]
+  - id: html
+    # Markup and content, not code: a name in an HTML file is almost always
+    # text or an attribute, never the definition of a symbol, so a text hit
+    # there is noise. Not searched by a code query.
+    prose: true
+    globs: ["*.html", "*.htm"]
+  - id: css
+    # Code, unlike HTML: class names, custom properties and keyframes are
+    # defined here and used from other languages' files.
+    globs: ["*.css"]
+  - id: scss
+    # Mixins, functions and variables are real definitions.
+    globs: ["*.scss", "*.sass"]
+  - id: sql
+    # Code: tables, views, functions and procedures are defined here (and
+    # migrations are a large part of what a change touches).
+    globs: ["*.sql"]
+  - id: objective-c
+    globs: ["*.m", "*.mm"]
+  - id: perl
+    globs: ["*.pl", "*.pm"]
+  - id: haskell
+    globs: ["*.hs", "*.lhs"]
+  - id: ocaml
+    globs: ["*.ml", "*.mli"]
+  - id: clojure
+    globs: ["*.clj", "*.cljs", "*.cljc"]
+  - id: erlang
+    globs: ["*.erl", "*.hrl"]
+  - id: r
+    globs: ["*.r", "*.R"]
+  - id: julia
+    globs: ["*.jl"]
+  - id: groovy
+    globs: ["*.groovy", "*.gvy", "*.gradle"]
+  - id: powershell
+    globs: ["*.ps1", "*.psm1", "*.psd1"]
+  - id: solidity
+    globs: ["*.sol"]

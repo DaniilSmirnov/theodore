@@ -10,6 +10,7 @@ import {
   useRef,
   useState,
 } from 'react';
+import { useKeptOpen, useSteadyChange } from '../rowState';
 
 import {
   CircleCheck,
@@ -19,7 +20,8 @@ import {
   StopFill,
   Terminal,
   Xmark,
-  ArrowUpRightFromSquare,
+  Globe,
+  PlugConnection,
 } from '@gravity-ui/icons';
 import { Button, Card, Chip, Tabs, Tooltip } from '@heroui/react';
 import { observer } from 'mobx-react-lite';
@@ -48,11 +50,15 @@ import {
 
 const EMPTY: SpaceLogLine[] = [];
 
-/** `space_config` for the page, refetched when what it depends on moves
- *  (trust answered, setup moved on, archived). */
+/** `space_config` for the page, refetched when what it depends on moves:
+ *  trust answered, setup moved on, archived, a turn started or ended (it may
+ *  have written the config), a new base (Continue, Update from base: the
+ *  repo's file is read at `base_sha`). */
 export function useSpaceConfig(
   id: string,
-  space: Pick<Space, 'status' | 'commands_denied' | 'setup'> | undefined,
+  space:
+    | Pick<Space, 'status' | 'commands_denied' | 'setup' | 'base_sha'>
+    | undefined,
 ): {
   config: SpaceConfigView | null;
   refresh: () => void;
@@ -66,6 +72,8 @@ export function useSpaceConfig(
   const live = space != null && space.status !== 'archived';
   const denied = space?.commands_denied;
   const setup = space?.setup?.status;
+  const status = space?.status;
+  const base = space?.base_sha;
   useEffect(() => {
     if (!live) return;
     let on = true;
@@ -76,7 +84,7 @@ export function useSpaceConfig(
     return () => {
       on = false;
     };
-  }, [id, live, denied, setup, tick]);
+  }, [id, live, denied, setup, status, base, tick]);
   const config = live && got?.id === id ? got.config : null;
   return { config, refresh };
 }
@@ -298,9 +306,16 @@ export const SetupStage = observer(function SetupStage({
           from this repo?” above.
         </span>
       )}
+      {/* A Retry waiting on "Run commands from this repo?" hasn't run yet:
+          what's here is the failed run's output, said so and dimmed. */}
+      {setup.status === 'waiting' && filterLogs(lines, 'setup').length > 0 && (
+        <span className="setup-log-stale text-xs text-muted">
+          From the last run — nothing runs again until you allow it.
+        </span>
+      )}
       <LogLines
         lines={filterLogs(lines, 'setup')}
-        className="max-h-64"
+        className={`max-h-64 ${setup.status === 'waiting' ? 'opacity-50' : ''}`}
         empty="No output yet."
       />
       {!!setup.notes?.length && (
@@ -364,7 +379,7 @@ export const SetupNote = observer(function SetupNote({
 }: {
   space: Space;
 }) {
-  const [hidden, setHidden] = useState(false);
+  const [hidden, setHidden] = useKeptOpen(`setup-note:${space.id}`);
   const notes = space.setup?.notes ?? [];
   if (hidden || setupView(space) !== 'note' || !space.setup) return null;
   return (
@@ -410,7 +425,8 @@ export const RunButton = observer(function RunButton({
       <Button
         size="sm"
         variant={ctl.running ? 'secondary' : 'ghost'}
-        className="space-run"
+        className="space-run btn-collapsible"
+        aria-label={ctl.running ? 'Stop' : 'Run'}
         isPending={busy}
         onPress={() => {
           setBusy(true);
@@ -422,7 +438,7 @@ export const RunButton = observer(function RunButton({
         ) : (
           <Play className="size-3.5" />
         )}
-        {ctl.running ? 'Stop' : 'Run'}
+        <span className="btn-label">{ctl.running ? 'Stop' : 'Run'}</span>
       </Button>
       <Tooltip.Content>
         <span className="font-mono">{ctl.script}</span>
@@ -451,11 +467,18 @@ export const PortChips = observer(function PortChips({
           <Button
             size="sm"
             variant="secondary"
-            className="space-port shrink-0 gap-1.5"
+            className="space-port btn-collapsible shrink-0 gap-1.5"
+            aria-label={i === 0 ? 'Open app' : `Port ${p}`}
             onPress={() => openExternal(portUrl(p))}
           >
-            <ArrowUpRightFromSquare className="size-3.5" />
-            {i === 0 ? 'Open app' : `Port ${p}`}
+            {i === 0 ? (
+              <Globe className="size-3.5" />
+            ) : (
+              <PlugConnection className="size-3.5" />
+            )}
+            <span className="btn-label">
+              {i === 0 ? 'Open app' : `Port ${p}`}
+            </span>
           </Button>
           <Tooltip.Content>Open {portUrl(p)} in the browser</Tooltip.Content>
         </Tooltip>
@@ -473,17 +496,20 @@ export function LogsToggle({
   onToggle: () => void;
 }) {
   return (
-    <Button
-      size="sm"
-      variant={open ? 'secondary' : 'ghost'}
-      aria-label="Command logs"
-      aria-pressed={open}
-      className="space-logs-toggle"
-      onPress={onToggle}
-    >
-      <Terminal className="size-3.5" />
-      Logs
-    </Button>
+    <Tooltip>
+      <Button
+        size="sm"
+        variant={open ? 'secondary' : 'ghost'}
+        aria-label="Command logs"
+        aria-pressed={open}
+        className="space-logs-toggle btn-collapsible"
+        onPress={onToggle}
+      >
+        <Terminal className="size-3.5" />
+        <span className="btn-label">Logs</span>
+      </Button>
+      <Tooltip.Content>Command logs</Tooltip.Content>
+    </Tooltip>
   );
 }
 
@@ -492,16 +518,22 @@ export function LogsToggle({
 export const LogsDrawer = observer(function LogsDrawer({
   space,
   onClose,
+  height,
 }: {
   space: Space;
   onClose: () => void;
+  /** px: the page caps it by the room the chat leaves (`drawerHeight`). */
+  height: number;
 }) {
   const store = useRootStore();
   const [filter, setFilter] = useState<LogFilter>('all');
   const lines = store.ephemeral.spaceLogs.get(space.id) ?? EMPTY;
   const counts = logCounts(lines);
   return (
-    <section className="space-logs flex h-[260px] shrink-0 flex-col border-t border-separator">
+    <section
+      className="space-logs flex shrink-0 flex-col border-t border-separator bg-background"
+      style={{ height }}
+    >
       <div className="flex items-center gap-2 px-4 pt-2">
         <Tabs
           data-plain
@@ -542,8 +574,16 @@ export const LogsDrawer = observer(function LogsDrawer({
 
 /** On an agent reply: the turn's check — passed / failed / running —
  *  expanding to the tail of its output. */
-export function CheckChip({ check }: { check: SpaceCheck }) {
-  const [open, setOpen] = useState(false);
+export function CheckChip({
+  check,
+  keptAs = null,
+}: {
+  check: SpaceCheck;
+  /** Keeps it open across being scrolled away, per this id. */
+  keptAs?: string | null;
+}) {
+  const [open, setOpen] = useKeptOpen(keptAs);
+  const steady = useSteadyChange();
   const { tone, label } = checkChip(check);
   const output = check.output ?? [];
   return (
@@ -553,7 +593,7 @@ export function CheckChip({ check }: { check: SpaceCheck }) {
         className="inline-flex w-fit items-center"
         aria-expanded={open}
         disabled={output.length === 0}
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => steady(() => setOpen(!open))}
       >
         <Chip
           size="sm"

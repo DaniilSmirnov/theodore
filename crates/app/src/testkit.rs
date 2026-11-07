@@ -83,11 +83,18 @@ struct StoreState {
     kv: HashMap<String, serde_json::Value>,
 }
 
-pub struct FakeStore(Mutex<StoreState>);
+type ReadHook = Box<dyn FnOnce() + Send>;
+
+pub struct FakeStore(Mutex<StoreState>, Mutex<Option<ReadHook>>);
 
 impl FakeStore {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self(Mutex::new(StoreState::default())))
+        Arc::new(Self(Mutex::new(StoreState::default()), Mutex::new(None)))
+    }
+
+    /// Runs `hook` just before the next `query`: a write racing a read.
+    pub fn before_next_read(&self, hook: ReadHook) {
+        *self.1.lock().unwrap() = Some(hook);
     }
 
     /// Test-only inspection, not part of `Store`.
@@ -215,6 +222,10 @@ impl Store for FakeStore {
     }
 
     fn query(&self, model: &str, field: &str, value: &str) -> StoreResult<Vec<ModelRow>> {
+        let hook = self.1.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
         let s = self.0.lock().unwrap();
         Ok(s.models
             .values()
@@ -307,6 +318,13 @@ impl Store for FakeStore {
         Ok(())
     }
 
+    fn outbox_has_pending(&self, op: &str, payload: &serde_json::Value) -> StoreResult<bool> {
+        let s = self.0.lock().unwrap();
+        Ok(s.outbox
+            .iter()
+            .any(|i| i.status == OutboxStatus::Pending && i.op == op && &i.payload == payload))
+    }
+
     fn outbox_pending_count(&self) -> StoreResult<u64> {
         let s = self.0.lock().unwrap();
         Ok(s.outbox
@@ -366,12 +384,18 @@ pub struct FakeGit {
     files: Mutex<HashMap<(String, String), Vec<u8>>>,
     /// Last `(branch, message)` passed to `commit_and_push`, for assertions.
     pub last_push: Mutex<Option<(String, String)>>,
+    /// The author of that last `commit_and_push`.
+    pub last_push_author: Mutex<Option<theodore_ports::Identity>>,
     push_responses: Mutex<VecDeque<GitResult<Sha>>>,
 
     // ── projects (plan "projects") ───────────────────────────────────────
     mirror_path: PathBuf,
     mirror_calls: Mutex<Vec<(PathBuf, RepoRef)>>,
     is_repo_value: Mutex<bool>,
+    /// Paths `is_tracked` says git has.
+    pub tracked: Mutex<Vec<String>>,
+    /// What `exclude_locally` was asked to ignore.
+    pub excluded: Mutex<Vec<String>>,
     default_branch_value: Mutex<Option<String>>,
     branches_value: Mutex<Vec<BranchInfo>>,
     resolve_refs: Mutex<HashMap<String, Sha>>,
@@ -394,6 +418,12 @@ pub struct FakeGit {
     checkpoint_errors: Mutex<VecDeque<GitError>>,
     /// `(space, message)` of every `space_checkpoint`.
     pub checkpoints: Mutex<Vec<(String, String)>>,
+    /// The next `space_checkpoint` waits for this once it is recorded.
+    checkpoint_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    /// What `numstat` answers; none: it fails.
+    numstats: Mutex<Option<Vec<theodore_ports::FileStat>>>,
+    /// `(from, to)` of every `numstat`.
+    pub numstat_calls: Mutex<Vec<(Sha, Sha)>>,
     removed_spaces: Mutex<Vec<String>>,
     /// Where space worktrees are created as real directories (tests that
     /// copy files or run commands in them); `None`: a fake path.
@@ -514,10 +544,13 @@ impl FakeGit {
             revision: Mutex::new(revision),
             files: Mutex::new(HashMap::new()),
             last_push: Mutex::new(None),
+            last_push_author: Mutex::new(None),
             push_responses: Mutex::new(VecDeque::new()),
             mirror_path: PathBuf::from("/tmp/theodore-fake-mirror"),
             mirror_calls: Mutex::new(Vec::new()),
             is_repo_value: Mutex::new(true),
+            tracked: Mutex::new(Vec::new()),
+            excluded: Mutex::new(Vec::new()),
             default_branch_value: Mutex::new(Some("main".into())),
             branches_value: Mutex::new(Vec::new()),
             resolve_refs: Mutex::new(HashMap::new()),
@@ -531,7 +564,10 @@ impl FakeGit {
             removed_worktrees: Mutex::new(Vec::new()),
             checkpoint_heads: Mutex::new(VecDeque::new()),
             checkpoint_errors: Mutex::new(VecDeque::new()),
+            checkpoint_gate: Mutex::new(None),
             checkpoints: Mutex::new(Vec::new()),
+            numstats: Mutex::new(None),
+            numstat_calls: Mutex::new(Vec::new()),
             removed_spaces: Mutex::new(Vec::new()),
             space_root: Mutex::new(None),
             grep_hits: Mutex::new(None),
@@ -718,9 +754,22 @@ impl FakeGit {
         self.removed_repos.lock().unwrap().clone()
     }
 
+    /// `numstat` answers `stats` from now on.
+    pub fn set_numstat(&self, stats: Vec<theodore_ports::FileStat>) {
+        *self.numstats.lock().unwrap() = Some(stats);
+    }
+
     /// The next `space_checkpoint` moves the space to `head`.
     pub fn push_checkpoint(&self, head: Sha) {
         self.checkpoint_heads.lock().unwrap().push_back(head);
+    }
+
+    /// The next `space_checkpoint` is seen in `checkpoints`, then waits for
+    /// the returned sender: a checkpoint in flight for as long as a test needs.
+    pub fn pause_next_checkpoint(&self) -> tokio::sync::oneshot::Sender<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.checkpoint_gate.lock().unwrap() = Some(rx);
+        tx
     }
 
     /// The next `space_checkpoint` fails with `e`.
@@ -855,8 +904,10 @@ impl GitPort for FakeGit {
         _repo: &theodore_domain::RepoRef,
         branch: &str,
         message: &str,
+        author: &theodore_ports::Identity,
     ) -> GitResult<Sha> {
         *self.last_push.lock().unwrap() = Some((branch.to_string(), message.to_string()));
+        *self.last_push_author.lock().unwrap() = Some(author.clone());
         self.push_responses
             .lock()
             .unwrap()
@@ -874,6 +925,15 @@ impl GitPort for FakeGit {
 
     async fn is_repo(&self, _path: &Path) -> GitResult<bool> {
         Ok(*self.is_repo_value.lock().unwrap())
+    }
+
+    async fn is_tracked(&self, _folder: &Path, path: &str) -> GitResult<bool> {
+        Ok(self.tracked.lock().unwrap().iter().any(|p| p == path))
+    }
+
+    async fn exclude_locally(&self, _folder: &Path, pattern: &str) -> GitResult<()> {
+        self.excluded.lock().unwrap().push(pattern.to_string());
+        Ok(())
     }
 
     async fn default_branch(&self, _repo: &Path) -> GitResult<Option<String>> {
@@ -986,6 +1046,23 @@ impl GitPort for FakeGit {
         })
     }
 
+    async fn numstat(
+        &self,
+        _repo: &Path,
+        from: &Sha,
+        to: &Sha,
+    ) -> GitResult<Vec<theodore_ports::FileStat>> {
+        self.numstat_calls
+            .lock()
+            .unwrap()
+            .push((from.clone(), to.clone()));
+        self.numstats
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(GitError::Unsupported("numstat"))
+    }
+
     async fn space_checkpoint(
         &self,
         _worktree: &Path,
@@ -996,6 +1073,10 @@ impl GitPort for FakeGit {
             .lock()
             .unwrap()
             .push((space.to_string(), message.to_string()));
+        let gate = self.checkpoint_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
         if let Some(e) = self.checkpoint_errors.lock().unwrap().pop_front() {
             return Err(e);
         }
@@ -1021,6 +1102,17 @@ impl GitPort for FakeGit {
         Ok(theodore_ports::SpaceCheckpoint {
             sha: head,
             head: wt_head,
+        })
+    }
+
+    async fn worktree_busy(
+        &self,
+        _worktree: &Path,
+    ) -> GitResult<Option<theodore_ports::WorktreeBusy>> {
+        // What the next checkpoint would be refused for.
+        Ok(match self.checkpoint_errors.lock().unwrap().front() {
+            Some(GitError::Busy(busy)) => Some(*busy),
+            _ => None,
         })
     }
 
@@ -1109,6 +1201,7 @@ impl GitPort for FakeGit {
         _worktree: &Path,
         space: &str,
         tip: &Sha,
+        _conflicts: &[String],
         _message: &str,
     ) -> GitResult<theodore_ports::SpaceMerge> {
         Ok(self.merge_call("finish", space, tip))
@@ -1256,6 +1349,10 @@ impl GitPort for FakeGit {
             from.clone(),
             paths.to_vec(),
         ));
+        // What mirroring wrote is gone: the folder reads clean again.
+        if let Some(state) = self.working_state_value.lock().unwrap().as_mut() {
+            state.dirty_files = 0;
+        }
         clone_git_result(&self.mirror_restore_value.lock().unwrap())
     }
 
@@ -1321,10 +1418,23 @@ pub struct FakeHost {
     pub changed_since_calls: std::sync::atomic::AtomicUsize,
     pub get_pr_responses: Mutex<VecDeque<HostResult<Fetched<PrDetail>>>>,
     pub set_viewed_responses: Mutex<VecDeque<HostResult<()>>>,
+    /// Every `(path, viewed)` a `set_viewed` call was made with.
+    pub set_viewed_calls: Mutex<Vec<(String, bool)>>,
     pub submit_review_responses: Mutex<VecDeque<HostResult<SubmittedReview>>>,
+    /// Every review a `submit_review` call reached the "host" with.
+    pub submit_review_calls: Mutex<Vec<ReviewSubmission>>,
     pub find_marker_responses: Mutex<VecDeque<HostResult<Option<theodore_domain::CommentId>>>>,
+    /// Markers already in a comment on the PR: `find_marker` finds these
+    /// before it looks at `find_marker_responses`.
+    pub posted_markers: Mutex<std::collections::HashSet<String>>,
     pub changed_since_responses: Mutex<VecDeque<HostResult<Changes>>>,
     pub search_responses: Mutex<VecDeque<HostResult<Vec<PrSummary>>>>,
+    /// Searches answer `complete: true`. Off by default: a test seeding a row
+    /// shouldn't see the startup inbox pass ask after it, or lose a queued
+    /// `get_pr` to it.
+    pub search_complete: std::sync::atomic::AtomicBool,
+    /// Every PR a `get_pr` call asked for, in order.
+    pub get_pr_refs: Mutex<Vec<PrRef>>,
     pub viewer_responses: Mutex<VecDeque<HostResult<Person>>>,
     pub reply_responses: Mutex<VecDeque<HostResult<theodore_domain::CommentId>>>,
     /// Every `(thread, body)` a `reply`/`reply_with_marker` call was made
@@ -1365,7 +1475,7 @@ pub struct FakeHost {
     pub create_pr_errors: Mutex<VecDeque<HostError>>,
     pub create_pr_lands: Mutex<bool>,
     pub get_issue_responses: Mutex<VecDeque<HostResult<TrackedIssue>>>,
-    pub my_open_issues_responses: Mutex<VecDeque<HostResult<Vec<TrackedIssue>>>>,
+    pub open_issues_responses: Mutex<VecDeque<HostResult<Vec<TrackedIssue>>>>,
 }
 
 impl FakeHost {
@@ -1471,8 +1581,8 @@ impl FakeHost {
     pub fn push_get_issue(&self, r: HostResult<TrackedIssue>) {
         self.get_issue_responses.lock().unwrap().push_back(r);
     }
-    pub fn push_my_open_issues(&self, r: HostResult<Vec<TrackedIssue>>) {
-        self.my_open_issues_responses.lock().unwrap().push_back(r);
+    pub fn push_open_issues(&self, r: HostResult<Vec<TrackedIssue>>) {
+        self.open_issues_responses.lock().unwrap().push_back(r);
     }
 }
 
@@ -1549,6 +1659,17 @@ impl HostAdapter for FakeHost {
             .pop_front()
             .unwrap_or(Ok(vec![]))
     }
+    async fn search_checked(
+        &self,
+        _repo: Option<&RepoRef>,
+        section: &InboxSection,
+    ) -> HostResult<theodore_ports::Searched> {
+        let prs = self.search(section).await?;
+        let complete = self
+            .search_complete
+            .load(std::sync::atomic::Ordering::SeqCst);
+        Ok(theodore_ports::Searched { prs, complete })
+    }
     async fn list_repos(&self) -> HostResult<Vec<theodore_domain::HostRepo>> {
         Ok(vec![])
     }
@@ -1559,23 +1680,28 @@ impl HostAdapter for FakeHost {
             .pop_front()
             .unwrap_or_else(|| Err(HostError::NotFound("no fixture queued".into())))
     }
-    async fn my_open_issues(&self, _repo: &RepoRef) -> HostResult<Vec<TrackedIssue>> {
-        self.my_open_issues_responses
+    async fn open_issues(&self, _repo: &RepoRef) -> HostResult<Vec<TrackedIssue>> {
+        self.open_issues_responses
             .lock()
             .unwrap()
             .pop_front()
             .unwrap_or(Ok(vec![]))
     }
-    async fn get_pr(&self, _pr: &PrRef, _etag: Option<&str>) -> HostResult<Fetched<PrDetail>> {
+    async fn get_pr(&self, pr: &PrRef, _etag: Option<&str>) -> HostResult<Fetched<PrDetail>> {
         self.get_pr_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.get_pr_refs.lock().unwrap().push(pr.clone());
         self.get_pr_responses
             .lock()
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| Err(HostError::NotFound("no fixture queued".into())))
     }
-    async fn set_viewed(&self, _pr: &PrRef, _path: &str, _viewed: bool) -> HostResult<()> {
+    async fn set_viewed(&self, _pr: &PrRef, path: &str, viewed: bool) -> HostResult<()> {
+        self.set_viewed_calls
+            .lock()
+            .unwrap()
+            .push((path.to_string(), viewed));
         self.set_viewed_responses
             .lock()
             .unwrap()
@@ -1585,8 +1711,12 @@ impl HostAdapter for FakeHost {
     async fn submit_review(
         &self,
         _pr: &PrRef,
-        _review: &ReviewSubmission,
+        review: &ReviewSubmission,
     ) -> HostResult<SubmittedReview> {
+        self.submit_review_calls
+            .lock()
+            .unwrap()
+            .push(review.clone());
         self.submit_review_responses
             .lock()
             .unwrap()
@@ -1599,8 +1729,13 @@ impl HostAdapter for FakeHost {
     async fn find_marker(
         &self,
         _pr: &PrRef,
-        _marker: &str,
+        marker: &str,
     ) -> HostResult<Option<theodore_domain::CommentId>> {
+        if self.posted_markers.lock().unwrap().contains(marker) {
+            return Ok(Some(theodore_domain::CommentId::new(format!(
+                "posted-{marker}"
+            ))));
+        }
         self.find_marker_responses
             .lock()
             .unwrap()
@@ -1817,9 +1952,8 @@ pub struct FakeAgent {
     /// (`stream_text: true`, never matched here).
     tagged: Mutex<Vec<TaggedScript>>,
     hang_next: Mutex<bool>,
-    /// Keeps a run's sender alive forever so its `events.recv()` never
-    /// resolves (used to test cancellation deterministically).
-    kept_alive: Mutex<Vec<tokio::sync::mpsc::Sender<AgentEvent>>>,
+    /// The next one-shot utility call (`stream_text: false`) hangs likewise.
+    hang_next_utility: Mutex<bool>,
     /// Every `stream_text: true` request `run()` was called with, in
     /// order (assertions on the prompt, mode, or agent a use case
     /// picked): a turn, a skill run, an ask — never a one-shot utility
@@ -1830,6 +1964,7 @@ pub struct FakeAgent {
     /// test that cares inspects these with `utility_requests`.
     utility_requests: Mutex<Vec<AgentRequest>>,
     /// `run_steerable` gives a steer handle (as Claude Code's runner does).
+    hang_after_script: Mutex<bool>,
     steerable: std::sync::atomic::AtomicBool,
     /// Messages steered into runs, in order.
     steered: Arc<Mutex<Vec<String>>>,
@@ -1867,9 +2002,19 @@ impl FakeAgent {
             .push((Box::new(matches), events));
     }
     /// The next turn / skill / ask `run()` (`stream_text: true`) never
-    /// emits anything and never closes, until the whole fake is dropped.
+    /// emits anything and only closes once cancelled, as a real agent's
+    /// events do when its process is gone.
     pub fn hang_next_run(&self) {
         *self.hang_next.lock().unwrap() = true;
+    }
+    /// The next one-shot utility call hangs until it is cancelled.
+    pub fn hang_next_utility(&self) {
+        *self.hang_next_utility.lock().unwrap() = true;
+    }
+    /// The next turn sends `events`, then hangs: an agent cut off mid-reply.
+    pub fn push_script_then_hang(&self, events: Vec<AgentEvent>) {
+        *self.hang_after_script.lock().unwrap() = true;
+        self.push_script(events);
     }
     pub fn requests(&self) -> Vec<AgentRequest> {
         self.requests.lock().unwrap().clone()
@@ -1932,9 +2077,18 @@ impl AgentPort for FakeAgent {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         // Only a turn / skill / ask hangs: a background one-shot call
         // (naming, handoff) must not take the hang meant for it.
-        let hang = stream_text && std::mem::take(&mut *self.hang_next.lock().unwrap());
+        let hang = if stream_text {
+            std::mem::take(&mut *self.hang_next.lock().unwrap())
+        } else {
+            std::mem::take(&mut *self.hang_next_utility.lock().unwrap())
+        };
+        let cancel = CancellationToken::new();
+        let cancelled = cancel.clone();
         if hang {
-            self.kept_alive.lock().unwrap().push(tx);
+            tokio::spawn(async move {
+                let _keep = tx;
+                cancelled.cancelled().await;
+            });
         } else {
             let events = tagged.unwrap_or_else(|| {
                 if stream_text {
@@ -1953,26 +2107,35 @@ impl AgentPort for FakeAgent {
             let paused = stream_text
                 .then(|| self.paused.lock().unwrap().take())
                 .flatten();
+            let hang_after =
+                stream_text && std::mem::take(&mut *self.hang_after_script.lock().unwrap());
             tokio::spawn(async move {
-                if let Some(go) = paused
-                    && go.await.is_err()
-                {
-                    // Never released: hang like `hang_next_run`.
-                    let _keep = tx;
-                    std::future::pending::<()>().await;
-                    return;
+                if let Some(go) = paused {
+                    tokio::select! {
+                        // Stopped before it played: as if its process died.
+                        _ = cancelled.cancelled() => return,
+                        released = go => {
+                            if released.is_err() {
+                                // Never released: hang like `hang_next_run`.
+                                let _keep = tx;
+                                cancelled.cancelled().await;
+                                return;
+                            }
+                        }
+                    }
                 }
                 for e in events {
                     if tx.send(e).await.is_err() {
                         break;
                     }
                 }
+                if hang_after {
+                    let _keep = tx;
+                    cancelled.cancelled().await;
+                }
             });
         }
-        Ok(AgentRun {
-            events: rx,
-            cancel: CancellationToken::new(),
-        })
+        Ok(AgentRun { events: rx, cancel })
     }
     async fn run_steerable(
         &self,
@@ -2879,6 +3042,8 @@ pub struct FakeCodeIntel {
     pub limits: Mutex<Vec<theodore_ports::CodeIntelLimits>>,
     /// Every query fails with this, when set.
     pub fail: Mutex<Option<theodore_ports::CodeIntelError>>,
+    /// `Workspace::servers` of the last `open`.
+    pub last_servers: Mutex<std::collections::BTreeMap<String, String>>,
 }
 
 impl FakeCodeIntel {
@@ -2914,6 +3079,7 @@ impl FakeCodeIntel {
 #[async_trait]
 impl theodore_ports::CodeIntelPort for FakeCodeIntel {
     async fn open(&self, ws: theodore_ports::Workspace) -> theodore_ports::CodeIntelResult<()> {
+        self.last_servers.lock().unwrap().clone_from(&ws.servers);
         let langs: Vec<&str> = ws.languages.iter().map(|l| l.as_str()).collect();
         self.record(format!(
             "open {} {:?} [{}]",
@@ -3079,6 +3245,12 @@ impl theodore_ports::CodeIntelPort for FakeCodeIntel {
     }
     async fn file_changed(&self, root: &Path, path: &str) {
         self.record(format!("file_changed {} {path}", root.display()));
+    }
+    async fn warm(&self, root: &Path) {
+        self.record(format!("warm {}", root.display()));
+    }
+    async fn set_lsp(&self, root: &Path, on: bool) {
+        self.record(format!("set_lsp {} {on}", root.display()));
     }
     async fn status(
         &self,

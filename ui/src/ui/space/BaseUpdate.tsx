@@ -12,6 +12,7 @@ import { observer } from 'mobx-react-lite';
 import type { Space, SpaceBaseStatus } from '../../gen/contract';
 import { api } from '../../core/api';
 import { useRootStore } from '../../stores/context';
+import { useProjectAutoRefresh } from '../project/freshness';
 
 /** "Base moved: 3 commits behind", or `null` when there is nothing to
  *  show (up to date, resolving, archived). */
@@ -40,13 +41,48 @@ export function resolvingText(
     : `Resolving conflicts with ${space.base}${where}`;
 }
 
+/** The success toast after Update, Complete merge or Abort; `null` while
+ *  it still resolves (the banner says so). */
+export function updateOutcome(
+  which: 'update' | 'complete' | 'abort',
+  after: Pick<Space, 'base' | 'updating'>,
+): string | null {
+  if (which === 'abort') return 'Update aborted: back where it started';
+  if (after.updating) return null;
+  return which === 'update'
+    ? `Updated from ${after.base}`
+    : `Merged ${after.base} into the space`;
+}
+
+/** How often an open space page asks `space_base_status` again (a read of
+ *  the copy on this Mac: a few ms). */
+export const BASE_STATUS_POLL_MS = 60_000;
+
 /** The base's distance, re-read when the space or its project's copy
- *  changes (a turn, an update, the poller's fetch). */
-function useBaseStatus(space: Space): SpaceBaseStatus | null {
+ *  changes (a turn, an update, the poller's fetch), every minute while the
+ *  page is open, and when the window comes back to the front: a local
+ *  folder's base moves with a commit made there, which nothing else tells. */
+export function useBaseStatus(space: Space): SpaceBaseStatus | null {
   const store = useRootStore();
-  const fetchedAt = store.models.projects.get(space.project)?.last_fetched_at;
+  const project = store.models.projects.get(space.project) ?? null;
+  const fetchedAt = project?.last_fetched_at;
   const [status, setStatus] = useState<SpaceBaseStatus | null>(null);
+  const [focused, setFocused] = useState(0);
   const live = space.status !== 'archived' && space.status !== 'running';
+  // Opening the page fetches a project a few minutes stale, as its own
+  // page does: the base may have moved since (the stamp re-reads below).
+  useProjectAutoRefresh(project);
+  useEffect(() => {
+    const again = () => setFocused((n) => n + 1);
+    window.addEventListener('focus', again);
+    // And now and then while the page stays open: a PR refresh fetches the
+    // copy without stamping the project.
+    const poll = setInterval(again, BASE_STATUS_POLL_MS);
+    return () => {
+      window.removeEventListener('focus', again);
+      clearInterval(poll);
+    };
+  }, []);
   useEffect(() => {
     if (!live) return;
     let on = true;
@@ -57,8 +93,23 @@ function useBaseStatus(space: Space): SpaceBaseStatus | null {
     return () => {
       on = false;
     };
-  }, [space.id, space.base_sha, space.head_sha, fetchedAt, live]);
+  }, [space.id, space.base_sha, space.head_sha, fetchedAt, live, focused]);
   return status;
+}
+
+/** `baseMovedLabel`'s words, in parts a narrow header can drop
+ *  (`.base-moved-lead`, `.base-moved-long`: "2 behind"). */
+export function BaseMovedText({ behind }: { behind: number }) {
+  return (
+    <>
+      <span className="base-moved-lead">Base moved: </span>
+      {behind}
+      <span className="base-moved-long">
+        {behind === 1 ? ' commit' : ' commits'}
+      </span>{' '}
+      behind
+    </>
+  );
 }
 
 /** Header: "Base moved: N commits behind" with Update. */
@@ -67,10 +118,11 @@ export const BaseMoved = observer(function BaseMoved({
 }: {
   space: Space;
 }) {
+  const store = useRootStore();
   const status = useBaseStatus(space);
   const [busy, setBusy] = useState(false);
   const label = baseMovedLabel(space, status);
-  if (!label) return null;
+  if (!label || !status) return null;
   return (
     <Tooltip>
       <Button
@@ -83,12 +135,16 @@ export const BaseMoved = observer(function BaseMoved({
           setBusy(true);
           void api
             .updateSpaceFromBase(space.id)
+            .then((s) => {
+              const done = updateOutcome('update', s);
+              if (done) store.ephemeral.toast(done, 'info');
+            })
             .catch(() => {})
             .finally(() => setBusy(false));
         }}
       >
         <CodeMerge className="size-3.5" />
-        {label} · Update
+        <BaseMovedText behind={status.behind} /> · Update
       </Button>
       <Tooltip.Content>
         Merges {space.base} into this space. Conflicts go to the agent; pushed
@@ -104,6 +160,7 @@ export const UpdatingBanner = observer(function UpdatingBanner({
 }: {
   space: Space;
 }) {
+  const store = useRootStore();
   const [busy, setBusy] = useState<'complete' | 'abort' | null>(null);
   const text = resolvingText(space);
   if (!text) return null;
@@ -114,10 +171,19 @@ export const UpdatingBanner = observer(function UpdatingBanner({
       which === 'complete'
         ? api.updateSpaceFromBase(space.id)
         : api.abortSpaceUpdate(space.id);
-    void call.catch(() => {}).finally(() => setBusy(null));
+    void call
+      .then((s) => {
+        const done = updateOutcome(which, s);
+        if (done) store.ephemeral.toast(done, 'info');
+      })
+      .catch(() => {})
+      .finally(() => setBusy(null));
   };
   return (
-    <Alert status="warning" className="space-updating mx-3 mt-3 items-center">
+    <Alert
+      status="warning"
+      className="space-updating mx-3 mt-3 w-auto shrink-0 items-center"
+    >
       <Alert.Content>
         <Alert.Description>
           {text}. Theodore commits the merge once no conflict markers are left.
@@ -136,9 +202,9 @@ export const UpdatingBanner = observer(function UpdatingBanner({
       <Button
         size="sm"
         variant="ghost"
-        className="shrink-0"
+        className="space-update-abort shrink-0"
         isPending={busy === 'abort'}
-        isDisabled={running || busy !== null}
+        isDisabled={busy !== null}
         onPress={() => act('abort')}
       >
         Abort

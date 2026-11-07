@@ -8,7 +8,7 @@
  * writing agent stays idle while "Reviewing…" shows here.
  */
 import { useEffect, useState } from 'react';
-import { ChevronDown, Sparkles } from '@gravity-ui/icons';
+import { ChevronDown, Eye, Sparkles } from '@gravity-ui/icons';
 import { Button, Popover } from '@heroui/react';
 import { observer } from 'mobx-react-lite';
 import type { AgentId, Space } from '../../gen/contract';
@@ -87,7 +87,9 @@ export const ReviewMenu = observer(function ReviewMenu({
       <Button
         size="sm"
         variant="secondary"
-        className="gap-1.5 rounded-r-none"
+        // A narrow header keeps the eye and drops the word (styles.css).
+        className="space-review-open btn-collapsible-narrow gap-1.5 rounded-r-none"
+        aria-label="Review"
         isDisabled={opening || archived}
         onPress={() => {
           setOpening(true);
@@ -98,8 +100,8 @@ export const ReviewMenu = observer(function ReviewMenu({
             .finally(() => setOpening(false));
         }}
       >
-        {reviewing && <Spinner />}
-        Review
+        {reviewing ? <Spinner /> : <Eye className="size-3.5" />}
+        <span className="btn-label-narrow">Review</span>
       </Button>
       <Popover isOpen={menuOpen} onOpenChange={setMenuOpen}>
         <Button

@@ -5,8 +5,14 @@
  * the live reply still being written. Each chat adds its own bits through
  * slots (file:line chips, undo, a turn's check); Stop is the composer's.
  */
-import { useState, type ReactNode, type RefObject } from 'react';
-import { Check, Copy, ThumbsDown, ThumbsUp } from '@gravity-ui/icons';
+import { useState, type ReactNode } from 'react';
+import {
+  ArrowDown,
+  Check,
+  Copy,
+  ThumbsDown,
+  ThumbsUp,
+} from '@gravity-ui/icons';
 import { Alert, Button, Tooltip, Typography } from '@heroui/react';
 import { observer } from 'mobx-react-lite';
 import type {
@@ -20,22 +26,50 @@ import { MessageAttachments } from './attachments';
 import { AgentTag, Btn } from './bits';
 import { LiveText } from './RunLive';
 import { ToolCalls } from './ToolCalls';
+import {
+  LiveTimeline,
+  LiveTimer,
+  TurnActivity,
+  TurnFiles,
+  TurnFooter,
+} from './TurnTimeline';
+import { useChatScroll } from './useChatScroll';
 
-/** The scrolling log; `end` marks its bottom for scroll-to-latest. A wide
- *  page keeps a reading width; a narrow panel uses all of it. */
+/** The scrolling log (`useChatScroll`). A wide page keeps a reading width; a
+ *  narrow panel uses all of it. */
 export function ChatLog({
-  end,
+  scope,
   children,
 }: {
-  end: RefObject<HTMLDivElement | null>;
+  /** Keeps the scroll position per this id. */
+  scope?: string;
   children: ReactNode;
 }) {
+  const { scroller, content, away, jump } = useChatScroll(scope);
   return (
-    <div className="chat-log flex min-h-0 flex-1 flex-col overflow-auto">
-      <div className="mx-auto flex w-full max-w-[860px] flex-1 flex-col gap-5 px-4 py-5">
-        {children}
-        <div ref={end} />
+    <div className="relative flex min-h-0 flex-1 flex-col">
+      <div
+        ref={scroller}
+        className="chat-log flex min-h-0 flex-1 flex-col overflow-auto"
+      >
+        <div
+          ref={content}
+          className="mx-auto flex w-full max-w-[860px] flex-1 flex-col gap-5 px-4 py-5"
+        >
+          {children}
+        </div>
       </div>
+      {away && (
+        <Button
+          size="sm"
+          variant="secondary"
+          className="chat-jump absolute bottom-2 left-1/2 z-10 h-7 -translate-x-1/2 gap-1 rounded-full px-3 text-xs shadow-sm"
+          onPress={jump}
+        >
+          <ArrowDown className="size-3.5" />
+          Jump to latest
+        </Button>
+      )}
     </div>
   );
 }
@@ -164,18 +198,32 @@ export function MessageActions({
   );
 }
 
-/** The agent's tag and whatever the chat puts beside it. */
+/** Whether a conversation names the agent on its replies: only when its
+ *  replies come from more than one. Computed once per list and passed down,
+ *  so a row re-renders only when the answer flips. */
+export function mixedAgents(
+  agents: Iterable<AgentId | null | undefined>,
+): boolean {
+  const seen = new Set<AgentId>();
+  for (const a of agents) if (a) seen.add(a);
+  return seen.size > 1;
+}
+
+/** The agent's tag (when `tagged`) and whatever the chat puts beside it. */
 function AgentHeader({
   agent,
+  tagged,
   badges,
 }: {
   agent: AgentId | null | undefined;
+  tagged?: boolean;
   badges?: ReactNode;
 }) {
-  if (!agent && !badges) return null;
+  const named = tagged && agent ? agent : null;
+  if (!named && !badges) return null;
   return (
     <div className="flex min-w-0 flex-wrap items-center gap-2">
-      {agent && <AgentTag id={agent} />}
+      {named && <AgentTag id={named} />}
       {badges}
     </div>
   );
@@ -190,12 +238,15 @@ export function UserBubble({
   text,
   refs,
   attachments,
+  badges,
   className = '',
 }: {
   id?: string;
   text: string;
   refs?: ReactNode;
   attachments?: Attachment[] | null;
+  /** Undo on a Revert, which reads as your own message. */
+  badges?: ReactNode;
   className?: string;
 }) {
   return (
@@ -205,6 +256,9 @@ export function UserBubble({
       className={`chat-message msg user flex justify-end ${className}`}
     >
       <div className="flex max-w-[85%] flex-col items-end gap-1.5">
+        {badges && (
+          <div className="flex items-center gap-1.5 text-xs">{badges}</div>
+        )}
         {refs && (
           <div className="flex max-w-full flex-wrap justify-end gap-1.5">
             {refs}
@@ -221,16 +275,22 @@ export function UserBubble({
   );
 }
 
-/** One stored message. Yours: a `UserBubble`. The agent's: its tag, the markdown reply, its chips and files,
- *  `after` (a turn's steps, its check), then copy / vote. A run that
- *  failed shows why instead, with Retry when `onRetryFailed` is given. */
+/** `ChatMessage.failed` of a run you stopped (the core's "stopped"). */
+const STOPPED = 'stopped';
+
+/** One stored message. Yours: a `UserBubble`. The agent's: its tag, a space
+ *  turn's activity, the markdown reply, its chips and files, `after` (a turn's
+ *  check), then how long it took, copy / vote and the files it changed. A run
+ *  that failed shows why instead, with Retry when `onRetryFailed` is given. */
 export function ChatMessage({
   m,
   refs,
   badges,
+  tagged,
   after,
   onAskAgain,
   onRetryFailed,
+  onOpenFile,
   className = '',
 }: {
   m: Message;
@@ -238,11 +298,15 @@ export function ChatMessage({
   refs?: ReactNode;
   /** Beside the agent's tag (undone, Undo). */
   badges?: ReactNode;
+  /** Name the agent: this chat has replies from more than one. */
+  tagged?: boolean;
   /** Under the agent's reply, before its actions. */
   after?: ReactNode;
   /** "Ask again" under the agent's reply. */
   onAskAgain?: () => void;
   onRetryFailed?: () => void;
+  /** A changed file's chip: the Changes pane on it; `null`: just the pane. */
+  onOpenFile?: (path: string | null) => void;
   className?: string;
 }) {
   if (m.author.kind === 'me') {
@@ -252,6 +316,7 @@ export function ChatMessage({
         text={m.text}
         refs={refs}
         attachments={m.attachments}
+        badges={badges}
         className={className}
       />
     );
@@ -263,8 +328,24 @@ export function ChatMessage({
       className={`chat-message msg agent flex gap-3 ${className}`}
     >
       <div className="flex min-w-0 flex-1 flex-col gap-2 pt-1">
-        <AgentHeader agent={m.author.agent} badges={badges} />
-        {m.failed ? (
+        <AgentHeader agent={m.author.agent} tagged={tagged} badges={badges} />
+        {!!m.activity?.length && (
+          <TurnActivity
+            reply={m.id}
+            steps={m.activity}
+            pinLastText={!!m.text_in_steps || !m.text.trim()}
+            keepText={!!m.failed}
+          />
+        )}
+        {m.failed && m.text && !m.text_in_steps && (
+          <div className="text-sm leading-relaxed">
+            <Md text={m.text} />
+          </div>
+        )}
+        {m.failed === STOPPED ? (
+          // You stopped it: no failure, just where it ended.
+          <span className="agent-stopped text-xs text-muted">Stopped</span>
+        ) : m.failed ? (
           <Alert status="danger" className="agent-failed">
             <Alert.Indicator />
             <Alert.Content>
@@ -282,31 +363,49 @@ export function ChatMessage({
           </Alert>
         ) : (
           <>
-            <div className="text-sm leading-relaxed">
-              <Md text={m.text} />
-            </div>
+            {!m.text_in_steps && (
+              <div className="text-sm leading-relaxed">
+                <Md text={m.text} />
+              </div>
+            )}
             {refs && <div className="flex flex-wrap gap-1.5">{refs}</div>}
             <MessageAttachments attachments={m.attachments} />
           </>
         )}
         {after}
-        {!m.failed && <MessageActions text={m.text} onRetry={onAskAgain} />}
+        {(!m.failed || m.duration_ms != null) && (
+          <div className="flex flex-wrap items-center gap-2">
+            {m.duration_ms != null && (
+              <TurnFooter
+                at={m.at}
+                durationMs={m.duration_ms}
+                model={m.model}
+                agent={m.author.agent}
+              />
+            )}
+            {!m.failed && <MessageActions text={m.text} onRetry={onAskAgain} />}
+            {!!m.changed_files?.length && (
+              <TurnFiles files={m.changed_files} onOpen={onOpenFile} />
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
-/** The reply still being written: the agent's tag, its text as it streams
- *  (dots until there is some), its steps. Stalled: a note instead of the
- *  text, with Retry when `onRetry` is given. No Stop here — the composer
- *  has it. `text={false}`: the reply is stored already, only the steps
- *  still run. */
+/** The reply still being written: the agent's tag, then its text as it
+ *  streams (dots until there is some) and its steps, or with `timeline` both
+ *  as one list in the order they came, the time so far under them. Stalled: a
+ *  note under them, with Retry when `onRetry` is given. No Stop here — the
+ *  composer has it. */
 export const ChatLive = observer(function ChatLive({
   run,
   agent,
   badges,
-  text = true,
-  follow,
+  tagged,
+  timeline = false,
+  since,
   onRetry,
   className = '',
   data,
@@ -315,9 +414,12 @@ export const ChatLive = observer(function ChatLive({
   run: string | null;
   agent?: AgentId | null;
   badges?: ReactNode;
-  text?: boolean;
-  /** Kept in view as the text grows. */
-  follow?: RefObject<HTMLElement | null>;
+  /** Name the agent: this chat has replies from more than one. */
+  tagged?: boolean;
+  /** A space turn: text and steps chronological. */
+  timeline?: boolean;
+  /** When a space turn started, for its timer. */
+  since?: number;
   onRetry?: () => void;
   className?: string;
   /** `data-*` attributes for the bubble. */
@@ -325,7 +427,8 @@ export const ChatLive = observer(function ChatLive({
 }) {
   const store = useRootStore();
   const stalled = run != null && store.ephemeral.stalled.has(run);
-  const tools = (run && store.ephemeral.runLog.get(run)) || [];
+  const tools = (!timeline && run && store.ephemeral.runLog.get(run)) || [];
+  const waiting = stalled ? null : <Dots />;
   return (
     <div
       data-variant="agent"
@@ -333,17 +436,21 @@ export const ChatLive = observer(function ChatLive({
       {...data}
     >
       <div className="flex min-w-0 flex-1 flex-col gap-2 pt-1">
-        <AgentHeader agent={agent} badges={badges} />
-        {stalled ? (
-          <StalledHint />
-        ) : text && run ? (
-          <LiveText run={run} fallback={<Dots />} follow={follow} />
-        ) : tools.length === 0 ? (
-          <Dots />
-        ) : null}
+        <AgentHeader agent={agent} tagged={tagged} badges={badges} />
+        {!run ? (
+          waiting
+        ) : timeline ? (
+          <LiveTimeline run={run} fallback={waiting} />
+        ) : (
+          <LiveText run={run} fallback={waiting} />
+        )}
         {run && tools.length > 0 && (
           <ToolCalls tools={tools} running turn={run} />
         )}
+        {timeline && (run != null || since != null) && (
+          <LiveTimer run={run} since={since} />
+        )}
+        {stalled && <StalledHint />}
         {stalled && onRetry && (
           <Button
             size="sm"

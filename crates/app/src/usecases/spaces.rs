@@ -27,6 +27,7 @@ use crate::usecases::live::LiveRun;
 use crate::usecases::projects::stable_hash_u32;
 use crate::usecases::skills::{expand_skill, space_skill_content};
 use crate::usecases::space_queue::TurnEnd;
+use crate::usecases::turn_steps::TurnSteps;
 
 /// The `chat_message.pr` key a space's transcript is stored under.
 pub fn space_chat_key(space: &str) -> PrId {
@@ -74,7 +75,7 @@ impl Core {
             None => {
                 let siblings = self.list_spaces(Some(project.id.clone())).await?;
                 let taken: Vec<&str> = siblings.iter().map(|s| s.name.as_str()).collect();
-                unique_name(&slug(&req.goal), &taken)
+                unique_name(&slug(name_seed(&req.goal, start.title.as_deref())), &taken)
             }
         };
         let branch = match (&start.adopt, req.branch.clone()) {
@@ -129,16 +130,21 @@ impl Core {
             (_, true) => {}
             (Some(root), false) => {
                 let (root, dest) = (PathBuf::from(root), wt.path.clone());
-                notes.extend(
-                    tokio::task::spawn_blocking(move || {
-                        crate::usecases::space_commands::copy_into(&root, &dest, &copy)
-                    })
-                    .await
-                    .map_err(AppError::join)?,
-                );
+                let (copy_notes, files) = tokio::task::spawn_blocking(move || {
+                    crate::usecases::space_commands::copy_into(&root, &dest, &copy)
+                })
+                .await
+                .map_err(AppError::join)?;
+                notes.extend(copy_notes);
+                // Local files, secrets by default: for this space to use,
+                // never for its checkpoints or what it ships.
+                self.0.deps.git.space_exclude(&wt.path, &files).await?;
             }
-            (None, false) => notes
+            // Only a `copy` someone set is worth a word: the default
+            // `.env*` has nothing to come from on a host project.
+            (None, false) if cfg.merged.config.spaces.copy.is_some() => notes
                 .push("copy: skipped, this project has no local checkout to copy from".to_string()),
+            (None, false) => {}
         }
         let ports_guard = self.0.ports_lock.lock().await;
         let ports = self
@@ -184,7 +190,10 @@ impl Core {
             sent_feedback: Vec::new(),
             created_at: now,
             updated_at: now,
-            title: None,
+            attention_at: None,
+            // An adopted branch or PR with no note has no goal to title it
+            // by: it is called by its branch, or by "#<n> <title>".
+            title: if has_goal { None } else { start.title.clone() },
             handoff_summary: None,
             progress: None,
             updating: None,
@@ -248,7 +257,7 @@ impl Core {
         // A better name and a chat title, from the chat agent (never turn
         // 1's own, which the dialog may have overridden): backgrounded, so
         // it never delays turn 1 (`space_naming`).
-        if !space.goal.is_empty() {
+        if crate::usecases::space_naming::has_something_to_name(&space.goal) {
             let configured = self
                 .setting_agent_scoped("agents.chat", Some(&project.repo.slug()), AgentId::Claude)
                 .await;
@@ -336,6 +345,11 @@ impl Core {
             failed: None,
             attachments,
             queued: None,
+            activity: vec![],
+            duration_ms: None,
+            changed_files: vec![],
+            model: None,
+            text_in_steps: false,
         };
         self.start_turn(space, &req, message, false, prompt).await
     }
@@ -563,12 +577,24 @@ impl Core {
         }
         let project = self.space_project(&space).await?;
         let repo_path = self.ensure_project_cache(&project).await?;
+        let worktree_exists = Path::new(&space.worktree).exists();
+        // Refused over a rebase or merge left unfinished: said before anything
+        // stops, so the commands and terminals go on while you finish it.
+        if worktree_exists
+            && let Ok(Some(busy)) = self
+                .0
+                .deps
+                .git
+                .worktree_busy(Path::new(&space.worktree))
+                .await
+        {
+            return Err(theodore_ports::GitError::Busy(busy).into());
+        }
         // docs/config.md: stop `run`, checkpoint, `archive`, then remove.
         self.stop_space_commands(&space.id).await;
         // docs/spaces.md "Terminal": a shell must not keep writing into a
         // worktree about to be removed.
         self.close_space_terminals(&space.id).await;
-        let worktree_exists = Path::new(&space.worktree).exists();
         if worktree_exists {
             let saved = self
                 .0
@@ -794,8 +820,13 @@ impl Core {
             Some(_) => PathBuf::from(&space.worktree),
             None => self.0.deps.git.worktree(&pr_ref, &head).await?.path,
         };
-        self.finish_open_with(pr_ref, detail, revision, repo_path, worktree, group)
-            .await
+        let opened = self
+            .finish_open_with(pr_ref, detail, revision, repo_path, worktree, group)
+            .await?;
+        if !group {
+            self.carry_grouping(&opened.pr, &opened.head).await;
+        }
+        Ok(opened)
     }
 
     pub(crate) async fn space_row(&self, id: &str) -> AppResult<Space> {
@@ -871,7 +902,7 @@ fn resumable_session(space: &Space, agent: AgentId, cwd: &Path) -> Option<String
     space
         .agent_session
         .as_ref()
-        .filter(|s| s.agent == agent && Path::new(&s.cwd) == cwd)
+        .filter(|s| s.agent == agent && super::code_intel::same_path(Path::new(&s.cwd), cwd))
         .map(|s| s.id.clone())
 }
 
@@ -879,10 +910,20 @@ fn resumable_session(space: &Space, agent: AgentId, cwd: &Path) -> Option<String
 /// Claude Code's result `errors`, Codex's stderr.
 const SESSION_GONE: [&str; 2] = ["no conversation found", "no rollout found"];
 
+/// A stopped run's events end once its process is gone (SIGTERM, 5 s, then
+/// SIGKILL); this only bounds a runner that never closes them.
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// One agent run of a turn, streamed to the UI.
 #[derive(Default)]
 struct Streamed {
+    /// Its text blocks so far; once it ends on a final text, that.
     text: String,
+    /// `text` is the run's final text.
+    answered: bool,
+    /// Deltas of the text block not finished yet.
+    partial: String,
+    steps: TurnSteps,
     error: Option<String>,
     /// `error` says the resumed session is gone.
     session_gone: bool,
@@ -900,6 +941,7 @@ async fn stream_run(
 ) -> Streamed {
     let agent = req.agent;
     let resumed = req.resume.is_some();
+    let cwd = req.cwd.clone();
     let mut out = Streamed::default();
     let mut run = match core.0.deps.agents.run_steerable(req).await {
         Ok((run, steer)) => {
@@ -914,22 +956,53 @@ async fn stream_run(
     };
     let mut live = LiveRun::new(run_id, agent);
     let _unsteer = Unsteer { core, run: run_id };
+    // Stopped: the turn goes on until the process is gone, so its checkpoint
+    // has the last writes and nothing starts on top of a dying agent.
+    let mut give_up: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => { run.cancel.cancel(); break; }
+            _ = cancel.cancelled(), if give_up.is_none() => {
+                run.cancel.cancel();
+                give_up = Some(tokio::time::Instant::now() + STOP_WAIT);
+            }
+            _ = tokio::time::sleep_until(give_up.unwrap_or_else(tokio::time::Instant::now)),
+                if give_up.is_some() =>
+            {
+                tracing::warn!(
+                    error.code = "space.stop_timed_out",
+                    agent = agent.as_str(),
+                    "a stopped agent's events didn't end in time"
+                );
+                break;
+            }
             event = run.events.recv() => {
                 let Some(event) = event else { break };
+                // How its process ended isn't the turn's answer.
+                if give_up.is_some()
+                    && matches!(event, AgentEvent::Done { .. } | AgentEvent::Error { .. })
+                {
+                    continue;
+                }
+                let event = with_worktree_paths(event, &cwd);
                 // Quiet because it waits on your answer, not stuck.
                 if !(event == AgentEvent::Stalled && core.asking(run_id)) {
                     live.show(core, &event);
                 }
+                out.steps.record(&event);
                 match event {
-                    AgentEvent::Text { text: t } => out.text.push_str(&t),
+                    AgentEvent::Text { text: t } => {
+                        // The whole block: it replaces its own deltas.
+                        out.partial.clear();
+                        push_block(&mut out.text, &t);
+                    }
+                    AgentEvent::TextDelta { text: t } => out.partial.push_str(&t),
                     AgentEvent::Session { id } => out.session = Some(id),
                     AgentEvent::Plan { text } => out.plan = Some(text),
                     AgentEvent::Done { final_text, .. } => {
                         if !final_text.is_empty() {
                             out.text = final_text;
+                            out.answered = true;
+                            out.partial.clear();
                         }
                         break;
                     }
@@ -939,8 +1012,9 @@ async fn stream_run(
                         out.error = Some(message);
                         break;
                     }
-                    AgentEvent::TextDelta { .. }
-                    | AgentEvent::Thinking { .. }
+                    AgentEvent::Thinking { .. }
+                    | AgentEvent::TextStart
+                    | AgentEvent::Nested { .. }
                     | AgentEvent::ToolCall { .. }
                     | AgentEvent::ToolResult { .. }
                     | AgentEvent::Stalled
@@ -949,7 +1023,65 @@ async fn stream_run(
             }
         }
     }
+    // Cut off mid-block (Stop): the deltas are all there is of it.
+    let partial = std::mem::take(&mut out.partial);
+    out.steps.record_cut_off(&partial);
+    push_block(&mut out.text, &partial);
     out
+}
+
+/// Blocks read as paragraphs, not as one run-on line.
+fn push_block(text: &mut String, block: &str) {
+    if !text.is_empty() && !block.is_empty() {
+        text.push_str("\n\n");
+    }
+    text.push_str(block);
+}
+
+/// A tool call's path as shown: relative to the worktree, whose own directory
+/// (the space's id) means nothing to a reader. `/tmp` paths come back as
+/// `/private/tmp` on macOS.
+fn with_worktree_paths(event: AgentEvent, cwd: &Path) -> AgentEvent {
+    if let AgentEvent::Nested { parent, event } = event {
+        return AgentEvent::Nested {
+            parent,
+            event: Box::new(with_worktree_paths(*event, cwd)),
+        };
+    }
+    let AgentEvent::ToolCall {
+        id,
+        name,
+        mut input,
+    } = event
+    else {
+        return event;
+    };
+    let root = cwd.display().to_string();
+    let private = format!("/private{root}");
+    for key in ["file_path", "path", "notebook_path", "file"] {
+        let Some(path) = input.get(key).and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        // The worktree itself (a search over all of it): no "where" to say,
+        // rather than its internal path under the data dir.
+        if [root.as_str(), private.as_str()]
+            .iter()
+            .any(|r| path.trim_end_matches('/') == r.trim_end_matches('/'))
+        {
+            if let Some(obj) = input.as_object_mut() {
+                obj.remove(key);
+            }
+            continue;
+        }
+        let relative = [root.as_str(), private.as_str()]
+            .iter()
+            .find_map(|r| path.strip_prefix(r)?.strip_prefix('/'))
+            .map(str::to_string);
+        if let Some(relative) = relative {
+            input[key] = serde_json::Value::String(relative);
+        }
+    }
+    AgentEvent::ToolCall { id, name, input }
 }
 
 /// Nothing more is steered into a run once its events stop.
@@ -994,6 +1126,7 @@ async fn drive_turn(core: &Core, turn: Turn) {
         mcp: mcp.clone(),
     };
     let resumed = resume.is_some();
+    let asked_model = model.clone();
     let mut req = AgentRequest {
         agent,
         prompt,
@@ -1034,6 +1167,8 @@ async fn drive_turn(core: &Core, turn: Turn) {
     }
     let Streamed {
         text,
+        answered,
+        steps,
         mut error,
         session,
         plan,
@@ -1046,7 +1181,12 @@ async fn drive_turn(core: &Core, turn: Turn) {
     let plan = (mode == SpaceMode::Plan && error.is_none() && !cancel.is_cancelled())
         .then(|| crate::usecases::space_plan::plan_of(plan, &text))
         .flatten();
+    // Without a final text the blocks are the reply, unless a plan took over.
+    let blocks = (!answered).then(|| text.clone());
     let text = plan.clone().unwrap_or(text);
+    // A plan shows as the reply, even when its blocks are all it is.
+    let told_apart = plan.is_some() || blocks.as_ref() != Some(&text);
+    let (activity, text_in_steps) = steps.finish(told_apart.then_some(text.as_str()));
     // The session this turn ran in is the one the next turn continues. A
     // resumed run that reported none (it failed to start) leaves it as is;
     // a new one that reported none (Gemini) means there is none to continue.
@@ -1075,6 +1215,17 @@ async fn drive_turn(core: &Core, turn: Turn) {
             agent = agent.as_str(),
             duration_ms = ms,
             "space turn couldn't reach the agent"
+        );
+    } else if let (Some(e), false) = (&error, cancelled)
+        && theodore_ports::signed_out_message_in(e).is_some()
+    {
+        // The agent has no credentials: the user's to fix, not a bug.
+        tracing::info!(
+            error.code = theodore_ports::AGENT_SIGNED_OUT_CODE,
+            space = %space.id,
+            agent = agent.as_str(),
+            duration_ms = ms,
+            "space turn couldn't sign in to the agent"
         );
     } else if let (Some(e), false) = (&error, cancelled) {
         tracing::warn!(
@@ -1131,17 +1282,30 @@ async fn drive_turn(core: &Core, turn: Turn) {
         }
     };
 
+    // A merge's turn holds the base's changes too: not what the agent did.
+    let changed_files = match &checkpoint {
+        Some(cp) if cp.sha != space.head_sha && saved.base_before.is_none() => {
+            crate::usecases::turn_steps::changed_files(core, &cwd, &space.head_sha, &cp.sha).await
+        }
+        _ => Vec::new(),
+    };
     let key = space_chat_key(&space.id);
     let reply = ChatMessage {
         id: uuid::Uuid::new_v4().to_string(),
         pr: key,
         author: Author::Agent(agent),
-        text: if error.is_some() { String::new() } else { text },
+        // Stopped or failed: what it had written stays, above why it ended.
+        text,
         refs: vec![],
         at: core.0.deps.clock.now(),
         failed: error.clone(),
         attachments: vec![],
         queued: None,
+        activity,
+        duration_ms: Some(ms),
+        changed_files,
+        model: asked_model,
+        text_in_steps,
     };
     let head = checkpoint.as_ref().map(|cp| cp.sha.clone());
     let changed = head.as_ref().is_some_and(|h| *h != space.head_sha);
@@ -1219,8 +1383,10 @@ async fn drive_turn(core: &Core, turn: Turn) {
         action: SyncActionCode::C,
         data: Some(patch),
     });
-    // Stopped or failed: whatever is queued waits for you.
-    let end = if cancelled || error.is_some() {
+    // Stopped (the checkpoint took a while: maybe just now), failed, or its
+    // checkpoint skipped: whatever is queued waits for you, and the next turn
+    // doesn't clear what the space says about it.
+    let end = if cancel.is_cancelled() || error.is_some() || skipped.is_some() {
         TurnEnd::Interrupted
     } else {
         TurnEnd::Done
@@ -1336,6 +1502,17 @@ fn new_space_id() -> String {
 /// `true` for a space review's `PrRef::host_id`.
 pub(crate) fn is_space_ref(host_id: &str) -> bool {
     host_id.starts_with(SPACE_REF_PREFIX)
+}
+
+/// What a space's instant name is made of: the goal, or, with none (a
+/// branch or PR started without a note), what the start resolved to.
+/// Without either, an empty seed, which `slug` turns into "space".
+pub(crate) fn name_seed<'a>(goal: &'a str, started_as: Option<&'a str>) -> &'a str {
+    if goal.trim().is_empty() {
+        started_as.unwrap_or("")
+    } else {
+        goal
+    }
 }
 
 /// The first few words of `text`, lowercased and dash-joined:
@@ -1543,9 +1720,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_search_of_the_whole_worktree_names_no_internal_path() {
+        let cwd = Path::new("/data/spaces/795226850cea");
+        let call = |path: &str| AgentEvent::ToolCall {
+            id: "g".into(),
+            name: "Grep".into(),
+            input: serde_json::json!({ "pattern": "the", "path": path }),
+        };
+        let input = |e: AgentEvent| match e {
+            AgentEvent::ToolCall { input, .. } => input,
+            other => panic!("{other:?}"),
+        };
+        for root in [
+            "/data/spaces/795226850cea",
+            "/data/spaces/795226850cea/",
+            "/private/data/spaces/795226850cea",
+        ] {
+            let got = input(with_worktree_paths(call(root), cwd));
+            assert_eq!(got, serde_json::json!({ "pattern": "the" }), "{root}");
+        }
+        let got = input(with_worktree_paths(
+            call("/data/spaces/795226850cea/src"),
+            cwd,
+        ));
+        assert_eq!(got["path"], "src");
+        let got = input(with_worktree_paths(call("/elsewhere"), cwd));
+        assert_eq!(got["path"], "/elsewhere");
+    }
+
+    #[test]
     fn ultracode_opens_the_prompt_only_when_on() {
         assert_eq!(with_ultracode("Fix it".into(), true), "ultracode\n\nFix it");
         assert_eq!(with_ultracode("Fix it".into(), false), "Fix it");
+    }
+
+    #[test]
+    fn a_noteless_start_is_named_after_its_branch_or_pr() {
+        assert_eq!(
+            slug(name_seed("", Some("alice/fix-login"))),
+            "alice-fix-login"
+        );
+        assert_eq!(
+            slug(name_seed("  ", Some("#118 Fix login"))),
+            "118-fix-login"
+        );
+        assert_eq!(
+            slug(name_seed("Fix the thing", Some("alice/x"))),
+            "fix-the-thing"
+        );
+        assert_eq!(slug(name_seed("", None)), "space");
     }
 
     #[test]
@@ -1612,6 +1835,11 @@ mod tests {
             failed: None,
             attachments: vec![],
             queued: None,
+            activity: vec![],
+            duration_ms: None,
+            changed_files: vec![],
+            model: None,
+            text_in_steps: false,
         }
     }
 

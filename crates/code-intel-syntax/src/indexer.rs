@@ -91,6 +91,8 @@ pub struct Progress {
     pub pending_languages: Vec<LanguageId>,
     /// Languages in the worktree without a grammar.
     pub missing_languages: Vec<LanguageId>,
+    /// Files not indexed for being over the size limit, by path.
+    pub too_large: Vec<String>,
 }
 
 impl Progress {
@@ -646,7 +648,11 @@ impl WorkspaceIndex {
         let st = self.shared.lock();
         let mut indexed = 0;
         let mut indexable = 0;
+        let mut too_large = Vec::new();
         for f in st.snapshot.files() {
+            if st.too_large.contains(&f.blob_sha) {
+                too_large.push(f.path.clone());
+            }
             let Some(lang) = &f.language else {
                 continue;
             };
@@ -674,6 +680,7 @@ impl WorkspaceIndex {
             indexable,
             pending_languages: pending,
             missing_languages: missing,
+            too_large,
         }
     }
 

@@ -6,7 +6,12 @@
  * panel), so every chat with an agent reads the same.
  */
 import { useEffect, useRef, useState, type ReactNode, type Ref } from 'react';
-import { ArrowUp, ChevronDown, Square } from '@gravity-ui/icons';
+import {
+  ArrowRightToLine,
+  ArrowUp,
+  ChevronDown,
+  Square,
+} from '@gravity-ui/icons';
 import {
   Button,
   Dropdown,
@@ -201,7 +206,7 @@ export function Composer({
               }
             }}
           />
-          <InputGroup.Suffix className="flex w-full items-center gap-1.5 px-2.5 py-0">
+          <InputGroup.Suffix className="composer-suffix flex w-full items-center gap-1.5 px-2.5 py-0">
             {attachments && (
               <AttachButton onFiles={attachments.add} isDisabled={disabled} />
             )}
@@ -232,14 +237,15 @@ export function Composer({
                   size="sm"
                   variant="tertiary"
                   aria-label="Send now"
-                  className="shrink-0 rounded-full px-3 text-xs"
+                  className="send-now shrink-0 rounded-full px-3 text-xs"
                   isDisabled={empty || disabled}
                   onPress={onSendNow}
                 >
-                  Send now
+                  <ArrowRightToLine className="send-now-icon size-3.5" />
+                  <span className="send-now-label">Send now</span>
                 </Button>
                 <Tooltip.Content>
-                  Into the running turn <K>⌘⏎</K>
+                  Send now, into the running turn <K>⌘⏎</K>
                 </Tooltip.Content>
               </Tooltip>
             )}
@@ -321,6 +327,7 @@ export function ChipMenu<T extends string>({
   selected,
   onSelect,
   isDisabled,
+  keep,
 }: {
   label: ReactNode;
   icon?: ReactNode;
@@ -329,6 +336,8 @@ export function ChipMenu<T extends string>({
   selected: T;
   onSelect: (id: T) => void;
   isDisabled?: boolean;
+  /** Never squeezed by its neighbours: the label stays whole. */
+  keep?: boolean;
 }) {
   return (
     <Dropdown>
@@ -337,7 +346,7 @@ export function ChipMenu<T extends string>({
         variant="tertiary"
         aria-label={ariaLabel}
         isDisabled={isDisabled}
-        className="min-w-0 shrink gap-1.5 rounded-full px-3 text-xs"
+        className={`gap-1.5 rounded-full px-3 text-xs ${keep ? 'shrink-0' : 'min-w-0 shrink'}`}
       >
         {icon}
         <span className="min-w-0 truncate">{label}</span>
@@ -408,8 +417,8 @@ export const AgentChip = observer(function AgentChip({
   return (
     <AgentMenu
       agents={agents}
-      selected={[current]}
-      onSelect={(next) => next[0] && onChange(next[0])}
+      selected={current}
+      onSelect={onChange}
       isDisabled={isDisabled}
       ultracode
     />

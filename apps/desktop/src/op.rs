@@ -50,6 +50,7 @@ const CHATTY: &[&str] = &[
     "host_status_for",
     "app_info",
     "merge_info",
+    "refresh_space_pr",
     "conflicts",
     "sandbox_status",
     "detect_agents",

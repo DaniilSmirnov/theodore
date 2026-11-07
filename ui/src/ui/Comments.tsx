@@ -670,42 +670,47 @@ function DraftViewInner({ d }: { d: Draft }) {
       ? `${d.anchor.start_line}–${d.anchor.line}`
       : `${d.anchor.line}`;
   return (
-    <Card className="draft max-w-[760px] gap-2 border border-warning/40 px-4 py-3">
-      <div className="flex items-center gap-1.5 text-xs text-muted">
-        <Chip size="sm" variant="soft" color="warning">
-          pending
-        </Chip>
-        draft{d.source.kind === 'agent' && <AgentTag id={d.source.agent} />}
-        <span className="tabular-nums">
-          · {d.anchor.start_line != null ? 'lines' : 'line'} {label}
+    <Card className="draft min-w-0 max-w-[760px] gap-2 border border-warning/40 px-4 py-3">
+      {/* In a narrow column (a split diff's half) the actions drop under
+       *  the label instead of running off the card's edge. */}
+      <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted">
+        <span className="draft-label flex items-center gap-1.5 whitespace-nowrap">
+          <Chip size="sm" variant="soft" color="warning">
+            pending
+          </Chip>
+          draft{d.source.kind === 'agent' && <AgentTag id={d.source.agent} />}
+          <span className="tabular-nums">
+            · {d.anchor.start_line != null ? 'lines' : 'line'} {label}
+          </span>
         </span>
-        <span className="flex-1" />
-        {!editing && (
-          <SendToAgent pr={d.pr} item={{ kind: 'draft', id: d.id }} />
-        )}
-        {editing ? (
+        <span className="draft-actions ml-auto flex items-center gap-1.5">
+          {!editing && (
+            <SendToAgent pr={d.pr} item={{ kind: 'draft', id: d.id }} />
+          )}
+          {editing ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              onPress={() => {
+                editDraft(store, d.id, text);
+                setEditing(false);
+              }}
+            >
+              save
+            </Button>
+          ) : (
+            <Button size="sm" variant="ghost" onPress={() => setEditing(true)}>
+              edit
+            </Button>
+          )}
           <Button
             size="sm"
             variant="ghost"
-            onPress={() => {
-              editDraft(store, d.id, text);
-              setEditing(false);
-            }}
+            onPress={() => removeDraft(store, d.id)}
           >
-            save
+            delete
           </Button>
-        ) : (
-          <Button size="sm" variant="ghost" onPress={() => setEditing(true)}>
-            edit
-          </Button>
-        )}
-        <Button
-          size="sm"
-          variant="ghost"
-          onPress={() => removeDraft(store, d.id)}
-        >
-          delete
-        </Button>
+        </span>
       </div>
       {editing ? (
         <div className="flex flex-col gap-1.5">
@@ -746,6 +751,8 @@ function ComposerInner({
 }: {
   pr: PrId;
   anchor: Anchor;
+  /** The code the anchor covers, every line of a range: what Suggestion
+   *  starts from, since committing it replaces exactly those lines. */
   lineText: string;
   /** Offer "Ask AI"; off where there's no AI panel to answer in. */
   askAi?: boolean;

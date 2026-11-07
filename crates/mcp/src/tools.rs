@@ -617,6 +617,8 @@ fn install_name(s: &theodore_ports::InstallState) -> String {
         S::System { .. } => "system",
         S::Installed { .. } => "installed",
         S::Unavailable => "unavailable",
+        S::NeedsRuntime { .. } => "needs_runtime",
+        S::TrustedOnly => "trusted_only",
         S::Declined => "declined",
         S::Failed { .. } => "failed",
     }

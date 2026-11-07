@@ -23,7 +23,7 @@ use theodore_domain::{
 use theodore_ports::{
     AgentEvent, BranchInfo, Clock, CommitLog, ConflictEntry, ConflictKind as PortConflictKind,
     DevicePoll, Fetched, GitError, HostError, MergeMethod as PortMergeMethod, MergeState,
-    MergeStatus, NewAction, OutboxStatus, Secrets, Store, SyncActionCode,
+    MergeStatus, NewAction, OutboxStatus, Secrets, Store, SubmittedReview, SyncActionCode,
 };
 
 use crate::testkit::{self, Fixtures, fixtures};
@@ -747,6 +747,277 @@ async fn reading_every_hunk_of_a_file_marks_it_viewed_and_enqueues_set_viewed() 
     assert_eq!(fv.state, ViewedState::Viewed);
 }
 
+/// `setFileViewed` from the UI: the Viewed checkbox's transaction.
+fn file_viewed_tx(
+    id: &str,
+    pr: &PrId,
+    path: &str,
+    state: ViewedState,
+    exists: bool,
+) -> Transaction {
+    let model_id = format!("{}:{path}", pr.0);
+    let data = serde_json::to_value(FileViewedRow {
+        pr: pr.clone(),
+        path: path.into(),
+        state,
+    })
+    .unwrap();
+    let op = if exists {
+        MutationOp::Update {
+            model: models::FILE_VIEWED.into(),
+            id: model_id,
+            data,
+        }
+    } else {
+        MutationOp::Create {
+            model: models::FILE_VIEWED.into(),
+            id: model_id,
+            data,
+        }
+    };
+    Transaction {
+        id: id.into(),
+        ops: vec![op],
+    }
+}
+
+fn set_viewed_calls(f: &Fixtures) -> Vec<(String, bool)> {
+    f.host.set_viewed_calls.lock().unwrap().clone()
+}
+
+#[tokio::test]
+async fn toggling_viewed_by_hand_syncs_both_ways_through_the_outbox() {
+    let f = fixtures();
+    let (core, _recv, pr, _head) = open_fixture_pr(&f).await;
+
+    let r = core
+        .transact(file_viewed_tx(
+            "fv-1",
+            &pr,
+            "src/lib.rs",
+            ViewedState::Viewed,
+            false,
+        ))
+        .await;
+    assert!(matches!(r, TransactionResult::Ok { .. }));
+    wait_until(|| set_viewed_calls(&f) == vec![("src/lib.rs".to_string(), true)]).await;
+
+    let r = core
+        .transact(file_viewed_tx(
+            "fv-2",
+            &pr,
+            "src/lib.rs",
+            ViewedState::Unviewed,
+            true,
+        ))
+        .await;
+    assert!(matches!(r, TransactionResult::Ok { .. }));
+    wait_until(|| set_viewed_calls(&f).len() == 2).await;
+    assert_eq!(
+        set_viewed_calls(&f)[1],
+        ("src/lib.rs".to_string(), false),
+        "Not viewed must unmark the file on the host"
+    );
+}
+
+#[tokio::test]
+async fn quick_viewed_toggles_coalesce_into_one_host_write_of_the_last_state() {
+    let f = fixtures();
+    let (core, _recv, pr, _head) = open_fixture_pr(&f).await;
+
+    // The first write fails on the network and waits out its backoff, so
+    // the toggles below land while it is still pending.
+    f.host
+        .push_set_viewed(Err(HostError::Network("timeout".into())));
+    core.transact(file_viewed_tx(
+        "fv-1",
+        &pr,
+        "src/lib.rs",
+        ViewedState::Viewed,
+        false,
+    ))
+    .await;
+    wait_until(|| {
+        f.store
+            .outbox_snapshot()
+            .first()
+            .is_some_and(|i| i.attempts >= 1 && i.status == OutboxStatus::Pending)
+    })
+    .await;
+
+    for (i, state) in [
+        ViewedState::Unviewed,
+        ViewedState::Viewed,
+        ViewedState::Unviewed,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        core.transact(file_viewed_tx(
+            &format!("fv-t{i}"),
+            &pr,
+            "src/lib.rs",
+            state,
+            true,
+        ))
+        .await;
+    }
+    assert_eq!(
+        f.store
+            .outbox_snapshot()
+            .iter()
+            .filter(|i| i.op == "set_viewed")
+            .count(),
+        1,
+        "toggles while a write is pending ride on it"
+    );
+
+    f.clock.advance(10_000);
+    wait_until(|| f.store.outbox_snapshot()[0].status == OutboxStatus::Done).await;
+    assert_eq!(
+        set_viewed_calls(&f),
+        vec![
+            ("src/lib.rs".to_string(), true),
+            ("src/lib.rs".to_string(), false),
+        ],
+        "the retry sends the state the file has now"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_unview_puts_viewed_back() {
+    let f = fixtures();
+    let (core, _recv, pr, _head) = open_fixture_pr(&f).await;
+
+    core.transact(file_viewed_tx(
+        "fv-1",
+        &pr,
+        "src/lib.rs",
+        ViewedState::Viewed,
+        false,
+    ))
+    .await;
+    wait_until(|| set_viewed_calls(&f).len() == 1).await;
+    wait_until(|| {
+        f.store
+            .outbox_snapshot()
+            .iter()
+            .all(|i| i.status == OutboxStatus::Done)
+    })
+    .await;
+
+    f.host
+        .push_set_viewed(Err(HostError::Validation("nope".into())));
+    core.transact(file_viewed_tx(
+        "fv-2",
+        &pr,
+        "src/lib.rs",
+        ViewedState::Unviewed,
+        true,
+    ))
+    .await;
+    wait_until(|| {
+        f.store
+            .outbox_snapshot()
+            .iter()
+            .any(|i| i.status == OutboxStatus::Failed)
+    })
+    .await;
+    wait_until(|| {
+        file_viewed_row(&f, &pr, "src/lib.rs").is_some_and(|r| r.state == ViewedState::Viewed)
+    })
+    .await;
+}
+
+fn detail_with_viewed(state: ViewedState) -> theodore_domain::PrDetail {
+    let mut detail = testkit::sample_pr_detail(
+        &fixture_pr_ref(),
+        &Sha::new("base000"),
+        &Sha::new("head111"),
+    );
+    detail.viewed = vec![theodore_domain::FileViewed {
+        path: "src/lib.rs".into(),
+        state,
+    }];
+    detail
+}
+
+#[tokio::test]
+async fn a_file_marked_viewed_on_the_host_shows_viewed_after_open() {
+    let f = fixtures();
+    f.host.push_get_pr(Ok(Fetched::Modified {
+        etag: Some("etag-1".into()),
+        value: detail_with_viewed(ViewedState::Viewed),
+    }));
+    let (core, _recv) = Core::start(f.deps());
+    let resp = core
+        .open_pr(OpenPrRequest {
+            url: "https://github.com/acme/widgets/pull/7".into(),
+        })
+        .await
+        .expect("open_pr");
+
+    let fv = file_viewed_row(&f, &resp.pr, "src/lib.rs").expect("file_viewed row");
+    assert_eq!(fv.state, ViewedState::Viewed);
+    assert!(
+        f.store.outbox_snapshot().is_empty(),
+        "the host's own state is not written back to it"
+    );
+}
+
+#[tokio::test]
+async fn a_pending_viewed_write_wins_over_the_host_state_on_refresh() {
+    let f = fixtures();
+    let (core, _recv, pr, _head) = open_fixture_pr(&f).await;
+
+    // The local Viewed write fails on the network: it waits, pending.
+    f.host
+        .push_set_viewed(Err(HostError::Network("timeout".into())));
+    core.transact(file_viewed_tx(
+        "fv-1",
+        &pr,
+        "src/lib.rs",
+        ViewedState::Viewed,
+        false,
+    ))
+    .await;
+    wait_until(|| {
+        f.store
+            .outbox_snapshot()
+            .first()
+            .is_some_and(|i| i.attempts >= 1 && i.status == OutboxStatus::Pending)
+    })
+    .await;
+
+    // The host still says Unviewed: the pending local choice stays.
+    f.host.push_get_pr(Ok(Fetched::Modified {
+        etag: Some("etag-2".into()),
+        value: detail_with_viewed(ViewedState::Unviewed),
+    }));
+    core.refresh_pr(&pr, &fixture_pr_ref())
+        .await
+        .expect("refreshed");
+    assert_eq!(
+        file_viewed_row(&f, &pr, "src/lib.rs").map(|r| r.state),
+        Some(ViewedState::Viewed)
+    );
+
+    // Once the write landed, an unmark on the host comes through.
+    f.clock.advance(10_000);
+    wait_until(|| f.store.outbox_snapshot()[0].status == OutboxStatus::Done).await;
+    f.host.push_get_pr(Ok(Fetched::Modified {
+        etag: Some("etag-3".into()),
+        value: detail_with_viewed(ViewedState::Unviewed),
+    }));
+    core.refresh_pr(&pr, &fixture_pr_ref())
+        .await
+        .expect("refreshed");
+    assert_eq!(
+        file_viewed_row(&f, &pr, "src/lib.rs").map(|r| r.state),
+        Some(ViewedState::Unviewed)
+    );
+}
+
 // ── outbox retry / backoff / auth pause / compensation ──────────────────
 
 #[tokio::test]
@@ -957,24 +1228,22 @@ async fn outbox_fails_a_protocol_error_at_once_and_keeps_the_hosts_message() {
 #[tokio::test]
 async fn outbox_fails_a_refused_review_with_githubs_message() {
     let f = fixtures();
-    let (core, mut recv, pr, _head) = open_fixture_pr(&f).await;
+    let (core, _recv, pr, _head) = open_fixture_pr(&f).await;
 
     f.host.push_submit_review(Err(HostError::Validation(
         "Can not approve your own pull request".into(),
     )));
-    core.submit_review(SubmitReviewRequest {
-        pr: pr.clone(),
-        event: ReviewEvent::Approve,
-        body: String::new(),
-    })
-    .await
-    .expect("queued");
-
-    let event = expect_ephemeral(&mut recv, |e| matches!(e, Ephemeral::Toast { .. })).await;
-    assert!(matches!(
-        event,
-        Ephemeral::Toast { ref text, .. } if text == "Can not approve your own pull request"
-    ));
+    // The submit waits for the host: its error is the message (the UI
+    // toasts it); see `a_refused_submit_fails_the_command_with_the_hosts_words_once`.
+    let err = core
+        .submit_review(SubmitReviewRequest {
+            pr: pr.clone(),
+            event: ReviewEvent::Approve,
+            body: String::new(),
+        })
+        .await
+        .expect_err("refused");
+    assert_eq!(err.to_string(), "Can not approve your own pull request");
     wait_until(|| {
         f.store
             .outbox_snapshot()
@@ -1451,6 +1720,130 @@ async fn refresh_inbox_writes_pr_rows_and_seeds_inbox_state_once() {
 }
 
 #[tokio::test]
+async fn the_authored_poll_adds_a_new_pr_and_settles_one_closed_elsewhere() {
+    let f = fixtures();
+    let (core, _recv) = Core::start(f.deps());
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    f.host
+        .search_complete
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let repo = fixture_pr_ref().repo;
+    let pr_ref = |number| PrRef {
+        repo: repo.clone(),
+        number,
+        host_id: None,
+    };
+    // #7: yours, open as far as the store knows, closed on the host.
+    let mut mine = testkit::sample_pr_summary(&pr_ref(7), &Sha::new("h7"));
+    mine.reasons = vec![
+        theodore_domain::InboxReason::Authored,
+        theodore_domain::InboxReason::Mentioned,
+    ];
+    put_model_row(
+        &f,
+        models::PR,
+        &pr_ref(7).id().0,
+        serde_json::to_value(&mine).unwrap(),
+    );
+    let mut closed = testkit::sample_pr_detail(&pr_ref(7), &Sha::new("b"), &Sha::new("h7"));
+    closed.summary.state = theodore_domain::PrState::Closed;
+    closed.summary.updated_at = 5;
+    f.host.push_get_pr(Ok(Fetched::Modified {
+        etag: Some("e7".into()),
+        value: closed,
+    }));
+    // #8: opened on the host, never seen; with a conflict.
+    let mut new_pr = testkit::sample_pr_summary(&pr_ref(8), &Sha::new("h8"));
+    new_pr.reasons = vec![theodore_domain::InboxReason::Authored];
+    new_pr.conflicts = true;
+    f.host.push_search(Ok(vec![new_pr]));
+
+    core.refresh_authored().await.expect("refresh_authored");
+
+    let row = |n: u64| -> PrSummary {
+        serde_json::from_value(
+            f.store
+                .get(models::PR, &pr_ref(n).id().0)
+                .unwrap()
+                .unwrap()
+                .data,
+        )
+        .unwrap()
+    };
+    assert!(row(8).conflicts, "the new PR is in, conflict and all");
+    assert!(
+        f.store
+            .get(models::INBOX_STATE, &pr_ref(8).id().0)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(row(7).state, theodore_domain::PrState::Closed);
+    assert!(
+        row(7)
+            .reasons
+            .contains(&theodore_domain::InboxReason::Mentioned),
+        "a single-PR fetch keeps the inbox's reasons"
+    );
+    assert_eq!(
+        f.host
+            .get_pr_refs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.number)
+            .collect::<Vec<_>>(),
+        vec![7],
+        "only the PR the search no longer returns is asked after"
+    );
+}
+
+#[tokio::test]
+async fn an_inbox_refresh_that_sees_a_new_head_wakes_a_next_push_snooze() {
+    let f = fixtures();
+    let (core, _recv) = Core::start(f.deps());
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // Never opened this session: not in `current_head`, so the open-PR
+    // poller never sees its pushes.
+    let pr_ref = fixture_pr_ref();
+    let pr_id = pr_ref.id();
+    let mut summary = testkit::sample_pr_summary(&pr_ref, &Sha::new("old-head"));
+    summary.updated_at = 1;
+    put_model_row(
+        &f,
+        models::PR,
+        &pr_id.0,
+        serde_json::to_value(&summary).unwrap(),
+    );
+    let snoozed = |snooze: serde_json::Value| json!({"pr": pr_id, "done": false, "snooze": snooze});
+    put_model_row(
+        &f,
+        models::INBOX_STATE,
+        &pr_id.0,
+        snoozed(json!({"kind": "next_push"})),
+    );
+
+    // Same head: stays snoozed.
+    summary.updated_at = 2;
+    for _ in 0..4 {
+        f.host.push_search(Ok(vec![summary.clone()]));
+    }
+    core.refresh_inbox().await.expect("refresh_inbox");
+    let state = f.store.get(models::INBOX_STATE, &pr_id.0).unwrap().unwrap();
+    assert!(!state.data["snooze"].is_null(), "no push, no wake");
+
+    summary.head_sha = Sha::new("new-head");
+    summary.updated_at = 3;
+    for _ in 0..4 {
+        f.host.push_search(Ok(vec![summary.clone()]));
+    }
+    core.refresh_inbox().await.expect("refresh_inbox");
+    let state = f.store.get(models::INBOX_STATE, &pr_id.0).unwrap().unwrap();
+    assert!(state.data["snooze"].is_null(), "a push wakes it: {state:?}");
+}
+
+#[tokio::test]
 async fn refresh_inbox_links_stacked_prs_in_the_same_repo() {
     let f = fixtures();
     let (core, _recv) = Core::start(f.deps());
@@ -1839,6 +2232,174 @@ async fn submit_review_skips_outdated_drafts_with_a_toast() {
     assert_eq!(comments[0]["draft_id"], json!("d-ok"));
 }
 
+fn put_draft(f: &Fixtures, pr: &PrId, id: &str, outdated: bool) {
+    put_model_row(
+        f,
+        models::DRAFT,
+        id,
+        json!({
+            "id": id, "pr": pr.0, "anchor": testkit::sample_anchor("src/lib.rs", 2),
+            "body": format!("body of {id}"), "source": {"kind": "me"}, "outdated": outdated,
+        }),
+    );
+}
+
+fn draft_archived(f: &Fixtures, id: &str) -> bool {
+    f.store
+        .get(models::DRAFT, id)
+        .ok()
+        .flatten()
+        .is_some_and(|r| r.archived)
+}
+
+fn submitted_markers(f: &Fixtures) -> Vec<Vec<String>> {
+    f.host
+        .submit_review_calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let mut m: Vec<String> = r.comments.iter().map(|c| c.marker.clone()).collect();
+            m.sort();
+            m
+        })
+        .collect()
+}
+
+async fn submit_and_wait(f: &Fixtures, core: &Core, pr: &PrId) {
+    let before = f.host.submit_review_calls.lock().unwrap().len();
+    core.submit_review(SubmitReviewRequest {
+        pr: pr.clone(),
+        event: ReviewEvent::Comment,
+        body: "notes".into(),
+    })
+    .await
+    .expect("submit_review");
+    wait_until(|| {
+        f.host.submit_review_calls.lock().unwrap().len() > before
+            && f.store
+                .outbox_snapshot()
+                .iter()
+                .filter(|i| i.op == "submit_review")
+                .all(|i| i.status == OutboxStatus::Done)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_submitted_draft_is_never_posted_again_by_a_later_submit() {
+    let f = fixtures();
+    let (core, mut recv, pr, _head) = open_fixture_pr(&f).await;
+
+    put_draft(&f, &pr, "d-first", false);
+    // An old submitted draft whose anchor a push outdated long ago.
+    put_draft(&f, &pr, "d-old", true);
+    f.store
+        .apply(vec![NewAction {
+            model: models::DRAFT.into(),
+            model_id: "d-old".into(),
+            action: SyncActionCode::A,
+            data: None,
+        }])
+        .unwrap();
+    // The host posts it, but its thread isn't listed back yet.
+    f.host.push_submit_review(Ok(SubmittedReview {
+        review_id: "r1".into(),
+        threads: vec![],
+    }));
+    submit_and_wait(&f, &core, &pr).await;
+    wait_until(|| draft_archived(&f, "d-first")).await;
+
+    put_draft(&f, &pr, "d-a", false);
+    put_draft(&f, &pr, "d-b", false);
+    put_draft(&f, &pr, "d-c", false);
+    submit_and_wait(&f, &core, &pr).await;
+
+    assert_eq!(
+        submitted_markers(&f),
+        vec![
+            vec!["d-first".to_string()],
+            vec!["d-a".to_string(), "d-b".to_string(), "d-c".to_string()],
+        ],
+        "only drafts not yet submitted reach the host"
+    );
+    while let Ok(e) = recv.ephemeral.try_recv() {
+        assert!(
+            !matches!(&e, Ephemeral::Toast { text, .. } if text.contains("skipped")),
+            "archived drafts aren't skipped drafts: {e:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_refused_submit_fails_the_command_with_the_hosts_words_once() {
+    let f = fixtures();
+    let (core, mut recv, pr, _head) = open_fixture_pr(&f).await;
+    f.host.push_submit_review(Err(HostError::Validation(
+        "Can not approve your own pull request".into(),
+    )));
+
+    let err = core
+        .submit_review(SubmitReviewRequest {
+            pr: pr.clone(),
+            event: ReviewEvent::Approve,
+            body: String::new(),
+        })
+        .await
+        .expect_err("the host refused it");
+    assert!(
+        err.to_string()
+            .contains("Can not approve your own pull request"),
+        "{err}"
+    );
+    // The command's error is the toast: the outbox doesn't add a second.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    while let Ok(e) = recv.ephemeral.try_recv() {
+        assert!(
+            !matches!(
+                &e,
+                Ephemeral::Toast {
+                    level: ToastLevel::Error,
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_landed_submit_returns_once_the_host_has_it() {
+    let f = fixtures();
+    let (core, _recv, pr, _head) = open_fixture_pr(&f).await;
+    core.submit_review(SubmitReviewRequest {
+        pr,
+        event: ReviewEvent::Comment,
+        body: "notes".into(),
+    })
+    .await
+    .expect("submit_review");
+    assert_eq!(f.host.submit_review_calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_submit_leaves_out_a_draft_whose_marker_is_already_on_the_pr() {
+    let f = fixtures();
+    let (core, _recv, pr, _head) = open_fixture_pr(&f).await;
+
+    put_draft(&f, &pr, "d-posted", false);
+    put_draft(&f, &pr, "d-new", false);
+    f.host
+        .posted_markers
+        .lock()
+        .unwrap()
+        .insert("d-posted".into());
+    submit_and_wait(&f, &core, &pr).await;
+
+    assert_eq!(submitted_markers(&f), vec![vec!["d-new".to_string()]]);
+    wait_until(|| draft_archived(&f, "d-posted") && draft_archived(&f, "d-new")).await;
+}
+
 // ── reply_thread / resolve_thread ────────────────────────────────────────────
 
 #[tokio::test]
@@ -1916,6 +2477,76 @@ async fn reply_thread_does_not_repost_after_a_timeout_retry() {
         1,
         "the retry must not post a second reply once the marker is found"
     );
+}
+
+/// Puts one unresolved thread, `thread-1`, in the open fixture PR's detail.
+fn seed_thread(f: &Fixtures, pr: &PrId, head: &Sha) {
+    let mut detail = testkit::sample_pr_detail(&fixture_pr_ref(), &Sha::new("base000"), head);
+    detail.threads = vec![Thread {
+        id: ThreadId::new("thread-1"),
+        anchor: None,
+        resolved: false,
+        outdated: false,
+        comments: vec![],
+    }];
+    f.store
+        .apply(vec![NewAction {
+            model: models::PR_DETAIL.into(),
+            model_id: pr.0.clone(),
+            action: SyncActionCode::U,
+            data: Some(serde_json::to_value(&detail).unwrap()),
+        }])
+        .unwrap();
+}
+
+fn thread_resolved(f: &Fixtures, pr: &PrId) -> bool {
+    let row = f.store.get(models::PR_DETAIL, &pr.0).unwrap().unwrap();
+    let detail: theodore_domain::PrDetail = serde_json::from_value(row.data).unwrap();
+    detail.threads[0].resolved
+}
+
+#[tokio::test]
+async fn resolving_a_thread_shows_before_the_host_answers() {
+    let f = fixtures();
+    let (core, _recv, pr, head) = open_fixture_pr(&f).await;
+    seed_thread(&f, &pr, &head);
+    // The host is slow to take it: the write waits on a retry.
+    f.host
+        .push_resolve(Err(HostError::Network("timeout".into())));
+
+    core.resolve_thread(ResolveRequest {
+        pr: pr.clone(),
+        thread: ThreadId::new("thread-1"),
+        resolved: true,
+    })
+    .await
+    .expect("resolve_thread");
+    assert!(thread_resolved(&f, &pr), "resolved at once, not on a poll");
+}
+
+#[tokio::test]
+async fn a_refused_resolve_puts_the_thread_back() {
+    let f = fixtures();
+    let (core, _recv, pr, head) = open_fixture_pr(&f).await;
+    seed_thread(&f, &pr, &head);
+    f.host
+        .push_resolve(Err(HostError::Forbidden("must have push access".into())));
+
+    core.resolve_thread(ResolveRequest {
+        pr: pr.clone(),
+        thread: ThreadId::new("thread-1"),
+        resolved: true,
+    })
+    .await
+    .expect("resolve_thread");
+    wait_until(|| {
+        f.store
+            .outbox_snapshot()
+            .iter()
+            .any(|i| i.op == "resolve_thread" && i.status == OutboxStatus::Failed)
+    })
+    .await;
+    assert!(!thread_resolved(&f, &pr), "rolled back");
 }
 
 #[tokio::test]
@@ -3013,6 +3644,48 @@ async fn open_branch_opens_a_review_with_no_host_pr() {
     assert_eq!(again.pr, resp.pr);
 }
 
+/// A commit on the branch after its review opened: reopening it moves the
+/// review to the branch's new head, as a push moves a PR's.
+#[tokio::test]
+async fn reopening_a_branch_review_follows_the_branch() {
+    let f = fixtures();
+    let (core, _recv) = started_core(&f).await;
+    let project = add_ready_local_project(&core, &f, "/tmp/my-folder").await;
+    f.git.set_resolve("feature", Sha::new("feat-head"));
+    f.git.set_resolve("main", Sha::new("main-base"));
+    f.git
+        .set_commit(Sha::new("feat-head"), feature_branch_commit());
+    f.git.set_commit_log(vec![feature_branch_commit()]);
+    let open = || {
+        core.open_branch(OpenBranchRequest {
+            project: project.id.clone(),
+            branch: "feature".into(),
+            base: None,
+        })
+    };
+    let first = open().await.expect("open_branch");
+    assert_eq!(first.head.as_str(), "feat-head");
+
+    let mut next = feature_branch_commit();
+    next.sha = Sha::new("feat-head-2");
+    f.git.set_resolve("feature", Sha::new("feat-head-2"));
+    f.git.set_commit(Sha::new("feat-head-2"), next.clone());
+    f.git.set_commit_log(vec![feature_branch_commit(), next]);
+    let again = open().await.expect("reopen");
+    assert_eq!(again.pr, first.pr);
+    assert_eq!(again.head.as_str(), "feat-head-2");
+    assert_eq!(
+        core.0.current_head.read().await.get(&first.pr),
+        Some(&Sha::new("feat-head-2"))
+    );
+    let row = f.store.get(models::PR, &first.pr.0).unwrap().unwrap();
+    assert_eq!(row.data["head_sha"], json!("feat-head-2"));
+
+    // Nothing new: the same head, no new revision.
+    let same = open().await.expect("reopen unchanged");
+    assert_eq!(same.head.as_str(), "feat-head-2");
+}
+
 #[tokio::test]
 async fn ensure_open_recovers_a_local_pr_after_a_restart() {
     let f = fixtures();
@@ -3619,6 +4292,10 @@ async fn commit_suggestions_applies_and_pushes_one_commit_on_the_authors_own_pr(
     // The viewer is the PR's own author, so suggestions may be committed
     // directly instead of drafted.
     f.host.push_viewer(Ok(testkit::sample_person("author")));
+    f.git.ship.lock().unwrap().identity = Some(theodore_ports::Identity {
+        name: "Pat Author".into(),
+        email: "pat@example.com".into(),
+    });
     let (core, _recv, pr, head) = open_fixture_pr(&f).await;
 
     std::fs::create_dir_all(f.git.worktree_path(&head)).unwrap();
@@ -3656,6 +4333,14 @@ async fn commit_suggestions_applies_and_pushes_one_commit_on_the_authors_own_pr(
     let push = f.git.last_push.lock().unwrap().clone().expect("pushed");
     assert_eq!(push.0, "feature");
     assert_eq!(push.1, "apply suggestion");
+    assert_eq!(
+        f.git.last_push_author.lock().unwrap().clone(),
+        Some(theodore_ports::Identity {
+            name: "Pat Author".into(),
+            email: "pat@example.com".into(),
+        }),
+        "authored as the user, like a space's commits"
+    );
 }
 
 #[tokio::test]
@@ -4897,12 +5582,21 @@ async fn refresh_inbox_clears_reasons_of_prs_no_search_returns() {
         }])
         .unwrap();
     // Every section answers, none with this PR (you reviewed it).
+    f.host
+        .search_complete
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     for _ in 0..4 {
         f.host.push_search(Ok(vec![]));
     }
+    // Asked after, it's still open: the row stays, its reasons don't return.
+    f.host.push_get_pr(Ok(Fetched::Modified {
+        etag: None,
+        value: testkit::sample_pr_detail(&pr_ref, &Sha::new("b"), &Sha::new("h")),
+    }));
     core.refresh_inbox().await.expect("refresh_inbox");
     let stored = f.store.get(models::PR, &pr_ref.id().0).unwrap().unwrap();
     assert_eq!(stored.data["reasons"], json!([]));
+    assert_eq!(stored.data["state"], json!("open"));
 }
 
 #[tokio::test]
@@ -4999,7 +5693,8 @@ async fn a_rejected_token_on_a_read_raises_the_auth_banner_and_clears_after() {
             Ephemeral::HostStatus {
                 auth_ok: true,
                 online: true,
-                rate_limited_until: None
+                rate_limited_until: None,
+                server_trouble: false
             }
         )
     })
@@ -5042,6 +5737,29 @@ async fn a_finding_reported_from_a_skill_run_belongs_to_its_skill() {
     let id = core.add_finding(pr, finding).await.expect("add_finding");
     let row = f.store.get(models::FINDING, &id.0).unwrap().unwrap();
     assert_eq!(row.data["skill"], json!("bugs"));
+}
+
+#[tokio::test]
+async fn a_server_error_is_host_trouble_not_offline() {
+    let f = fixtures();
+    let (core, mut recv) = started_core(&f).await;
+    for _ in 0..4 {
+        f.host
+            .push_search(Err(theodore_ports::HostError::Server("502".into())));
+    }
+    let _ = core.refresh_inbox().await;
+    expect_ephemeral(&mut recv, |e| {
+        matches!(
+            e,
+            Ephemeral::HostStatus {
+                online: true,
+                server_trouble: true,
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(core.host_online(), "a host that answers 502 is not offline");
 }
 
 #[tokio::test]

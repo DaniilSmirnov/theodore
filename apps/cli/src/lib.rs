@@ -13,3 +13,4 @@ pub mod group;
 pub mod links;
 pub mod mcp_bridge;
 pub mod sandbox;
+pub mod sandbox_seed;

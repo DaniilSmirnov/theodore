@@ -26,6 +26,7 @@ theodore-agents.workspace = true
 theodore-secrets.workspace = true
 theodore-runtime = { path = "../../crates/runtime" }
 theodore-sandbox = { path = "../../crates/sandbox" }
+theodore-store.workspace = true
 theodore-contract.workspace = true
 rmcp.workspace = true
 serde_yaml = "0.9"

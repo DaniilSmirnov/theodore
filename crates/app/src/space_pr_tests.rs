@@ -46,7 +46,11 @@ fn pr_ref(number: u64) -> PrRef {
 }
 
 async fn host_project(f: &Fixtures) -> (Core, Receivers, Project) {
-    let (core, recv) = Core::start(f.deps());
+    host_project_with(f, f.deps()).await
+}
+
+async fn host_project_with(f: &Fixtures, deps: crate::Deps) -> (Core, Receivers, Project) {
+    let (core, recv) = Core::start(deps);
     tokio::time::sleep(Duration::from_millis(30)).await;
     let project = Project {
         id: "github:acme/widget".into(),
@@ -170,6 +174,18 @@ fn base_moved(f: &Fixtures, tip: &str) {
 
 /// The PR-description fill (a one-shot call), not a background naming or
 /// handoff call that could take its script first.
+/// `s` as if started from an existing PR, its tip at `fork`.
+fn patch_adopted(f: &Fixtures, id: &str, fork: &str, pr: &str) {
+    f.store
+        .apply(vec![NewAction {
+            model: models::SPACE.into(),
+            model_id: id.to_string(),
+            action: SyncActionCode::C,
+            data: Some(json!({ "fork_sha": fork, "pr": pr })),
+        }])
+        .unwrap();
+}
+
 fn is_fill(r: &theodore_ports::AgentRequest) -> bool {
     r.system
         .as_deref()
@@ -396,7 +412,278 @@ async fn merge_is_refused_with_turns_not_pushed_or_without_a_pr() {
     assert!(f.host.merge_calls().is_empty());
 }
 
+#[tokio::test]
+async fn an_adopted_prs_new_turns_must_be_pushed_before_it_merges() {
+    let f = fixtures();
+    let (core, _recv, project) = host_project(&f).await;
+    let s = one_turn(&f, &core, &project, "Retry on 429").await;
+    patch_adopted(&f, &s.id, "fork000", "github:acme/widget#1");
+    let err = core
+        .merge_space(MergeSpaceRequest {
+            space: s.id.clone(),
+            method: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("aren't pushed"), "{err}");
+    assert!(f.host.merge_calls().is_empty());
+}
+
+#[tokio::test]
+async fn continue_keeps_an_adopted_prs_unpushed_turns_and_leaves_its_branch() {
+    let f = fixtures();
+    let (core, _recv, project) = host_project(&f).await;
+    let s = one_turn(&f, &core, &project, "Retry on 429").await;
+    patch_adopted(&f, &s.id, "fork000", "github:acme/widget#1");
+    merge_on_host(&f, &core, 1).await;
+    base_moved(&f, "tip999");
+
+    let s = core.continue_space(&s.id).await.unwrap();
+    assert_eq!(s.fork_sha, None, "the new branch isn't the adopted one");
+    assert_ne!(
+        s.head_sha.0, "tip999",
+        "the turn nobody pushed is replayed, not dropped"
+    );
+}
+
+// ── Checks while the page is open ─────────────────────────────────────────
+
+/// The space page asks for its PR's checks (`refresh_space_pr`): a
+/// conditional fetch that lands in `pr_detail`, so a failure shows without
+/// opening the PR's review.
+#[tokio::test]
+async fn refresh_space_pr_brings_the_hosts_checks() {
+    let f = fixtures();
+    let (core, _recv, project) = host_project(&f).await;
+    let s = in_review(&f, &core, &project, "Retry on 429").await;
+    let pr = s.pr.clone().unwrap();
+    let mut failed = sample_pr_detail(&pr_ref(100), &Sha::new("base000"), &Sha::new("squash1"));
+    failed.checks = vec![theodore_domain::Check {
+        id: "c1".into(),
+        name: "test".into(),
+        status: theodore_domain::CheckStatus::Fail,
+        url: None,
+        duration_ms: None,
+    }];
+    f.host.push_get_pr(Ok(theodore_ports::Fetched::Modified {
+        etag: Some("e2".into()),
+        value: failed,
+    }));
+    core.refresh_space_pr(&s.id).await.unwrap();
+    let detail = f.store.get(models::PR_DETAIL, &pr.0).unwrap().unwrap().data;
+    assert_eq!(detail["checks"][0]["status"], json!("fail"));
+
+    // Nothing to ask about without a PR.
+    let other = one_turn(&f, &core, &project, "Something else").await;
+    core.refresh_space_pr(&other.id).await.unwrap();
+}
+
 // ── Continue after merge ──────────────────────────────────────────────────
+
+async fn send_reply(
+    f: &Fixtures,
+    core: &Core,
+    s: &Space,
+    text: &str,
+    reply: &str,
+    head: &str,
+) -> Space {
+    f.agents.push_script(done(reply));
+    f.git.push_checkpoint(Sha::new(head));
+    core.space_send(SpaceSendRequest {
+        space: s.id.clone(),
+        text: text.into(),
+        agent: None,
+        model: None,
+        mode: None,
+        attachments: None,
+    })
+    .await
+    .unwrap();
+    idle(f, &s.id).await
+}
+
+/// The round from the report: a workflow edit made and undone within it,
+/// a note added. Only the note is in the net diff.
+async fn a_round_with_an_undone_edit(f: &Fixtures, core: &Core, project: &Project) -> Space {
+    let s = in_review(f, core, project, "Initialize a tiny static tamagotchi").await;
+    merge_on_host(f, core, 100).await;
+    base_moved(f, "main222");
+    let mut c = core.continue_space(&s.id).await.unwrap();
+    for (reply, head) in [
+        (
+            "Added # qa3 note as the first line of .github/workflows/test.yml",
+            "turn222",
+        ),
+        ("I created notes/t3.md with the round's notes.", "turn333"),
+        (
+            ".github/workflows/test.yml now matches its original content, with the # qa3 \
+             line removed so the workflow runs exactly as it did before.",
+            "turn444",
+        ),
+    ] {
+        f.clock.advance(1_000);
+        c = send_reply(f, core, &c, "Yes, do that", reply, head).await;
+    }
+    let (base, head) = (Sha::new("main222"), Sha::new("turn444"));
+    f.git.set_revision(crate::testkit::two_hunk_revision(
+        &base,
+        &head,
+        "notes/t3.md",
+    ));
+    f.host.push_get_pr(Ok(theodore_ports::Fetched::Modified {
+        etag: None,
+        value: sample_pr_detail(&pr_ref(101), &base, &Sha::new("squash2")),
+    }));
+    c
+}
+
+fn is_ship_title(r: &theodore_ports::AgentRequest) -> bool {
+    r.system.as_deref() == Some(crate::usecases::ship_title::SHIP_TITLE_SYSTEM)
+}
+
+/// After a Continue, the next PR is titled by its net change — never by a
+/// sentence copied from the chat, never by an edit the round undid. With
+/// no usable proposal (the chat agent's "ok"): the changed path.
+#[tokio::test]
+async fn the_pr_after_a_continue_is_titled_by_its_net_change() {
+    let f = fixtures();
+    let (core, _recv, project) = host_project(&f).await;
+    let c = a_round_with_an_undone_edit(&f, &core, &project).await;
+    core.ship_space(open_pr(&c)).await.unwrap();
+    wait_until(|| f.host.create_pr_calls.lock().unwrap().len() == 2).await;
+    let calls = f.host.create_pr_calls.lock().unwrap().clone();
+    let (title, body) = (&calls[1].1.title, &calls[1].1.body);
+    assert_eq!(title, "Update notes/t3.md");
+    for chat in ["Added #", "I created", "workflows", "tamagotchi"] {
+        assert!(!body.contains(chat), "{chat}: {body}");
+    }
+    let ship = f.git.ship.lock().unwrap();
+    assert_eq!(ship.commits.last().unwrap().1.message, "Update notes/t3.md");
+}
+
+/// The chat agent's proposal from the round's diff stat and replies: its
+/// title, and its whole sentences about files in the net diff only.
+#[tokio::test]
+async fn the_pr_after_a_continue_takes_the_chat_agents_proposed_title() {
+    let f = fixtures();
+    let (core, _recv, project) = host_project(&f).await;
+    let c = a_round_with_an_undone_edit(&f, &core, &project).await;
+    f.agents.push_tagged(
+        is_ship_title,
+        done(
+            "TITLE: Add the round's t3 notes\nSUMMARY:\n\
+             - Add notes/t3.md with what the round found.\n\
+             - Restore .github/workflows/test.yml to its original content.",
+        ),
+    );
+    core.ship_space(open_pr(&c)).await.unwrap();
+    wait_until(|| f.host.create_pr_calls.lock().unwrap().len() == 2).await;
+    let calls = f.host.create_pr_calls.lock().unwrap().clone();
+    let (title, body) = (&calls[1].1.title, &calls[1].1.body);
+    assert_eq!(title, "Add the round's t3 notes");
+    assert!(
+        body.contains("- Add notes/t3.md with what the round found."),
+        "{body}"
+    );
+    assert!(!body.contains("workflows"), "{body}");
+    let ask = f
+        .agents
+        .utility_requests()
+        .into_iter()
+        .find(is_ship_title)
+        .expect("asked for a title");
+    assert!(ask.prompt.contains("- notes/t3.md (+"), "{}", ask.prompt);
+    assert!(
+        ask.prompt.contains("I created notes/t3.md"),
+        "{}",
+        ask.prompt
+    );
+    assert!(!ask.prompt.contains("Yes, do that"), "{}", ask.prompt);
+    let ship = f.git.ship.lock().unwrap();
+    assert_eq!(
+        ship.commits.last().unwrap().1.message,
+        "Add the round's t3 notes\n\n- Add notes/t3.md with what the round found."
+    );
+}
+
+/// `s` as if started from host issue `n` (`Space::issue`).
+fn patch_issue(f: &Fixtures, id: &str, n: u64) {
+    f.store
+        .apply(vec![NewAction {
+            model: models::SPACE.into(),
+            model_id: id.to_string(),
+            action: SyncActionCode::C,
+            data: Some(json!({ "issue": n })),
+        }])
+        .unwrap();
+}
+
+fn pr_bodies(f: &Fixtures) -> Vec<String> {
+    let calls = f.host.create_pr_calls.lock().unwrap();
+    calls.iter().map(|c| c.1.body.clone()).collect()
+}
+
+/// The first round's PR closed issue #12 when it merged: the next round's
+/// doesn't say "Closes #12" again (the host can't tell its state here).
+#[tokio::test]
+async fn closes_is_not_repeated_after_a_continue() {
+    let f = fixtures();
+    let (core, _recv, project) = host_project(&f).await;
+    let s = one_turn(&f, &core, &project, "Fix the login loop").await;
+    patch_issue(&f, &s.id, 12);
+    f.host.push_get_pr(Ok(theodore_ports::Fetched::Modified {
+        etag: None,
+        value: sample_pr_detail(&pr_ref(100), &Sha::new("base000"), &Sha::new("squash1")),
+    }));
+    core.ship_space(open_pr(&space(&f, &s.id))).await.unwrap();
+    wait_until(|| space(&f, &s.id).pr.is_some()).await;
+    assert!(
+        pr_bodies(&f)[0].contains("Closes #12"),
+        "{:?}",
+        pr_bodies(&f)
+    );
+
+    merge_on_host(&f, &core, 100).await;
+    base_moved(&f, "main222");
+    let c = core.continue_space(&s.id).await.unwrap();
+    f.clock.advance(1_000);
+    let c = send(&f, &core, &c, "One more thing", Some("turn222")).await;
+    f.host.push_get_pr(Ok(theodore_ports::Fetched::Modified {
+        etag: None,
+        value: sample_pr_detail(&pr_ref(101), &Sha::new("main222"), &Sha::new("squash2")),
+    }));
+    core.ship_space(open_pr(&c)).await.unwrap();
+    wait_until(|| f.host.create_pr_calls.lock().unwrap().len() == 2).await;
+    assert!(
+        !pr_bodies(&f)[1].contains("Closes #12"),
+        "{:?}",
+        pr_bodies(&f)
+    );
+}
+
+/// An issue the host says is closed already gets no "Closes #n".
+#[tokio::test]
+async fn closes_is_left_out_for_an_issue_the_host_says_is_closed() {
+    let f = fixtures();
+    let (core, _recv, project) = host_project(&f).await;
+    let s = one_turn(&f, &core, &project, "Fix the login loop").await;
+    patch_issue(&f, &s.id, 12);
+    f.host.push_get_issue(Ok(theodore_ports::TrackedIssue {
+        number: 12,
+        title: "Login loops".into(),
+        body: String::new(),
+        url: "https://example.test/12".into(),
+        closed: true,
+    }));
+    core.ship_space(open_pr(&space(&f, &s.id))).await.unwrap();
+    wait_until(|| !f.host.create_pr_calls.lock().unwrap().is_empty()).await;
+    assert!(
+        !pr_bodies(&f)[0].contains("Closes #12"),
+        "{:?}",
+        pr_bodies(&f)
+    );
+}
 
 #[tokio::test]
 async fn continue_moves_the_space_to_a_new_branch_on_the_fresh_base() {
@@ -455,6 +742,31 @@ async fn continue_moves_the_space_to_a_new_branch_on_the_fresh_base() {
             .contains("me/retry-on-429-2"),
         "the system prompt names the new branch"
     );
+}
+
+/// Continue moves the worktree onto the new base: the files that moved
+/// are reindexed.
+#[tokio::test]
+async fn continue_reindexes_the_files_it_moved() {
+    use crate::code_intel_tests::{diffs_touch, reindexed};
+    let f = fixtures();
+    let (core, _recv, project) = host_project_with(&f, f.deps_with_code()).await;
+    let s = in_review(&f, &core, &project, "Retry on 429").await;
+    let root = s.worktree.clone();
+    wait_until(|| {
+        f.code_intel
+            .calls()
+            .iter()
+            .any(|c| c.starts_with(&format!("open {root}")))
+    })
+    .await;
+    merge_on_host(&f, &core, 100).await;
+    base_moved(&f, "main222");
+    // Whatever the turn reindexed has settled.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    diffs_touch(&f, "src/continued.ts");
+    core.continue_space(&s.id).await.unwrap();
+    wait_until(|| reindexed(&f, &root, "src/continued.ts") == 1).await;
 }
 
 #[tokio::test]
@@ -568,4 +880,95 @@ async fn a_merged_space_continues_rather_than_updating_from_base() {
     merge_on_host(&f, &core, 100).await;
     let err = core.update_space_from_base(&s.id).await.unwrap_err();
     assert!(err.to_string().contains("Continue"), "{err}");
+}
+
+/// Continue moves the worktree onto the base's tip without a turn: the same
+/// stop as a clean update.
+#[tokio::test]
+async fn back_to_here_stops_at_continue() {
+    let f = fixtures();
+    let (core, _recv, project) = host_project(&f).await;
+    let s = in_review(&f, &core, &project, "Retry on 429").await;
+    let send = |text: &str| theodore_contract::SpaceSendRequest {
+        space: s.id.clone(),
+        text: text.into(),
+        agent: None,
+        model: None,
+        mode: None,
+        attachments: None,
+    };
+    f.agents.push_script(done("done"));
+    f.git.push_checkpoint(Sha::new("turn222"));
+    core.space_send(send("not pushed")).await.unwrap();
+    idle(&f, &s.id).await;
+    merge_on_host(&f, &core, 100).await;
+    base_moved(&f, "main222");
+    core.continue_space(&s.id).await.unwrap();
+    f.agents.push_script(done("done"));
+    f.git.push_checkpoint(Sha::new("turn333"));
+    core.space_send(send("next round")).await.unwrap();
+    idle(&f, &s.id).await;
+    let s = space(&f, &s.id);
+
+    // Right after the first turn: across Continue.
+    let err = core
+        .rewind_space(theodore_contract::RewindSpaceRequest {
+            space: s.id.clone(),
+            reply: s.turn_log[0].reply.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("can't go back past"), "{err}");
+    assert_eq!(space(&f, &s.id).head_sha, Sha::new("turn333"));
+}
+
+// ── Open PR interrupted ───────────────────────────────────────────────────
+
+/// Theodore quits while the agent fills the PR template: the branch is on
+/// the host, the outbox item isn't written yet.
+#[tokio::test]
+async fn open_pr_interrupted_during_the_fill_can_be_retried() {
+    let f = fixtures();
+    let (core, _recv, project) = host_project(&f).await;
+    f.git.put_file(
+        &Sha::new("turn111"),
+        ".github/pull_request_template.md",
+        TEMPLATE.as_bytes(),
+    );
+    f.agents.push_script(done("done"));
+    f.git.push_checkpoint(Sha::new("turn111"));
+    let s = core
+        .create_space(CreateSpaceRequest {
+            project: project.id.clone(),
+            goal: "Retry on 429".into(),
+            name: None,
+            branch: None,
+            base: None,
+            agent: None,
+            model: None,
+            start_from: None,
+        })
+        .await
+        .unwrap();
+    let s = idle(&f, &s.id).await;
+
+    f.agents.hang_next_utility();
+    let interrupted = {
+        let (core, req) = (core.clone(), open_pr(&s));
+        tokio::spawn(async move { core.ship_space(req).await })
+    };
+    wait_until(|| !f.git.ship.lock().unwrap().pushes.is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    interrupted.abort();
+    let _ = interrupted.await;
+    assert!(space(&f, &s.id).pr.is_none());
+
+    core.ship_space(open_pr(&s))
+        .await
+        .expect("a retry after an interrupted Open PR is safe");
+    wait_until(|| space(&f, &s.id).pr.is_some()).await;
+    let ship = f.git.ship.lock().unwrap();
+    assert_eq!(ship.commits.len(), 1, "the same squashed commit");
+    assert_eq!(ship.pushes.len(), 1, "already on the host");
+    assert_eq!(f.host.create_pr_calls.lock().unwrap().len(), 1);
 }

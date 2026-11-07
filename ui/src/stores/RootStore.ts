@@ -37,7 +37,7 @@ export class RootStore {
 
   async start(): Promise<void> {
     setCommandFailureHandler((f) =>
-      this.ephemeral.handle({ type: 'toast', level: 'warn', text: f.message }),
+      this.ephemeral.handle({ type: 'toast', level: 'error', text: f.message }),
     );
     // A command turned away for want of a sign-in: the session ended and
     // its event got lost, so ask again; the gate then shows.

@@ -18,7 +18,7 @@ pub struct Capabilities {
     pub merge_queue: bool,
     pub auto_merge: bool,
     pub reactions: bool,
-    /// A cheap read of the project's own issues (`my_open_issues`,
+    /// A cheap read of the project's own issues (`open_issues`,
     /// `get_issue`): New space "From an issue" offers the option only here.
     pub issues: bool,
 }
@@ -42,6 +42,10 @@ pub enum HostError {
     Validation(String),
     #[error("network: {0}")]
     Network(String),
+    /// The host answered, but with a server error (5xx) after retries: it
+    /// is up and having trouble, not unreachable.
+    #[error("host server error: {0}")]
+    Server(String),
     #[error("not supported by this host: {0}")]
     Unsupported(&'static str),
     #[error("unexpected response: {0}")]
@@ -61,6 +65,7 @@ impl HostError {
             HostError::Conflict(_) => "host.conflict",
             HostError::Validation(_) => "host.validation",
             HostError::Network(_) => "host.network",
+            HostError::Server(_) => "host.server_error",
             HostError::Unsupported(_) => "host.unsupported",
             HostError::Protocol(_) => "host.protocol",
         }
@@ -82,6 +87,15 @@ pub enum InboxSection {
     Mentioned,
     /// Raw host search query, e.g. `is:pr is:open repo:o/r`.
     Query(String),
+}
+
+/// A search's answer, and whether it's all the host has for the query.
+#[derive(Debug, Clone)]
+pub struct Searched {
+    pub prs: Vec<PrSummary>,
+    /// `true`: a PR missing from `prs` really doesn't match the query.
+    /// `false`: the host cut the list short, or can't say.
+    pub complete: bool,
 }
 
 /// Cheap "did anything change" probe (GitHub notifications, GitLab
@@ -189,6 +203,19 @@ pub struct TrackedIssue {
     pub title: String,
     pub body: String,
     pub url: String,
+    /// Closed on the host: a space's next PR says no "Closes #<number>"
+    /// for it.
+    #[serde(default)]
+    pub closed: bool,
+}
+
+/// `HostAdapter::open_issues`' order: `mine` first, then the rest of `all`,
+/// each issue once.
+pub fn mine_first(mine: Vec<TrackedIssue>, all: Vec<TrackedIssue>) -> Vec<TrackedIssue> {
+    let seen: std::collections::HashSet<u64> = mine.iter().map(|i| i.number).collect();
+    let mut out = mine;
+    out.extend(all.into_iter().filter(|i| !seen.contains(&i.number)));
+    out
 }
 
 #[async_trait]
@@ -231,6 +258,24 @@ pub trait HostAdapter: Send + Sync {
         let _ = repo;
         self.search(section).await
     }
+    /// `search`, or `search_repo` with a `repo`, saying how far to trust what
+    /// is missing from the answer. Default: complete for an inbox section,
+    /// which adapters read to its last page. A raw query isn't: only some
+    /// hosts read `is:open repo:o/r` as the query it says it is.
+    async fn search_checked(
+        &self,
+        repo: Option<&RepoRef>,
+        section: &InboxSection,
+    ) -> HostResult<Searched> {
+        let prs = match repo {
+            Some(repo) => self.search_repo(repo, section).await?,
+            None => self.search(section).await?,
+        };
+        Ok(Searched {
+            prs,
+            complete: !matches!(section, InboxSection::Query(_)),
+        })
+    }
     /// Repos for the Add project picker, with the metadata it shows
     /// (description, visibility, last push) — not just the bare ref.
     async fn list_repos(&self) -> HostResult<Vec<HostRepo>>;
@@ -255,9 +300,10 @@ pub trait HostAdapter: Send + Sync {
     }
 
     // issues (docs/spaces.md "New space from an issue")
-    /// The viewer's own open issues in `repo`, for the New space picker.
-    async fn my_open_issues(&self, _repo: &RepoRef) -> HostResult<Vec<TrackedIssue>> {
-        Err(HostError::Unsupported("my_open_issues"))
+    /// Open issues in `repo` for the New space picker: the viewer's own
+    /// (assigned) first, then the rest, each once.
+    async fn open_issues(&self, _repo: &RepoRef) -> HostResult<Vec<TrackedIssue>> {
+        Err(HostError::Unsupported("open_issues"))
     }
     /// One issue by number, read for its title/body/url to seed a space's
     /// goal (a pasted URL or `#<number>` resolves to this).
@@ -274,6 +320,22 @@ pub trait HostAdapter: Send + Sync {
     ) -> HostResult<SubmittedReview>;
     /// Find a comment previously posted with `marker` (outbox retry after timeout).
     async fn find_marker(&self, pr: &PrRef, marker: &str) -> HostResult<Option<CommentId>>;
+    /// Which of `markers` are already in a comment on the PR, so a submit
+    /// never posts a draft twice. Default: `find_marker` for each; a host
+    /// that reads every comment in one pass should override it.
+    async fn find_markers(
+        &self,
+        pr: &PrRef,
+        markers: &[String],
+    ) -> HostResult<std::collections::HashSet<String>> {
+        let mut found = std::collections::HashSet::new();
+        for marker in markers {
+            if self.find_marker(pr, marker).await?.is_some() {
+                found.insert(marker.clone());
+            }
+        }
+        Ok(found)
+    }
 
     // threads
     async fn reply(&self, pr: &PrRef, thread: &ThreadId, body: &str) -> HostResult<CommentId>;

@@ -396,6 +396,39 @@ describe('migrateRoute', () => {
     for (const r of kept) expect(migrateRoute(r, ALL)).toEqual(r);
   });
 
+  it('turns the old Settings → Projects and Languages tabs into the project’s settings', () => {
+    expect(
+      migrateRoute({ name: 'settings', page: 'projects' }, web.id),
+    ).toEqual({
+      name: 'project-settings',
+      project: web.id,
+      section: 'general',
+    });
+    expect(
+      migrateRoute({ name: 'settings', page: 'languages' }, local.id),
+    ).toEqual({
+      name: 'project-settings',
+      project: local.id,
+      section: 'languages',
+    });
+    // Under All there is no one project: Settings' first page.
+    for (const page of ['projects', 'languages'])
+      expect(migrateRoute({ name: 'settings', page }, ALL)).toEqual({
+        name: 'settings',
+        page: 'agents',
+      });
+  });
+
+  it('keeps a project settings tab, with a section it knows', () => {
+    const r = { name: 'project-settings', project: web.id, section: 'config' };
+    expect(migrateRoute(r, ALL)).toEqual(r);
+    expect(migrateRoute({ ...r, section: 'nope' }, ALL)).toEqual({
+      ...r,
+      section: 'general',
+    });
+    expect(migrateRoute({ name: 'project-settings' }, ALL)).toBeNull();
+  });
+
   it('drops anything it cannot read', () => {
     for (const raw of [
       null,

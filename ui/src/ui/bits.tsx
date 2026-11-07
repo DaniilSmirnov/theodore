@@ -151,7 +151,9 @@ export function Hints({ children }: { children: ReactNode }) {
   return (
     <Toolbar
       aria-label="Shortcuts"
-      className="hints flex w-full shrink-0 flex-nowrap items-center gap-1 overflow-hidden whitespace-nowrap border-t border-separator bg-background px-6 py-2 text-xs text-muted [mask-image:linear-gradient(to_right,black_calc(100%-40px),transparent)]"
+      // Narrow, the keys wrap onto a second line rather than run off the
+      // edge; each label stays whole (a flex item of its own).
+      className="hints flex w-full shrink-0 flex-wrap items-center gap-x-1 gap-y-1 whitespace-nowrap border-t border-separator bg-background px-6 py-2 text-xs text-muted"
     >
       {children}
     </Toolbar>

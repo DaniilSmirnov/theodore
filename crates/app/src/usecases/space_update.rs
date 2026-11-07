@@ -141,6 +141,7 @@ impl Core {
             .await?
         {
             SpaceMerge::Merged(head) => {
+                self.spawn_space_code_changed(wt.path.clone(), from.clone(), head.clone());
                 self.apply(vec![patch(
                     &space.id,
                     serde_json::json!({
@@ -203,6 +204,17 @@ impl Core {
     /// resolved so far, and the space is back at the checkpoint it started
     /// from, on its old base.
     pub async fn abort_space_update(&self, space: &str) -> AppResult<Space> {
+        // The agent's resolving turn stops first: Abort is no Stop + Abort.
+        let row = self.space_row(space).await?;
+        if row.status == SpaceStatus::Running && row.updating.is_some() {
+            self.space_stop(space).await?;
+            for _ in 0..600 {
+                if self.space_row(space).await?.status != SpaceStatus::Running {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
         let _guard = self.0.ship_lock.lock().await;
         let space = self.space_row(space).await?;
         if space.status == SpaceStatus::Running {
@@ -227,6 +239,12 @@ impl Core {
                 )),
                 e => e.into(),
             })?;
+        // The merge's files went back; the base's tip has at least them.
+        self.spawn_space_code_changed(
+            wt.path.clone(),
+            update.base_tip.clone(),
+            update.from.clone(),
+        );
         self.apply(vec![patch(
             &space.id,
             serde_json::json!({
@@ -262,6 +280,11 @@ impl Core {
         let left = match &finish {
             Finish::Left(paths) => Some(paths.clone()),
             Finish::Merged(cp) | Finish::Abandoned(cp) => {
+                self.spawn_space_code_changed(
+                    worktree.to_path_buf(),
+                    space.head_sha.clone(),
+                    cp.sha.clone(),
+                );
                 data["head_sha"] = serde_json::json!(cp.sha);
                 data["worktree_head"] = serde_json::json!(cp.head);
                 data["status"] = serde_json::json!(SpaceStatus::Idle);
@@ -287,7 +310,13 @@ impl Core {
     ) -> GitResult<(Finish, serde_json::Value)> {
         let git = &self.0.deps.git;
         match git
-            .space_merge_finish(worktree, &space.id, &update.base_tip, &merge_message(space))
+            .space_merge_finish(
+                worktree,
+                &space.id,
+                &update.base_tip,
+                &update.conflicts,
+                &merge_message(space),
+            )
             .await?
         {
             SpaceMerge::Merged(head) => Ok((

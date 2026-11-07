@@ -302,10 +302,19 @@ impl HostAdapter for GitlabAdapter {
         Ok(mr_ref_to_pr_ref(repo, &mr))
     }
 
-    async fn my_open_issues(&self, repo: &RepoRef) -> HostResult<Vec<TrackedIssue>> {
-        let login = self.username().await?.to_string();
-        let issues = rest::list_assigned_issues(&self.http, &project_path(repo), &login).await?;
-        Ok(issues.into_iter().map(gl_issue_to_tracked).collect())
+    async fn open_issues(&self, repo: &RepoRef) -> HostResult<Vec<TrackedIssue>> {
+        let project = project_path(repo);
+        let all = rest::list_open_issues(&self.http, &project, None).await?;
+        // Yours first; without a viewer the list is still the repo's.
+        let login = self.username().await.ok().map(|l| l.to_string());
+        let mine = match login {
+            Some(login) => rest::list_open_issues(&self.http, &project, Some(&login)).await?,
+            None => Vec::new(),
+        };
+        let tracked = |v: Vec<crate::model::GlIssue>| -> Vec<TrackedIssue> {
+            v.into_iter().map(gl_issue_to_tracked).collect()
+        };
+        Ok(theodore_ports::mine_first(tracked(mine), tracked(all)))
     }
 
     async fn get_issue(&self, repo: &RepoRef, number: u64) -> HostResult<TrackedIssue> {
@@ -915,6 +924,7 @@ fn gl_issue_to_tracked(issue: crate::model::GlIssue) -> TrackedIssue {
         title: issue.title,
         body: issue.description.unwrap_or_default(),
         url: issue.web_url,
+        closed: issue.state.as_deref() == Some("closed"),
     }
 }
 

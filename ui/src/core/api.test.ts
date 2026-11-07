@@ -94,3 +94,37 @@ describe('operation ids', () => {
     expect(toast).not.toHaveBeenCalled();
   });
 });
+
+describe('a stale last-seen sha', () => {
+  let transport: FakeTransport;
+  const toast = vi.fn();
+
+  beforeEach(() => {
+    transport = new FakeTransport();
+    setTransport(transport);
+    setCommandFailureHandler(toast);
+  });
+
+  afterEach(() => toast.mockReset());
+
+  it("isn't toasted by interdiff: the review forgets it instead", async () => {
+    transport.onCall('interdiff', () => {
+      throw { code: 'commit_not_found', message: 'commit b6cef3e not found' };
+    });
+    const err = await api
+      .interdiff({ pr: 'github:a/b#1', base_sha: 'b6cef3e', file: null })
+      .catch((e: unknown) => e);
+    expect((err as CommandFailure).code).toBe('commit_not_found');
+    expect(toast).not.toHaveBeenCalled();
+  });
+
+  it('leaves any other interdiff failure to the toast', async () => {
+    transport.onCall('interdiff', () => {
+      throw { code: 'git', message: 'git diff: exit 1' };
+    });
+    await api
+      .interdiff({ pr: 'github:a/b#1', base_sha: 'b6cef3e', file: null })
+      .catch(() => {});
+    expect(toast).toHaveBeenCalledTimes(1);
+  });
+});

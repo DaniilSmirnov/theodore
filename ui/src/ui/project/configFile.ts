@@ -1,5 +1,5 @@
 /**
- * Settings → Projects → Config: pure rules for the config editor — which
+ * Project settings → Config: pure rules for the config editor — which
  * text it starts from, Tab / Enter in a plain textarea, the problems list,
  * the "Save to…" menu, and the toasts after a save.
  */

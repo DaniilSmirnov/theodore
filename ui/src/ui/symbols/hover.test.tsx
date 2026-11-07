@@ -167,8 +167,30 @@ describe('HoverController', () => {
     t.timers.fire();
     await flush();
     expect(t.calls).toHaveLength(2);
-    expect(t.cache.size).toBe(1);
     expect(t.shown.filter(Boolean)).toHaveLength(0);
+  });
+
+  it('asks again while the server warms, then keeps its answer', async () => {
+    const SYNTAX: CodeHover = { text: 'fn helper()', source: 'syntax' };
+    const answers: (CodeHover | null)[] = [null, SYNTAX, LSP, SYNTAX];
+    const t = setup(() => Promise.resolve(answers.shift()!));
+    const hover = async () => {
+      t.ctl.move('pr1', 'h1', at(5), false, 'a');
+      t.timers.fire();
+      await flush();
+      t.ctl.leave();
+    };
+    // Nothing yet, then a by-name answer: neither is kept.
+    await hover();
+    expect(t.cache.size).toBe(0);
+    await hover();
+    expect(t.shown.at(-2)?.hover).toBe(SYNTAX);
+    expect(t.cache.size).toBe(0);
+    // The server's answer is kept: no more requests.
+    await hover();
+    await hover();
+    expect(t.calls).toHaveLength(3);
+    expect(t.shown.at(-2)?.hover).toBe(LSP);
   });
 });
 

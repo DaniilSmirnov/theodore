@@ -178,9 +178,7 @@ impl BbHttp {
                     }
 
                     if status.is_server_error() {
-                        return Err(HostError::Network(format!(
-                            "server error {status} after retries"
-                        )));
+                        return Err(HostError::Server(format!("{status} after retries")));
                     }
 
                     return resp

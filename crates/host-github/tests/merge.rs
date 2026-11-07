@@ -123,14 +123,29 @@ async fn enqueue_calls_the_mutation() {
 }
 
 #[tokio::test]
-async fn update_branch_succeeds_when_the_mutation_reports_success() {
+async fn update_branch_succeeds_when_the_mutation_returns_the_pull_request() {
     let s = support::servers().await;
 
+    // GitHub's `UpdatePullRequestBranchPayload` has only `clientMutationId`
+    // and `pullRequest`: a query selecting `success` is rejected outright.
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("updatePullRequestBranch"))
+        .and(body_string_contains("success"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "errors": [{
+                "message": "Field 'success' doesn't exist on type 'UpdatePullRequestBranchPayload'",
+                "extensions": { "code": "undefinedField" }
+            }]
+        })))
+        .with_priority(1)
+        .mount(&s.graphql)
+        .await;
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_string_contains("updatePullRequestBranch"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "data": { "updatePullRequestBranch": { "success": true } }
+            "data": { "updatePullRequestBranch": { "pullRequest": { "id": "PR_node_42" } } }
         })))
         .mount(&s.graphql)
         .await;
@@ -139,14 +154,14 @@ async fn update_branch_succeeds_when_the_mutation_reports_success() {
 }
 
 #[tokio::test]
-async fn update_branch_is_a_conflict_when_the_mutation_reports_failure() {
+async fn update_branch_is_a_conflict_when_the_mutation_returns_no_pull_request() {
     let s = support::servers().await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_string_contains("updatePullRequestBranch"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "data": { "updatePullRequestBranch": { "success": false } }
+            "data": { "updatePullRequestBranch": { "pullRequest": null } }
         })))
         .mount(&s.graphql)
         .await;

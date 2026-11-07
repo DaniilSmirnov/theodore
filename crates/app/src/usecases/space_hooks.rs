@@ -38,6 +38,7 @@ pub(crate) fn initial_setup(
         error: None,
         notes,
         finished_at: None,
+        from_worktree: false,
     })
 }
 
@@ -58,6 +59,8 @@ pub(crate) fn interrupted_patch(
         patch.insert("status".into(), serde_json::json!(SpaceStatus::Failed));
         patch.insert("run".into(), serde_json::Value::Null);
         patch.insert("error".into(), serde_json::json!(WHY));
+        patch.insert("attention_at".into(), serde_json::json!(now));
+        patch.insert("updated_at".into(), serde_json::json!(now));
     }
     // Its `ask_user` wait ended with the process that asked.
     if space.question.is_some() {
@@ -124,6 +127,7 @@ impl Core {
             error: None,
             notes: vec![],
             finished_at: None,
+            from_worktree: false,
         });
         f(&mut setup);
         self.patch_space(
@@ -152,6 +156,7 @@ impl Core {
             setup.status = status;
             setup.goal_pending = false;
             setup.finished_at = Some(now);
+            setup.from_worktree = false;
             setup.notes.extend(note);
             self.patch_space(id, serde_json::json!({ "setup": setup, "updated_at": now }))
                 .await?;
@@ -190,8 +195,15 @@ impl Core {
         let Ok(project) = self.space_project(&space).await else {
             return;
         };
-        let cfg = self.space_config_of(&space, &project).await;
+        let cfg = self.setup_config_of(&space, &project).await;
         let Some(script) = cfg.runnable(SpaceCommandKind::Setup) else {
+            if space.setup.as_ref().is_some_and(|s| s.from_worktree) {
+                // The file changed after Allow: a new set, asked again.
+                let _ = self
+                    .update_setup(id, |s| s.status = SetupStatus::Waiting)
+                    .await;
+                return;
+            }
             let _ = self
                 .finish_setup(
                     id,
@@ -255,16 +267,30 @@ impl Core {
                     return Err(AppError::Invalid("setup isn't failed".into()));
                 }
                 let project = self.space_project(&space).await?;
-                let cfg = self.space_config_of(&space, &project).await;
+                let (cfg, from_worktree) = self.retry_setup_config(&space, &project).await;
                 if cfg.runnable(SpaceCommandKind::Setup).is_none() {
-                    return Err(AppError::Invalid(
-                        "there is no allowed setup command to run".into(),
-                    ));
+                    if !from_worktree {
+                        return Err(AppError::Invalid(
+                            "there is no allowed setup command to run".into(),
+                        ));
+                    }
+                    // "Fix with agent" changed the command: its fingerprint
+                    // is new, so the trust prompt asks about this set.
+                    self.patch_space(&space.id, serde_json::json!({ "commands_denied": false }))
+                        .await?;
+                    return self
+                        .update_setup(&space.id, |s| {
+                            s.status = SetupStatus::Waiting;
+                            s.error = None;
+                            s.from_worktree = true;
+                        })
+                        .await;
                 }
                 let space = self
                     .update_setup(&space.id, |s| {
                         s.status = SetupStatus::Running;
                         s.error = None;
+                        s.from_worktree = from_worktree;
                     })
                     .await?;
                 self.spawn_setup(&space.id);
@@ -324,7 +350,7 @@ impl Core {
             .and_then(|s| s.error.clone())
             .ok_or_else(|| AppError::Invalid("setup hasn't failed".into()))?;
         let project = self.space_project(&row).await?;
-        let cfg = self.space_config_of(&row, &project).await;
+        let cfg = self.setup_config_of(&row, &project).await;
         let script = cfg
             .command(SpaceCommandKind::Setup)
             .map(|c| c.script)
@@ -353,7 +379,7 @@ impl Core {
     pub async fn space_trust(&self, req: SpaceTrustRequest) -> AppResult<Space> {
         let space = self.space_row(&req.space).await?;
         let project = self.space_project(&space).await?;
-        let cfg = self.space_config_of(&space, &project).await;
+        let cfg = self.prompt_config_of(&space, &project).await;
         let repo = cfg
             .repo
             .as_ref()
@@ -368,13 +394,27 @@ impl Core {
                 .as_ref()
                 .is_some_and(|x| x.status == SetupStatus::Waiting)
         };
+        // A Retry asking about the worktree's commands: the base's stay as
+        // they were, allowed or not, for this space's `run` and every other.
+        let own_file = waiting(&space) && space.setup.as_ref().is_some_and(|s| s.from_worktree);
         if req.allow {
-            self.store_trust(&project.id, &repo.hash).await?;
+            if own_file {
+                self.add_trust(&project.id, &repo.hash).await?;
+            } else {
+                self.store_trust(&project.id, &repo.hash).await?;
+            }
             self.patch_space(&space.id, serde_json::json!({ "commands_denied": false }))
                 .await?;
             // Every space of the project waiting on this answer goes on.
             for s in self.list_spaces(Some(project.id.clone())).await? {
-                if waiting(&s) && (s.id == space.id || !s.commands_denied) {
+                let answered = s.id == space.id
+                    || (!s.commands_denied
+                        && self
+                            .prompt_config_of(&s, &project)
+                            .await
+                            .runnable(SpaceCommandKind::Setup)
+                            .is_some());
+                if waiting(&s) && answered {
                     let _ = self
                         .update_setup(&s.id, |x| x.status = SetupStatus::Running)
                         .await;
@@ -382,6 +422,15 @@ impl Core {
                 }
             }
             return self.space_row(&space.id).await;
+        }
+        if own_file {
+            return self
+                .finish_setup(
+                    &space.id,
+                    SetupStatus::Skipped,
+                    Some("the changed setup command was not run".into()),
+                )
+                .await;
         }
         self.patch_space(&space.id, serde_json::json!({ "commands_denied": true }))
             .await?;
@@ -688,7 +737,7 @@ impl Core {
     pub async fn space_config(&self, space: &str) -> AppResult<SpaceConfigView> {
         let space = self.space_row(space).await?;
         let project = self.space_project(&space).await?;
-        let cfg = self.space_config_of(&space, &project).await;
+        let cfg = self.prompt_config_of(&space, &project).await;
         let commands = [
             SpaceCommandKind::Setup,
             SpaceCommandKind::Run,

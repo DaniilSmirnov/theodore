@@ -38,6 +38,9 @@ pub const ALLOWED_SIGNED_OUT: &[&str] = &[
     "account_sign_in_cancel",
     "account_sign_out",
     "focus_window",
+    // Asked once at startup, signed in or not: a later sign-in has no second
+    // asking, and links would wait behind it for good.
+    "take_pending_space",
     // Telemetry: UI errors on the sign-in screen still reach the log, and
     // a broken sign-in can still be reported (docs/telemetry.md), also as
     // a GitHub issue: that posts with the GitHub token, not the account.
@@ -151,6 +154,7 @@ mod tests {
             "account_sign_in_cancel",
             "account_sign_out",
             "focus_window",
+            "take_pending_space",
             "log_client",
             "track_ui",
             "telemetry_status",

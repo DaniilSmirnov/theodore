@@ -109,7 +109,8 @@ body {
 .ln .src {
   /* Real code has long lines: wrap them instead of hiding the tail. */
   white-space: pre-wrap;
-  word-break: break-all;
+  /* Break at word boundaries; split a word only when it alone is too wide. */
+  overflow-wrap: anywhere;
   tab-size: 4;
 }
 /* Always laid out (never `display: none`), so the row's last grid track
@@ -164,6 +165,11 @@ body {
 }
 .ln.split > .side + .side {
   border-left: 1px solid var(--separator);
+}
+/* A split diff's half is narrow: a line's threads and drafts start under
+ * its code, not 108px in, so a card's actions stay inside it. */
+.split-col .ln-notes {
+  padding-left: 0.75rem;
 }
 .ln.split.t-add,
 .ln.split.t-del {
@@ -354,6 +360,65 @@ body.cmd .lines .src span:hover {
 .toast__title,
 .toast__description {
   overflow-wrap: anywhere;
+}
+
+/* Space header: it is its own container, so what gives way follows the
+ * room it has, not the window (the sidebar and the changes pane change
+ * that). First the labels of the secondary actions go (Logs, Terminal, Run,
+ * Open app, PR); then "Base moved: 2 commits behind" becomes "2 behind";
+ * narrower still, Push and Review too. What still doesn't fit wraps to a
+ * second line under the title (SpacePage.tsx). */
+.space-header {
+  container: space-header / inline-size;
+}
+@container space-header (max-width: 74rem) {
+  .space-header .btn-label {
+    display: none;
+  }
+  .space-header .btn-collapsible {
+    padding-inline: 0.5rem;
+  }
+}
+/* A wide header keeps the whole "Base moved: 2 commits behind". */
+@container space-header (max-width: 56rem) {
+  .space-header .base-moved-lead,
+  .space-header .base-moved-long {
+    display: none;
+  }
+}
+@container space-header (max-width: 48rem) {
+  .space-header .btn-label-narrow {
+    display: none;
+  }
+  .space-header .btn-collapsible-narrow {
+    padding-inline: 0.5rem;
+  }
+}
+
+/* Composer footer: the chips share it with Send now, Queue and Stop. As the
+ * box narrows, Send now becomes an icon (its tooltip says the rest), then the
+ * model chip drops its effort; the mode chip never shrinks (Composer.tsx). */
+.composer-suffix {
+  container: composer-suffix / inline-size;
+}
+.composer-suffix .send-now-icon {
+  display: none;
+}
+@container composer-suffix (max-width: 32rem) {
+  .composer-suffix .send-now-label {
+    display: none;
+  }
+  .composer-suffix .send-now-icon {
+    display: inline;
+  }
+  .composer-suffix .send-now {
+    padding-inline: 0.5rem;
+  }
+}
+@container composer-suffix (max-width: 24rem) {
+  .composer-suffix .agent-effort {
+    display: none;
+  }
 }
 
 /* Markdown (PR descriptions, comments) */
@@ -664,6 +729,12 @@ body.cmd .lines .src span:hover {
   border-radius: 9999px;
   border: 1px solid var(--separator);
   box-shadow: 0 6px 24px rgb(0 0 0 / 0.12);
+}
+/* In its own strip under the page (App.tsx): nothing to float over, and
+ * the whole width to say it in. */
+.status-strip .status-banner.alert {
+  max-width: 100%;
+  box-shadow: none;
 }
 .status-banner .alert__content {
   flex-direction: row;

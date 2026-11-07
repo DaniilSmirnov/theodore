@@ -351,6 +351,10 @@ export const ReviewerPicker = observer(function ReviewerPicker({
   const requested = new Set(
     (detail?.reviewers ?? []).filter((r) => !r.team).map((r) => r.person.login),
   );
+  // The host refuses a review request from the PR's author.
+  const candidates = Array.isArray(users)
+    ? users.filter((u) => u.login !== detail?.summary?.author?.login)
+    : [];
 
   useEffect(() => {
     if (!open || users) return;
@@ -378,6 +382,10 @@ export const ReviewerPicker = observer(function ReviewerPicker({
           <div className="flex items-center gap-2 px-4 py-3 text-sm text-muted">
             <Spinner /> Loading…
           </div>
+        ) : candidates.length === 0 ? (
+          <div className="px-4 py-3 text-sm text-muted">
+            No one else can review this PR
+          </div>
         ) : (
           <Dropdown.Menu
             aria-label="Reviewers"
@@ -397,7 +405,7 @@ export const ReviewerPicker = observer(function ReviewerPicker({
               }
             }}
           >
-            {users.map((u) => (
+            {candidates.map((u) => (
               <Dropdown.Item key={u.login} id={u.login} textValue={u.login}>
                 {u.login}
               </Dropdown.Item>

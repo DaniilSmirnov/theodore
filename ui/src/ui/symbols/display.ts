@@ -1,4 +1,4 @@
-import type { SymbolHit } from '../../gen/contract';
+import type { SymbolHit, SymbolSource } from '../../gen/contract';
 
 export interface SymbolGroup {
   path: string;
@@ -35,6 +35,31 @@ export function countByKind(hits: readonly SymbolHit[]): {
     else references++;
   }
   return { definitions, references };
+}
+
+/** Least trusted first: a mixed answer is only as exact as its weakest
+ *  hit. No source is the grep fallback's. */
+const TRUST: SymbolSource[] = ['text', 'syntax', 'lsp'];
+
+const SOURCE_CHIP: Record<SymbolSource, { label: string; tip: string }> = {
+  lsp: { label: 'language server', tip: 'Resolved by the language server' },
+  syntax: { label: 'parser', tip: 'Matched by name, not a language server' },
+  text: {
+    label: 'text search',
+    tip: 'Matched by pattern, not a language server',
+  },
+};
+
+/** The peek's "who found these" chip for `hits`: their least trusted
+ *  source. `null` for no hits. */
+export function sourceChip(
+  hits: readonly SymbolHit[],
+): { label: string; tip: string } | null {
+  if (hits.length === 0) return null;
+  const weakest = Math.min(
+    ...hits.map((h) => TRUST.indexOf(h.source ?? 'text')),
+  );
+  return SOURCE_CHIP[TRUST[weakest]!];
 }
 
 /** The tab the peek opens on: Definition when `find_symbol` found one,

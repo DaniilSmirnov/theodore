@@ -948,3 +948,424 @@ async fn fix_with_agent_refuses_when_setup_has_not_failed() {
     let err = e.core.space_fix_setup(&s.id).await.unwrap_err();
     assert!(err.to_string().contains("hasn't failed"), "{err}");
 }
+
+#[tokio::test]
+async fn a_committed_local_file_gets_the_repos_limits() {
+    let e = started().await;
+    let folder = Path::new(e.project.path.as_deref().unwrap());
+    std::fs::create_dir_all(folder.join(".theodore")).unwrap();
+    std::fs::write(
+        folder.join(".theodore/config.local.yaml"),
+        "code_intel: {lsp: {review: true}}\nspaces: {setup: \"touch pwned\"}\n",
+    )
+    .unwrap();
+
+    // Untracked: it's yours, nothing to ask.
+    let layers = e.core.project_layers(&e.project, None).await;
+    let cfg = e.core.config_with_trust(&layers, &e.project, false).await;
+    assert!(cfg.merged.config.code_intel.lsp.review.unwrap_or(false));
+    assert!(
+        cfg.runnable(theodore_contract::SpaceCommandKind::Setup)
+            .is_some()
+    );
+
+    // Committed: anyone who can push wrote it.
+    e.f.git
+        .tracked
+        .lock()
+        .unwrap()
+        .push(".theodore/config.local.yaml".into());
+    let layers = e.core.project_layers(&e.project, None).await;
+    let cfg = e.core.config_with_trust(&layers, &e.project, false).await;
+    assert!(
+        !cfg.merged.config.code_intel.lsp.review.unwrap_or(false),
+        "a repo can't turn servers on"
+    );
+    assert_eq!(
+        cfg.runnable(theodore_contract::SpaceCommandKind::Setup),
+        None,
+        "its commands wait for your Allow"
+    );
+}
+
+// ── a refused archive ─────────────────────────────────────────────────────
+
+/// Archive refused over an unfinished rebase: nothing is half-done, so the
+/// dev server keeps running.
+#[tokio::test]
+async fn a_refused_archive_leaves_the_running_commands_alone() {
+    let e = started().await;
+    e.global("spaces: {run: pnpm dev}");
+    e.f.commands.on(
+        "pnpm dev",
+        FakeScript::Hang {
+            lines: vec!["up".into()],
+        },
+    );
+    let s = e.create("").await;
+    e.core
+        .space_run(SpaceRunRequest {
+            space: s.id.clone(),
+            start: true,
+        })
+        .await
+        .unwrap();
+    e.until(&s.id, |s| {
+        s.process
+            .as_ref()
+            .is_some_and(|p| p.status == ProcessStatus::Running)
+    })
+    .await;
+    e.f.git
+        .push_checkpoint_error(theodore_ports::GitError::Busy(
+            theodore_ports::WorktreeBusy::Rebase,
+        ));
+    assert!(e.core.archive_space(&s.id).await.is_err());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let row = e.space(&s.id);
+    assert_ne!(row.status, SpaceStatus::Archived);
+    assert_eq!(
+        row.process.map(|p| p.status),
+        Some(ProcessStatus::Running),
+        "still serving"
+    );
+}
+
+// ── Retry reads the worktree's own config ─────────────────────────────────
+
+const WT_CONFIG: &str = ".theodore/config.yaml";
+
+fn in_worktree(s: &Space, yaml: &str) {
+    let path = Path::new(&s.worktree).join(WT_CONFIG);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, yaml).unwrap();
+}
+
+fn retry(s: &Space) -> SpaceSetupRequest {
+    SpaceSetupRequest {
+        space: s.id.clone(),
+        action: SetupAction::Retry,
+    }
+}
+
+/// A repo-file setup that fails, allowed; setup left `failed`.
+async fn failed_repo_setup(e: &Env) -> Space {
+    e.repo_file(WT_CONFIG, "spaces:\n  setup: broken\n  run: pnpm dev\n");
+    e.f.commands.on(
+        "broken",
+        FakeScript::Exit {
+            lines: vec![],
+            code: 1,
+        },
+    );
+    let s = e.create("Fix it").await;
+    assert_eq!(setup_status(&s), Some(SetupStatus::Waiting));
+    let hash = e
+        .core
+        .space_config(&s.id)
+        .await
+        .unwrap()
+        .repo_commands
+        .unwrap()
+        .hash;
+    e.core
+        .space_trust(SpaceTrustRequest {
+            space: s.id.clone(),
+            allow: true,
+            hash,
+        })
+        .await
+        .unwrap();
+    e.until(&s.id, |s| setup_status(s) == Some(SetupStatus::Failed))
+        .await
+}
+
+#[tokio::test]
+async fn retry_runs_the_worktrees_fixed_command_after_allow() {
+    let e = started().await;
+    let s = failed_repo_setup(&e).await;
+    let base_hash = e
+        .core
+        .space_config(&s.id)
+        .await
+        .unwrap()
+        .repo_commands
+        .unwrap()
+        .hash;
+
+    // What "Fix with agent" leaves: the worktree's file, not the base's.
+    in_worktree(&s, "spaces:\n  setup: fixed\n  run: pnpm dev\n");
+    let row = e.core.space_setup(retry(&s)).await.unwrap();
+    assert_eq!(setup_status(&row), Some(SetupStatus::Waiting), "it asks");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(e.f.commands.scripts(), ["broken"], "nothing ran unapproved");
+    assert_eq!(e.agent_runs(), 0);
+
+    // The prompt shows the changed command, with its own fingerprint.
+    let view = e.core.space_config(&s.id).await.unwrap();
+    let repo = view.repo_commands.expect("repo commands");
+    assert!(!repo.trusted);
+    assert_ne!(repo.hash, base_hash);
+    assert!(
+        repo.items
+            .iter()
+            .any(|i| i.key == "spaces.setup" && i.value == "fixed"),
+        "{:?}",
+        repo.items
+    );
+    let stale = e
+        .core
+        .space_trust(SpaceTrustRequest {
+            space: s.id.clone(),
+            allow: true,
+            hash: base_hash.clone(),
+        })
+        .await;
+    assert!(stale.is_err(), "the hash of the commands it shows, only");
+
+    e.f.agents.push_script(done("ok"));
+    e.core
+        .space_trust(SpaceTrustRequest {
+            space: s.id.clone(),
+            allow: true,
+            hash: repo.hash.clone(),
+        })
+        .await
+        .unwrap();
+    let row = e
+        .until(&s.id, |s| {
+            setup_status(s) == Some(SetupStatus::Done) && s.turns == 1
+        })
+        .await;
+    assert_eq!(e.f.commands.scripts(), ["broken", "fixed"]);
+
+    // Nothing else moved to the worktree: `run` and the view are the base's
+    // again, still allowed.
+    assert_eq!(setup_status(&row), Some(SetupStatus::Done));
+    let view = e.core.space_config(&s.id).await.unwrap();
+    let repo = view.repo_commands.expect("repo commands");
+    assert_eq!(repo.hash, base_hash);
+    assert!(
+        repo.trusted,
+        "allowing the fix keeps the base's set allowed"
+    );
+}
+
+#[tokio::test]
+async fn run_check_and_archive_keep_reading_the_base() {
+    let e = started().await;
+    let s = failed_repo_setup(&e).await;
+    in_worktree(
+        &s,
+        "spaces:\n  setup: fixed\n  run: worktree-run\n  check: worktree-check\n  archive: worktree-archive\n",
+    );
+    e.f.commands.on(
+        "pnpm dev",
+        FakeScript::Hang {
+            lines: vec!["up".into()],
+        },
+    );
+    e.core
+        .space_run(SpaceRunRequest {
+            space: s.id.clone(),
+            start: true,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !e.f.commands
+            .scripts()
+            .iter()
+            .any(|c| c.starts_with("worktree-")),
+        "{:?}",
+        e.f.commands.scripts()
+    );
+    e.core.archive_space(&s.id).await.unwrap();
+    assert!(
+        !e.f.commands
+            .scripts()
+            .iter()
+            .any(|c| c.starts_with("worktree-")),
+        "{:?}",
+        e.f.commands.scripts()
+    );
+}
+
+#[tokio::test]
+async fn a_worktree_without_its_own_setup_retries_the_bases() {
+    let e = started().await;
+    let s = failed_repo_setup(&e).await;
+    // No file in the worktree: the base's command again, no prompt.
+    let row = e.core.space_setup(retry(&s)).await.unwrap();
+    assert_eq!(setup_status(&row), Some(SetupStatus::Running));
+    e.until(&s.id, |s| setup_status(s) == Some(SetupStatus::Failed))
+        .await;
+    assert_eq!(e.f.commands.scripts(), ["broken", "broken"]);
+
+    // A file with no setup in it: the same.
+    in_worktree(&s, "spaces:\n  run: pnpm dev\n");
+    let row = e.core.space_setup(retry(&s)).await.unwrap();
+    assert_eq!(setup_status(&row), Some(SetupStatus::Running));
+    e.until(&s.id, |s| setup_status(s) == Some(SetupStatus::Failed))
+        .await;
+    assert_eq!(e.f.commands.scripts(), ["broken", "broken", "broken"]);
+}
+
+#[tokio::test]
+async fn retry_in_a_repo_less_project_asks_and_skips_the_worktrees_local_file() {
+    let e = started().await;
+    e.global("spaces: {setup: make setup}");
+    e.f.commands.on(
+        "make setup",
+        FakeScript::Exit {
+            lines: vec![],
+            code: 1,
+        },
+    );
+    let s = e.create("Fix it").await;
+    let s = e
+        .until(&s.id, |s| setup_status(s) == Some(SetupStatus::Failed))
+        .await;
+    // The repo-less project: the worktree's setup applies to Retry, behind
+    // the prompt, as any repo command.
+    in_worktree(&s, "spaces:\n  setup: fixed\n");
+    let row = e.core.space_setup(retry(&s)).await.unwrap();
+    assert_eq!(setup_status(&row), Some(SetupStatus::Waiting));
+    // Not now: skipped, and your own command is not denied by it.
+    let hash = e
+        .core
+        .space_config(&s.id)
+        .await
+        .unwrap()
+        .repo_commands
+        .unwrap()
+        .hash;
+    e.f.agents.push_script(done("ok"));
+    let row = e
+        .core
+        .space_trust(SpaceTrustRequest {
+            space: s.id.clone(),
+            allow: false,
+            hash,
+        })
+        .await
+        .unwrap();
+    assert_eq!(setup_status(&row), Some(SetupStatus::Skipped));
+    assert!(!row.commands_denied);
+    assert_eq!(e.f.commands.scripts(), ["make setup"]);
+
+    // The personal local file is never read from a worktree.
+    std::fs::write(
+        Path::new(&s.worktree).join(".theodore/config.local.yaml"),
+        "spaces:\n  setup: from-the-worktrees-local\n",
+    )
+    .unwrap();
+    std::fs::remove_file(Path::new(&s.worktree).join(WT_CONFIG)).unwrap();
+    e.core.space_setup(retry(&s)).await.unwrap();
+    e.until(&s.id, |s| setup_status(s) == Some(SetupStatus::Failed))
+        .await;
+    assert_eq!(e.f.commands.scripts(), ["make setup", "make setup"]);
+}
+
+/// A host project has no checkout: the base's file comes from the cache,
+/// the worktree's from disk.
+#[tokio::test]
+async fn retry_in_a_host_project_reads_the_worktree_too() {
+    let e = started().await;
+    let repo = theodore_domain::RepoRef {
+        host: theodore_domain::HostKind::Github,
+        owner: "acme".into(),
+        name: "widget".into(),
+    };
+    let project = Project {
+        id: "github:acme/widget".into(),
+        repo,
+        path: None,
+        status: theodore_contract::ProjectStatus::Ready,
+        error: None,
+        default_branch: Some("main".into()),
+        added_at: 0,
+        description: None,
+        private: false,
+        pushed_at: None,
+        last_fetched_at: Some(0),
+    };
+    e.core
+        .apply(vec![theodore_ports::NewAction {
+            model: models::PROJECT.into(),
+            model_id: project.id.clone(),
+            action: theodore_ports::SyncActionCode::I,
+            data: Some(serde_json::to_value(&project).unwrap()),
+        }])
+        .await
+        .unwrap();
+    e.f.git.put_file(
+        &Sha::new("base000"),
+        WT_CONFIG,
+        b"spaces:\n  setup: broken\n",
+    );
+    e.f.commands.on(
+        "broken",
+        FakeScript::Exit {
+            lines: vec![],
+            code: 1,
+        },
+    );
+    let s = e
+        .core
+        .create_space(CreateSpaceRequest {
+            project: project.id.clone(),
+            goal: String::new(),
+            name: None,
+            branch: None,
+            base: None,
+            agent: None,
+            model: None,
+            start_from: None,
+        })
+        .await
+        .unwrap();
+    let hash = e
+        .core
+        .space_config(&s.id)
+        .await
+        .unwrap()
+        .repo_commands
+        .unwrap()
+        .hash;
+    e.core
+        .space_trust(SpaceTrustRequest {
+            space: s.id.clone(),
+            allow: true,
+            hash,
+        })
+        .await
+        .unwrap();
+    let s = e
+        .until(&s.id, |s| setup_status(s) == Some(SetupStatus::Failed))
+        .await;
+
+    in_worktree(&s, "spaces:\n  setup: fixed\n");
+    let row = e.core.space_setup(retry(&s)).await.unwrap();
+    assert_eq!(setup_status(&row), Some(SetupStatus::Waiting));
+    let repo = e
+        .core
+        .space_config(&s.id)
+        .await
+        .unwrap()
+        .repo_commands
+        .unwrap();
+    assert!(repo.items.iter().any(|i| i.value == "fixed"));
+    e.core
+        .space_trust(SpaceTrustRequest {
+            space: s.id.clone(),
+            allow: true,
+            hash: repo.hash,
+        })
+        .await
+        .unwrap();
+    e.until(&s.id, |s| setup_status(s) == Some(SetupStatus::Done))
+        .await;
+    assert_eq!(e.f.commands.scripts(), ["broken", "fixed"]);
+}

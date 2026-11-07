@@ -28,7 +28,12 @@ pub(crate) fn ensure_askpass(root: &Path) -> GitResult<PathBuf> {
     let path = root.join(ASKPASS_NAME);
     let current = std::fs::read_to_string(&path).ok();
     if current.as_deref() != Some(ASKPASS_SCRIPT) {
-        let tmp = root.join(".askpass.sh.tmp");
+        // A temp name of its own per call: two first clones at once (a fresh
+        // data dir, several projects added together) each write and rename
+        // their own file, instead of one renaming the other's away mid-write.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = root.join(format!(".askpass.sh.{}.{n}.tmp", std::process::id()));
         {
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(ASKPASS_SCRIPT.as_bytes())?;
@@ -75,4 +80,32 @@ pub(crate) fn remote_pr_ref(host: HostKind, number: u64) -> String {
 /// cheap no-op and the sha survives a `gc`.
 pub(crate) fn local_pr_ref(number: u64) -> String {
     format!("refs/theodore/pr/{number}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_first_writes_of_the_askpass_helper_all_succeed() {
+        for _ in 0..20 {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("fresh");
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let root = root.clone();
+                    std::thread::spawn(move || ensure_askpass(&root))
+                })
+                .collect();
+            for h in handles {
+                let path = h.join().unwrap().expect("askpass written");
+                assert_eq!(std::fs::read_to_string(path).unwrap(), ASKPASS_SCRIPT);
+            }
+            let leftovers = std::fs::read_dir(&root)
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().file_name() != ASKPASS_NAME)
+                .count();
+            assert_eq!(leftovers, 0);
+        }
+    }
 }

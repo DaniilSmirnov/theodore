@@ -1,4 +1,5 @@
 import {
+  Archive,
   ArrowRightFromSquare,
   BranchesRight,
   ChevronDown,
@@ -32,7 +33,7 @@ import { observer } from 'mobx-react-lite';
 import { useEffect, useState, type ReactNode } from 'react';
 import type { Space } from '../gen/contract';
 import { useRootStore, useUi } from '../stores/context';
-import { sameRoute, type Route } from '../stores/UiStore';
+import { sameRoute, type Route, type UiStore } from '../stores/UiStore';
 import { api } from '../core/api';
 import { Avatar, K, Spinner } from './bits';
 import { contextMenuHandler, type ContextMenuItem } from './ContextMenu';
@@ -46,10 +47,12 @@ import { WorkspaceSwitcher } from './WorkspaceSwitcher';
 import { markSpaceUnseen, spaceSeen } from './space/seen';
 import { isBuildMode } from './space/mode';
 import { PrGlyph } from './space/SpacePr';
+import { archive } from './space/SpacePage';
 import {
   canMarkUnread,
   spaceGlyph,
   spaceTitle,
+  withPrNumber,
   spacesIn,
   type SpaceGlyph,
 } from './space/spaces';
@@ -66,11 +69,23 @@ interface NavItem {
   contextMenu?: () => ContextMenuItem[];
   /** A pinned space (docs/spaces.md §3): sorts first, marked with a small pin. */
   pinned?: boolean;
+  /** A space row's hover button; disabled while its turn runs, as on the
+   *  space page. */
+  onArchive?: () => void;
+  archiveDisabled?: boolean;
 }
 
-/** Pin/unpin and "Mark as unread" (docs/spaces.md §3) — the sidebar's
- *  right-click menu and ⌘K share this. */
-export function spaceContextMenu(s: Space): ContextMenuItem[] {
+/** Archive from the sidebar: the space page's own `archive`, which steps
+ *  back off the page — but only when this is the space that is open. A
+ *  refusal (a turn running) is toasted by api.ts. */
+function archiveFromSidebar(ui: UiStore, s: Space) {
+  if (ui.route.name === 'space' && ui.route.id === s.id) archive(ui, s);
+  else void api.archiveSpace(s.id).catch(() => {});
+}
+
+/** Pin/unpin, "Mark as unread" and Archive (docs/spaces.md §3) — the
+ *  sidebar's right-click menu. */
+export function spaceContextMenu(s: Space, ui: UiStore): ContextMenuItem[] {
   const pinned = s.pinned ?? false;
   return [
     {
@@ -96,6 +111,14 @@ export function spaceContextMenu(s: Space): ContextMenuItem[] {
           },
         ]
       : []),
+    {
+      id: 'archive',
+      label: 'Archive',
+      icon: <Archive className="size-4" />,
+      isDisabled: s.status === 'running',
+      disabledReason: 'Stop the agent before archiving',
+      onAction: () => archiveFromSidebar(ui, s),
+    },
   ];
 }
 
@@ -276,20 +299,14 @@ export const Sidebar = observer(function Sidebar() {
                     ) : (
                       <SpaceGlyphIcon g={g} />
                     ),
-                  label: pr
-                    ? `#${pr.pr.number} ${spaceTitle(s)}`
-                    : spaceTitle(s),
+                  label: withPrNumber(pr?.pr.number, spaceTitle(s)),
                   route: { name: 'space', id: s.id },
+                  contextMenu: () => spaceContextMenu(s, ui),
+                  pinned: s.pinned ?? false,
+                  onArchive: () => archiveFromSidebar(ui, s),
+                  archiveDisabled: s.status === 'running',
                 };
               }),
-              ...spaces.map((s): NavItem => ({
-                key: routeKey({ name: 'space', id: s.id }),
-                icon: <SpaceGlyphIcon g={spaceGlyph(s, spaceSeen.get(s.id))} />,
-                label: spaceTitle(s),
-                route: { name: 'space', id: s.id },
-                contextMenu: () => spaceContextMenu(s),
-                pinned: s.pinned ?? false,
-              })),
               {
                 key: 'new-space',
                 icon: <Plus />,
@@ -383,6 +400,35 @@ export const Sidebar = observer(function Sidebar() {
                       {i.n}
                     </span>
                   )}
+                  {i.onArchive && (
+                    // Over the row's right edge on a fade, so the label
+                    // doesn't shift. Pressing it archives and nothing else:
+                    // React Aria's press stops at the button, and the click
+                    // is stopped too so no row handler sees it.
+                    <span
+                      className="space-archive absolute inset-y-0 end-0 flex items-center rounded-e-2xl bg-linear-to-l from-default from-70% to-transparent pe-1.5 ps-6 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 group-data-[focus-visible=true]:opacity-100"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <Tooltip>
+                        <Button
+                          isIconOnly
+                          size="sm"
+                          variant="ghost"
+                          aria-label="Archive space"
+                          className="size-6 min-w-6 rounded-xl text-muted"
+                          isDisabled={i.archiveDisabled}
+                          onPress={i.onArchive}
+                        >
+                          <Archive className="size-3.5" />
+                        </Button>
+                        <Tooltip.Content>
+                          {i.archiveDisabled
+                            ? 'Stop the agent before archiving'
+                            : 'Archive — removes the worktree; the transcript and checkpoints are kept'}
+                        </Tooltip.Content>
+                      </Tooltip>
+                    </span>
+                  )}
                 </span>
               </ListBox.Item>
             ))}
@@ -422,7 +468,7 @@ export const Sidebar = observer(function Sidebar() {
                   ui.closeListSearch();
                 }}
                 onContextMenu={contextMenuHandler(ui, () =>
-                  spaceContextMenu(s),
+                  spaceContextMenu(s, ui),
                 )}
               >
                 <span className="grid size-4 shrink-0 place-items-center text-muted [&>svg]:size-4">

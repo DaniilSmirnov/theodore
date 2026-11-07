@@ -263,6 +263,58 @@ async fn mirror_off_restores_cleanly_when_nothing_was_edited() {
 }
 
 #[tokio::test]
+async fn switching_isnt_refused_for_the_files_the_first_space_mirrored() {
+    let f = fixtures();
+    let (core, project) = folder_project(&f, "/tmp/mirror-switch-dirty").await;
+    let s1 = one_turn(&f, &core, &project, "first change").await;
+    f.git.push_mirror_sync(Ok(vec!["a.txt".into()]));
+    core.mirror_space(&s1.id).await.unwrap();
+    // git sees what mirroring wrote as the folder's own change.
+    f.git.set_working_state(theodore_ports::WorkingState {
+        current_branch: Some("main".into()),
+        dirty_files: 1,
+    });
+
+    f.agents.push_script(done("done"));
+    f.git.push_checkpoint(Sha::new("turn999"));
+    let s2 = core
+        .create_space(CreateSpaceRequest {
+            project: project.id.clone(),
+            goal: "second change".into(),
+            name: None,
+            branch: None,
+            base: None,
+            agent: None,
+            model: None,
+            start_from: None,
+        })
+        .await
+        .unwrap();
+    let s2 = idle(&f, &s2.id).await;
+    f.git.push_mirror_sync(Ok(vec!["d.txt".into()]));
+    let mirrored = core.mirror_space(&s2.id).await.unwrap();
+    assert!(mirrored.mirror.is_some());
+    assert!(space(&f, &s1.id).mirror.is_none());
+}
+
+#[tokio::test]
+async fn resuming_isnt_refused_for_the_spaces_own_mirrored_files() {
+    let f = fixtures();
+    let (core, project) = folder_project(&f, "/tmp/mirror-resume-dirty").await;
+    let s = one_turn(&f, &core, &project, "a change").await;
+    f.git.push_mirror_sync(Ok(vec!["a.txt".into()]));
+    core.mirror_space(&s.id).await.unwrap();
+    core.pause_resumed_mirrors().await;
+    f.git.set_working_state(theodore_ports::WorkingState {
+        current_branch: Some("main".into()),
+        dirty_files: 1,
+    });
+    f.git.push_mirror_sync(Ok(Vec::new()));
+    let resumed = core.mirror_space(&s.id).await.expect("resumes");
+    assert_eq!(resumed.mirror.unwrap().status, MirrorStatus::On);
+}
+
+#[tokio::test]
 async fn switching_restores_the_first_space_then_mirrors_the_second() {
     let f = fixtures();
     let (core, project) = folder_project(&f, "/tmp/mirror-switch").await;
@@ -328,6 +380,14 @@ async fn switching_is_refused_while_the_other_folder_was_edited() {
         matches!(&err, AppError::Invalid(m) if m.contains("a.txt")),
         "{err}"
     );
+    // s2 has no Discard of its own: the refusal says where it is.
+    let s1_title = s1.title.clone().unwrap_or_else(|| s1.name.clone());
+    assert!(
+        matches!(&err, AppError::Invalid(m)
+            if m.contains(&format!("\"{s1_title}\"")) && m.contains("open that space")
+                && !m.contains("Discard to overwrite")),
+        "{err}"
+    );
     assert!(space(&f, &s1.id).mirror.is_some(), "s1 stays on");
     assert!(space(&f, &s2.id).mirror.is_none(), "s2 never turned on");
 }
@@ -360,7 +420,7 @@ async fn a_mirror_left_on_comes_back_paused_and_resuming_keeps_its_remembered_st
 }
 
 #[tokio::test]
-async fn resuming_refuses_if_the_folder_is_dirty_now() {
+async fn resuming_refuses_if_the_folder_was_edited_since() {
     let f = fixtures();
     let (core, project) = folder_project(&f, "/tmp/mirror-pause-dirty").await;
     let s = one_turn(&f, &core, &project, "add a csv export").await;
@@ -368,12 +428,12 @@ async fn resuming_refuses_if_the_folder_is_dirty_now() {
     core.mirror_space(&s.id).await.unwrap();
     core.pause_resumed_mirrors().await;
 
-    f.git.set_working_state(theodore_ports::WorkingState {
-        current_branch: Some("main".into()),
-        dirty_files: 1,
-    });
+    f.git.set_mirror_edited(Ok(vec!["a.txt".into()]));
     let err = core.mirror_space(&s.id).await.unwrap_err();
-    assert!(matches!(err, AppError::Invalid(_)), "{err}");
+    assert!(
+        matches!(&err, AppError::Invalid(m) if m.contains("a.txt")),
+        "{err}"
+    );
     assert_eq!(
         space(&f, &s.id).mirror.unwrap().status,
         MirrorStatus::Paused,

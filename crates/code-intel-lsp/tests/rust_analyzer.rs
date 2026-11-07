@@ -55,6 +55,8 @@ async fn rust_analyzer_resolves_a_definition_in_this_crate() {
         }),
         workspace_folders: true,
         language_ids: vec![(LanguageId::new("rust"), "rust".into(), vec!["rs".into()])],
+        start_timeout_secs: None,
+        ready_settle_secs: None,
     };
     let options = SessionOptions {
         request_timeout: Duration::from_secs(120),

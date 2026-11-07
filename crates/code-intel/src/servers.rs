@@ -2,10 +2,12 @@
 //! lets it start, and how (docs/code-intel.md §6, §8).
 //!
 //! ```text
-//! open ─▶ server_for(lang) ─▶ (spec, install state)
+//! open ─▶ server_for(lang, code_intel.servers.<lang>) ─▶ (spec, install state)
 //!          └─ allowed(policy, trust)? ── no ──▶ never resolved, never started
 //!               └─ yes: on the machine or downloaded? ─▶ resolve ─▶ LaunchConfig ─▶ pool
-//!                   └─ missing ─▶ waits for install()   (no download here)
+//!                   ├─ missing ─▶ waits for install()   (no download here)
+//!                   ├─ its runtime missing or too old ─▶ NeedsRuntime: not started
+//!                   └─ runs the project's code and this is a review ─▶ TrustedOnly: not started
 //! ```
 //!
 //! | worktree        | switch                          | default | options sent                    |
@@ -56,17 +58,19 @@ pub(crate) struct ServerPlan {
     pub error: Option<String>,
 }
 
-/// The server for `language` in the worktree at `root`, resolved to a
-/// binary only when the policy allows starting it. `None`: the manifest
-/// lists no server. Probes run (`--version`); nothing is downloaded.
+/// The server for `language` in the worktree at `root`, `prefer` tried
+/// first, resolved to a binary only when the policy allows starting it.
+/// `None`: the manifest lists no server. Probes run (`--version`, each
+/// runtime); nothing is downloaded.
 pub(crate) async fn plan(
     toolchain: &Toolchain,
     language: &LanguageId,
+    prefer: Option<&str>,
     root: &Path,
     policy: LspPolicy,
     trust: TrustMode,
 ) -> Option<ServerPlan> {
-    let (spec, install) = toolchain.server_for(language, None, root, trust).await?;
+    let (spec, install) = toolchain.server_for(language, prefer, root, trust).await?;
     let on_disk = matches!(
         install,
         InstallState::System { .. } | InstallState::Installed { .. }
@@ -84,9 +88,31 @@ pub(crate) async fn plan(
     })
 }
 
+/// Why `plan` has no running server, for `Answer::note`.
+pub(crate) fn not_resolved_note(plan: &ServerPlan) -> String {
+    let name = &plan.spec.name;
+    match &plan.install {
+        InstallState::NeedsRuntime {
+            runtime,
+            min,
+            found,
+        } => {
+            let found = found
+                .as_ref()
+                .map(|f| format!(", found {f}"))
+                .unwrap_or_default();
+            format!("{name} needs {runtime} {min} or newer{found}")
+        }
+        InstallState::TrustedOnly => {
+            format!("{name} runs the project's code, so it serves spaces and not reviews")
+        }
+        _ => format!("{name} not installed"),
+    }
+}
+
 /// The pool's launch config for `plan`, serving `languages`. `None` when it
-/// is not resolved or its argv is not UTF-8. `trust` picks the options:
-/// review runs get `review_init_options` merged in.
+/// is not resolved or its argv or environment is not UTF-8. `trust` picks
+/// the options: review runs get `review_init_options` merged in.
 pub(crate) fn launch(
     toolchain: &Toolchain,
     plan: &ServerPlan,
@@ -112,13 +138,20 @@ pub(crate) fn launch(
             )
         })
         .collect();
+    let env = cfg
+        .env
+        .into_iter()
+        .map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect::<Option<Vec<(String, String)>>>()?;
     Some(LaunchConfig {
         server: plan.spec.name.clone(),
         argv,
-        env: Vec::new(),
+        env,
         init_options: cfg.init_options,
         workspace_folders: cfg.workspace_folders,
         language_ids,
+        start_timeout_secs: cfg.start_timeout_secs,
+        ready_settle_secs: cfg.ready_settle_secs,
     })
 }
 

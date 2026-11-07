@@ -17,17 +17,20 @@ use crate::meta::{self, WorktreeMeta};
 use crate::process::GitProc;
 
 impl GitCli {
-    /// Commits every change in `worktree` and pushes it to `branch` on
-    /// `repo`'s remote (plan §4 "Fix target": own or local PR). The
-    /// worktree is always a detached, Theodore-owned checkout, so `git add
-    /// -A` + commit is safe — there is no user branch to disturb.
+    /// Commits every change in `worktree` as `author` and pushes it to
+    /// `branch` on `repo`'s remote (plan §4 "Fix target": own or local PR).
+    /// The worktree is always a detached, Theodore-owned checkout, so `git
+    /// add -A` + commit is safe — there is no user branch to disturb.
     pub(crate) async fn commit_and_push_op(
         &self,
         worktree: &Path,
         repo: &RepoRef,
         branch: &str,
         message: &str,
+        author: &theodore_ports::Identity,
     ) -> GitResult<Sha> {
+        let name = format!("user.name={}", author.name);
+        let email = format!("user.email={}", author.email);
         let askpass = self.ensure_askpass()?;
         GitProc {
             cwd: worktree,
@@ -41,15 +44,7 @@ impl GitCli {
         GitProc {
             cwd: worktree,
             askpass: &askpass,
-            args: &[
-                "-c",
-                "user.name=Theodore",
-                "-c",
-                "user.email=theodore@localhost",
-                "commit",
-                "-m",
-                message,
-            ],
+            args: &["-c", &name, "-c", &email, "commit", "-m", message],
             token: None,
             stdin: None,
         }

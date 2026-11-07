@@ -190,7 +190,7 @@ async fn conflicts_wait_for_the_agent_and_theodore_commits_the_merge() {
     // Markers still there: nothing committed.
     let again = h
         .git
-        .space_merge_finish(&wt, "s1", &tip, "s1: merge main")
+        .space_merge_finish(&wt, "s1", &tip, &["a.txt".into()], "s1: merge main")
         .await;
     assert_eq!(again.unwrap(), SpaceMerge::Conflicts(vec!["a.txt".into()]));
 
@@ -199,7 +199,7 @@ async fn conflicts_wait_for_the_agent_and_theodore_commits_the_merge() {
     std::fs::write(wt.join("note.txt"), "why\n").unwrap();
     let done = h
         .git
-        .space_merge_finish(&wt, "s1", &tip, "s1: merge main")
+        .space_merge_finish(&wt, "s1", &tip, &["a.txt".into()], "s1: merge main")
         .await
         .unwrap();
     let SpaceMerge::Merged(head) = done else {
@@ -223,7 +223,7 @@ async fn a_merge_concluded_or_aborted_by_hand_is_recognised() {
 
     h.git.space_merge(&wt, "s1", &tip, "m").await.unwrap();
     git(&wt, &["merge", "--abort"]);
-    let left = h.git.space_merge_finish(&wt, "s1", &tip, "m").await;
+    let left = h.git.space_merge_finish(&wt, "s1", &tip, &[], "m").await;
     assert_eq!(left.unwrap(), SpaceMerge::NotMerging);
 
     h.git.space_merge(&wt, "s1", &tip, "m").await.unwrap();
@@ -231,7 +231,7 @@ async fn a_merge_concluded_or_aborted_by_hand_is_recognised() {
     git(&wt, &["commit", "-qam", "agent's own merge commit"]);
     let done = h
         .git
-        .space_merge_finish(&wt, "s1", &tip, "m")
+        .space_merge_finish(&wt, "s1", &tip, &[], "m")
         .await
         .unwrap();
     let SpaceMerge::Merged(head) = done else {
@@ -367,6 +367,31 @@ async fn push_after_an_update_merges_the_base_into_the_pr_branch() {
         .await
         .unwrap();
     assert_eq!(parents(&h.cache, &third.0), vec![pushed.0]);
+}
+
+/// `git add` clears the unmerged entry, not the markers in the file.
+#[tokio::test]
+async fn staged_conflict_markers_are_not_committed() {
+    let h = host().await;
+    let (wt, _) = h
+        .space_with("s1", "a.txt", "one\nTWO (space)\nthree\n")
+        .await;
+    let tip = h.base_moves("a.txt", "one\nTWO (base)\nthree\n").await;
+    let merged = h.git.space_merge(&wt, "s1", &tip, "s1: merge main").await;
+    assert_eq!(merged.unwrap(), SpaceMerge::Conflicts(vec!["a.txt".into()]));
+
+    git(&wt, &["add", "a.txt"]);
+    let left = h
+        .git
+        .space_merge_finish(&wt, "s1", &tip, &["a.txt".into()], "s1: merge main")
+        .await
+        .unwrap();
+    assert_eq!(left, SpaceMerge::Conflicts(vec!["a.txt".into()]));
+    assert_eq!(
+        h.git.worktree_busy(&wt).await.unwrap(),
+        Some(WorktreeBusy::Merge),
+        "still merging"
+    );
 }
 
 /// Open PR after an update: one commit on the new base, nothing else.

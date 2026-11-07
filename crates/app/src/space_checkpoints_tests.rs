@@ -481,5 +481,12 @@ async fn the_diff_follows_the_agent_during_a_turn_without_checkpoints() {
     core.space_stop(&s.id).await.unwrap();
     let s = idle(&f, &s.id).await;
     assert_eq!(s.head_sha, Sha::new("snap1"));
+    // The review follows right after the space goes idle.
+    for _ in 0..400 {
+        if head_of(&core).await == Some(Sha::new("snap1")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert_eq!(head_of(&core).await, Some(Sha::new("snap1")));
 }

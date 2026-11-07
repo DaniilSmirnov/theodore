@@ -6,17 +6,30 @@
  *  it in, and the real reply (a synced `ChatMessage`) replaces it. */
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+} from 'vitest';
 import { askRunId } from '../actions';
 import { setTransport } from '../core/transport';
 import { RootStore } from '../stores/RootStore';
 import { RootStoreProvider } from '../stores/context';
 import { FakeTransport } from '../test/fakeTransport';
 import { Harness, PR, revision, seed } from '../test/bigPr';
+import { installChatLayout, uninstallChatLayout } from '../test/chatLayout';
 import { SidePanel } from './SidePanel';
 
 // jsdom lays nothing out: the chat's scroll-to-bottom has nowhere to go.
 Element.prototype.scrollIntoView ??= function () {};
+
+// The log is virtual: it needs a view to know which rows to mount.
+beforeAll(installChatLayout);
+afterAll(uninstallChatLayout);
 
 let transport: FakeTransport;
 let store: RootStore;

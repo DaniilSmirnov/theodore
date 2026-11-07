@@ -337,6 +337,21 @@ fn symbol_at_definition_and_body() {
     assert_eq!(sym.kind, K::Function);
     assert_eq!(body, "pub fn target(x: i32) -> i32 {\n    x + 1\n}");
     assert!(idx.symbol_body(&snap, "src/a/near.rs", "nope").is_err());
+
+    // The file moved under the index: its ranges are another text's, so
+    // the body is refused rather than read off the wrong bytes.
+    std::fs::write(
+        dir.path().join("src/a/near.rs"),
+        "// a comment added since\npub fn target(x: i32) -> i32 {\n    x + 1\n}\n",
+    )
+    .unwrap();
+    let err = idx
+        .symbol_body(&snap, "src/a/near.rs", "target")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("changed since it was indexed"),
+        "{err}"
+    );
 }
 
 #[test]

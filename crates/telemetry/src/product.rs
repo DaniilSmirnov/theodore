@@ -85,6 +85,23 @@ pub enum ProductEvent {
     ProblemReported {
         mode: String,
     },
+    /// An update is on disk and waits for a restart. The running version
+    /// is `app_version`, as on every event.
+    UpdateInstalled {
+        version: String,
+    },
+    /// An update check or download failed: `read_only` (the app runs from
+    /// the disk image or a translocated copy), `network`, `signature`,
+    /// `other`.
+    UpdateFailed {
+        reason: String,
+    },
+    /// The first-launch "Move to Applications?" answer: `moved`,
+    /// `declined`, `failed`; `from` is `volume`, `translocated`, `folder`.
+    MoveToApplications {
+        choice: String,
+        from: String,
+    },
 }
 
 impl ProductEvent {
@@ -107,6 +124,9 @@ impl ProductEvent {
             ProductEvent::SpaceShipped { .. } => "space_shipped",
             ProductEvent::ConfigSaved { .. } => "config_saved",
             ProductEvent::ProblemReported { .. } => "problem_reported",
+            ProductEvent::UpdateInstalled { .. } => "update_installed",
+            ProductEvent::UpdateFailed { .. } => "update_failed",
+            ProductEvent::MoveToApplications { .. } => "move_to_applications",
         }
     }
 
@@ -176,6 +196,12 @@ impl ProductEvent {
             ProductEvent::SpaceShipped { how: s() },
             ProductEvent::ConfigSaved { r#where: s() },
             ProductEvent::ProblemReported { mode: s() },
+            ProductEvent::UpdateInstalled { version: s() },
+            ProductEvent::UpdateFailed { reason: s() },
+            ProductEvent::MoveToApplications {
+                choice: s(),
+                from: s(),
+            },
         ]
     }
 

@@ -383,7 +383,7 @@ async fn gives_up_after_max_retries_on_persistent_5xx() {
 
     let http = client(&server, None, clock);
     let err = http.get::<serde_json::Value>("down").await.unwrap_err();
-    assert!(matches!(err, HostError::Network(_)));
+    assert!(matches!(err, HostError::Server(_)));
     // Default retry config: 1 initial try + 3 retries.
     assert_eq!(server.received_requests().await.unwrap().len(), 4);
 }
@@ -414,6 +414,75 @@ async fn token_is_redacted_from_error_bodies() {
     };
     assert!(!body.contains(secret));
     assert!(body.contains("<redacted>"));
+}
+
+async fn error_for(status: u16, body: serde_json::Value) -> HostError {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/x"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(body))
+        .mount(&server)
+        .await;
+    let http = client(&server, None, FakeClock::new(0));
+    http.get::<serde_json::Value>("x").await.unwrap_err()
+}
+
+#[tokio::test]
+async fn a_json_error_body_becomes_its_message() {
+    let err = error_for(
+        422,
+        serde_json::json!({
+            "message": "Review cannot be requested from pull request author.",
+            "documentation_url": "https://docs.github.com/rest/pulls/review-requests",
+            "status": "422"
+        }),
+    )
+    .await;
+    assert!(
+        matches!(&err, HostError::Validation(m)
+            if m == "Review cannot be requested from pull request author."),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_validation_failure_keeps_the_messages_of_its_errors() {
+    let err = error_for(
+        422,
+        serde_json::json!({
+            "message": "Validation Failed",
+            "errors": [{
+                "resource": "PullRequest",
+                "code": "custom",
+                "message": "A pull request already exists for acme:feature."
+            }],
+            "documentation_url": "https://docs.github.com/rest/pulls/pulls"
+        }),
+    )
+    .await;
+    assert!(
+        matches!(&err, HostError::Validation(m)
+            if m == "Validation Failed: A pull request already exists for acme:feature."),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_gitlab_error_body_becomes_its_message() {
+    let err = error_for(
+        409,
+        serde_json::json!({ "message": ["Branch already exists"] }),
+    )
+    .await;
+    assert!(
+        matches!(&err, HostError::Conflict(m) if m == "Branch already exists"),
+        "{err:?}"
+    );
+    let err = error_for(404, serde_json::json!({ "error": "404 Not Found" })).await;
+    assert!(
+        matches!(&err, HostError::NotFound(m) if m == "404 Not Found"),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]

@@ -103,4 +103,42 @@ describe('GroupsPane with a grouping older than the revision', () => {
     expect(m.host.textContent).not.toContain('off-pattern');
     expect(m.host.textContent).not.toContain('undefined');
   });
+
+  it('badges a file tree row whose file is in no group', async () => {
+    const store = new RootStore();
+    seed(store);
+    store.sync.pool.put('grouping', PR, {
+      rev: 'o'.repeat(40),
+      groups: [g1Only],
+    });
+    m = await mount(
+      <RootStoreProvider store={store}>
+        <GroupsPane
+          pr={PR}
+          rev={rev}
+          mode={{ mode: 'files', group: null, file: null }}
+          setMode={() => {}}
+          since={null}
+          sinceOnly={false}
+        />
+      </RootStoreProvider>,
+    );
+    const row = (path: string) =>
+      [...m!.host.querySelectorAll('.file-tree [role="option"]')].find((r) =>
+        r.textContent?.includes(path),
+      );
+    expect(row('a.ts')?.querySelector('.tree-ungrouped')).toBeNull();
+    expect(row('b.ts')?.querySelector('.tree-ungrouped')).not.toBeNull();
+  });
 });
+
+const g1Only = {
+  id: 'g1',
+  title: 'Group g1',
+  why: '',
+  kind: 'normal',
+  risk: null,
+  check: [],
+  hunks: ['ha'],
+  outliers: [],
+};

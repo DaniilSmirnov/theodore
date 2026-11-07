@@ -10,7 +10,7 @@ use theodore_contract::{
     SpaceQueuedRequest, SpaceSendRequest, SpaceStatus, models,
 };
 use theodore_domain::{AgentId, Author, Sha, Usage};
-use theodore_ports::{AgentEvent, AgentMode, Store};
+use theodore_ports::{AgentEvent, AgentMode, GitError, Store, WorktreeBusy};
 
 use crate::testkit::{Fixtures, fixtures};
 use crate::usecases::spaces::space_chat_key;
@@ -317,6 +317,52 @@ async fn a_failed_turn_holds_the_queue() {
     assert!(held(&f, &a));
 }
 
+/// `failed` with no agent error: the reason lives in `skipped`, and the
+/// next queued message would clear it.
+#[tokio::test]
+async fn a_skipped_checkpoint_holds_the_queue_and_keeps_its_error() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    f.agents.push_script(done("ok"));
+    f.git
+        .push_checkpoint_error(GitError::Busy(WorktreeBusy::Rebase));
+    let (s, release) = running(&f, &core, &project).await;
+    let a = core.space_send(send(&s.id, "next")).await.unwrap();
+    release();
+    let s = idle(&f, &s.id).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(f.agents.requests().len(), 1, "the queue waits for you");
+    assert!(held(&f, &a));
+    assert_eq!(s.status, SpaceStatus::Failed);
+    let s = space(&f, &s.id);
+    assert!(
+        s.error
+            .as_deref()
+            .is_some_and(|e| e.contains("checkpoint skipped")),
+        "{:?}",
+        s.error
+    );
+}
+
+/// Stop lands after the agent finished, while its checkpoint is written.
+#[tokio::test]
+async fn stop_during_the_checkpoint_holds_the_queue() {
+    let f = fixtures();
+    let (core, _recv, project) = started(&f).await;
+    f.agents.push_script(done("ok"));
+    let (s, release) = running(&f, &core, &project).await;
+    let a = core.space_send(send(&s.id, "next")).await.unwrap();
+    let go = f.git.pause_next_checkpoint();
+    release();
+    wait_until(|| !f.git.checkpoints.lock().unwrap().is_empty()).await;
+    core.space_stop(&s.id).await.unwrap();
+    go.send(()).unwrap();
+    idle(&f, &s.id).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(f.agents.requests().len(), 1, "nothing ran on its own");
+    assert!(held(&f, &a));
+}
+
 #[tokio::test]
 async fn queued_messages_survive_a_restart_held_with_send() {
     let f = fixtures();
@@ -444,6 +490,8 @@ async fn send_now_queues_when_the_run_cant_take_it() {
     let a = core.space_send_now(send(&s.id, "plain")).await.unwrap();
     assert!(message(&f, &a).unwrap().queued.is_some());
     release();
+    // "plain" gets its own turn: past it, or it could take the pause below.
+    wait_until(|| f.agents.requests().len() == 2).await;
     idle(&f, &s.id).await;
 
     // A steerable run, but the message switches the mode: it waits too.

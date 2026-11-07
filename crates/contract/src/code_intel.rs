@@ -89,6 +89,8 @@ pub struct CodeServer {
     pub name: String,
     pub install: CodeInstall,
     pub state: CodeServerState,
+    /// How to get it when Theodore can't: `gem install ruby-lsp`.
+    pub hint: Option<String>,
 }
 
 /// Where a grammar or a server stands.
@@ -107,8 +109,20 @@ pub enum CodeInstall {
     Installed {
         version: String,
     },
-    /// No download for this platform.
+    /// No download for this platform, and not on this machine.
     Unavailable,
+    /// Needs a runtime that is missing or too old; nothing is downloaded
+    /// for a server that can't run.
+    NeedsRuntime {
+        /// `java`, `node`, `ruby`, `php`, `dotnet`, `dotnet-sdk`.
+        runtime: String,
+        /// The oldest that works: `21`, `8.2`.
+        min: String,
+        /// What is on this machine, if one ran.
+        found: Option<String>,
+    },
+    /// Runs the project's code, so it serves spaces and never a review.
+    TrustedOnly,
     /// You said no to the install suggestion.
     Declined,
     Failed {
@@ -119,6 +133,8 @@ pub enum CodeInstall {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeServerState {
+    /// The project's switch keeps language servers off here.
+    Off,
     NotRunning,
     Warming,
     Ready,

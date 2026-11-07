@@ -7,7 +7,8 @@
 //! its own worktree, the same as any other change it makes in the space:
 //! the commands it proposes reach the project once the space ships
 //! (§8), and wait for the usual "Run commands from this repo?" from
-//! there — nothing here bypasses that trust prompt.
+//! there. A Retry of setup in that same space takes the worktree's file
+//! right away (§2), behind the same prompt — nothing here bypasses it.
 //!
 //! Pure text, kept out of `space_hooks.rs` so it's testable without a
 //! running `Core`; `Core::space_setup_assist` / `Core::space_fix_setup`

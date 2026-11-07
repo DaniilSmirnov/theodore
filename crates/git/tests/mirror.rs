@@ -224,6 +224,81 @@ async fn a_path_the_new_checkpoint_drops_is_removed_from_the_folder() {
 }
 
 #[tokio::test]
+async fn a_sync_refuses_to_overwrite_a_hand_edit_in_the_folder() {
+    let e = env().await;
+    let first = checkpoint(&e, "s1", &e.base, |p| {
+        std::fs::write(p.join("a.txt"), "first\n").unwrap();
+    })
+    .await;
+    let mut touched = Vec::new();
+    sync(&e, "s1", &mut touched, &e.base, &first).await;
+
+    std::fs::write(e.folder.join("a.txt"), "by hand\n").unwrap();
+    let second = checkpoint(&e, "s1", &e.base, |p| {
+        std::fs::write(p.join("a.txt"), "second\n").unwrap();
+    })
+    .await;
+    let err = e
+        .git
+        .mirror_sync(&e.folder, &e.cache, "s1", &second, &first)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, GitError::Refused(m) if m.contains("a.txt")),
+        "{err:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(e.folder.join("a.txt")).unwrap(),
+        "by hand\n"
+    );
+}
+
+#[tokio::test]
+async fn a_first_sync_from_a_base_the_folder_isnt_on_is_no_hand_edit() {
+    let e = env().await;
+    let fork = e.base.clone();
+    // The folder moves on; the space still forks from the older base.
+    std::fs::write(e.folder.join("a.txt"), "folder moved on\n").unwrap();
+    commit_all(&e.folder, "folder moves on");
+    let head = checkpoint(&e, "s1", &fork, |p| {
+        std::fs::write(p.join("a.txt"), "from the space\n").unwrap();
+    })
+    .await;
+    let mut touched = Vec::new();
+    sync(&e, "s1", &mut touched, &fork, &head).await;
+    assert_eq!(
+        std::fs::read_to_string(e.folder.join("a.txt")).unwrap(),
+        "from the space\n"
+    );
+}
+
+#[tokio::test]
+async fn a_rename_removes_the_old_path_from_the_folder() {
+    let e = env().await;
+    let first = checkpoint(&e, "s1", &e.base, |p| {
+        std::fs::write(p.join("x.txt"), "a file long enough to be a rename\n").unwrap();
+    })
+    .await;
+    let mut touched = Vec::new();
+    sync(&e, "s1", &mut touched, &e.base, &first).await;
+
+    let second = checkpoint(&e, "s1", &e.base, |p| {
+        std::fs::rename(p.join("x.txt"), p.join("y.txt")).unwrap();
+    })
+    .await;
+    sync(&e, "s1", &mut touched, &first, &second).await;
+    assert!(!e.folder.join("x.txt").exists());
+    assert!(e.folder.join("y.txt").exists());
+    assert_eq!(
+        e.git
+            .mirror_edited(&e.folder, &e.cache, "s1", &second, &touched)
+            .await
+            .unwrap(),
+        Vec::<String>::new()
+    );
+}
+
+#[tokio::test]
 async fn mirror_off_restores_every_mirrored_path_exactly() {
     let e = env().await;
     let before_a = std::fs::read_to_string(e.folder.join("a.txt")).unwrap();
@@ -422,4 +497,29 @@ async fn mirroring_never_touches_a_repository_above_a_moved_folder() {
         .await
         .unwrap_err();
     assert!(matches!(err, GitError::NotAWorktree(_)), "{err}");
+}
+
+#[tokio::test]
+async fn is_tracked_and_exclude_locally_leave_the_checkout_clean() {
+    let e = env().await;
+    assert!(e.git.is_tracked(&e.folder, "a.txt").await.unwrap());
+    assert!(!e.git.is_tracked(&e.folder, "nope.txt").await.unwrap());
+
+    std::fs::write(e.folder.join("mine.yaml"), "x").unwrap();
+    assert_ne!(git(&e.folder, &["status", "--porcelain"]), "");
+    e.git.exclude_locally(&e.folder, "mine.yaml").await.unwrap();
+    e.git.exclude_locally(&e.folder, "mine.yaml").await.unwrap();
+    assert_eq!(
+        git(&e.folder, &["status", "--porcelain"]),
+        "",
+        "ignored, no .gitignore"
+    );
+    assert_eq!(
+        std::fs::read_to_string(e.folder.join(".git/info/exclude"))
+            .unwrap()
+            .matches("mine.yaml")
+            .count(),
+        1,
+        "once"
+    );
 }

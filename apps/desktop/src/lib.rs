@@ -13,6 +13,8 @@ pub mod gate;
 pub mod menu;
 pub mod notify;
 pub mod op;
+pub mod quit;
+pub mod relocate;
 pub mod shell_path;
 pub mod updater;
 
@@ -105,6 +107,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::ship_space,
             commands::merge_space,
             commands::continue_space,
+            commands::refresh_space_pr,
             commands::undo_space_turn,
             commands::rewind_space,
             commands::revert_space_file,
@@ -151,6 +154,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::account_sign_in_cancel,
             commands::account_sign_out,
             commands::focus_window,
+            commands::take_pending_space,
             commands::notify_space,
             commands::log_client,
             commands::track_ui,
@@ -210,11 +214,13 @@ fn storage_namespace(sandbox: bool, env: theodore_runtime::BuildEnv) -> &'static
 /// `forward` receives the event emitter once the app is up, to pipe the
 /// core's sync and ephemeral streams to the UI. `auto_update` starts the
 /// launch-time and periodic update check (the menu's "Check for updates"
-/// works either way).
+/// works either way). `offer_move`: the data dir, to offer moving the app
+/// to Applications once (`relocate`); `None` never offers.
 pub fn run(
     core: Arc<dyn CoreApi>,
     sandbox: bool,
     auto_update: bool,
+    offer_move: Option<std::path::PathBuf>,
     forward: impl FnOnce(CoreEvents<tauri::Wry>) + Send + 'static,
 ) {
     let builder = specta_builder();
@@ -249,6 +255,8 @@ pub fn run(
         .invoke_handler(gate::guard_core(core.clone(), builder.invoke_handler()))
         .manage(core.clone())
         .manage(updater::UpdateState::default())
+        .manage(updater::Notices::default())
+        .manage(deep_link::SpaceLinks::default())
         // The title bar's size reaches the page as CSS variables (`chrome`).
         .on_page_load(|webview, payload| {
             if payload.event() == tauri::webview::PageLoadEvent::Finished
@@ -273,8 +281,13 @@ pub fn run(
                 });
             }
             app.manage(notify::for_app(&handle));
+            // SIGTERM / SIGINT quit like ⌘Q, with the same cleanup.
+            quit::exit_on_signal(handle.clone(), core.clone());
             forward(emitter(handle.clone()));
             deep_link::listen(&handle, core.clone());
+            if let Some(data_dir) = offer_move {
+                relocate::offer(&handle, data_dir);
+            }
             if auto_update {
                 updater::spawn_periodic_check(handle, core.clone());
             }
@@ -283,20 +296,14 @@ pub fn run(
         .build(tauri::generate_context!())
         .expect("error while building the Theodore app")
         .run(move |_handle, event| {
-            // A clean quit stops every space's `run` command first: left to
-            // `kill_on_drop` alone, a SIGTERM'd process never runs its
-            // destructors, so its process group would be orphaned to PID 1
-            // (docs/spaces.md "Crash recovery") — the same way an unclean
-            // exit does, just needlessly.
+            // A clean quit stops every space's `run` command first, then
+            // flushes telemetry; each step has a time limit, so a hung one
+            // never keeps the app from exiting (`quit`).
             if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
-                tauri::async_runtime::block_on(exit_core.stop_all_space_commands());
+                quit::stop_spaces(exit_core.clone());
             }
-            // Last: send what the remote sinks still hold, flush the file.
-            if let tauri::RunEvent::Exit = event
-                && let Some(t) = theodore_telemetry::global()
-            {
-                tracing::info!("Theodore quitting");
-                t.shutdown();
+            if let tauri::RunEvent::Exit = event {
+                quit::shutdown_telemetry();
             }
         });
 }

@@ -97,6 +97,27 @@ pub(crate) fn range_from_lsp(
     }
 }
 
+/// The text `range` covers; `None` when it lies outside `text`.
+pub(crate) fn slice(text: &str, range: theodore_ports::Range) -> Option<&str> {
+    let offset = |at: Position| -> Option<usize> {
+        let line = (at.line as usize).checked_sub(1)?;
+        let col = (at.col as usize).checked_sub(1)?;
+        let start = match line {
+            0 => 0,
+            n => text.match_indices('\n').nth(n - 1)?.0 + 1,
+        };
+        let rest = &text[start..];
+        let content = &rest[..rest.find('\n').unwrap_or(rest.len())];
+        match content.char_indices().nth(col) {
+            Some((i, _)) => Some(start + i),
+            None if content.chars().count() == col => Some(start + content.len()),
+            None => None,
+        }
+    };
+    let (s, e) = (offset(range.start)?, offset(range.end)?);
+    text.get(s..e)
+}
+
 /// `rel` under `root`, refusing anything that would leave it.
 pub(crate) fn resolve(root: &Path, rel: &str) -> CodeIntelResult<PathBuf> {
     let p = Path::new(rel);

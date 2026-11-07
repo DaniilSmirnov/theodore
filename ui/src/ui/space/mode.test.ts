@@ -1,7 +1,7 @@
 import { observable, runInAction } from 'mobx';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Space } from '../../gen/contract';
-import { notifySpace } from '../../core/native';
+import { notifySpace, takePendingSpace } from '../../core/native';
 import { setTransport } from '../../core/transport';
 import type { RootStore } from '../../stores/RootStore';
 import { UiStore } from '../../stores/UiStore';
@@ -13,9 +13,11 @@ vi.mock('../../core/native', () => ({
   OPEN_SPACE_EVENT: 'open-space',
   notifySpace: vi.fn(),
   setBadge: vi.fn(() => Promise.resolve()),
+  takePendingSpace: vi.fn(() => Promise.resolve(null)),
 }));
 
 const notify = vi.mocked(notifySpace);
+const pendingSpace = vi.mocked(takePendingSpace);
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
 let transport: FakeTransport;
@@ -71,6 +73,20 @@ describe('a click on a space notification', () => {
     store.ui.go({ name: 'inbox' });
     transport.emit('open-space', 'gone');
     expect(store.ui.route).toEqual({ name: 'inbox' });
+    off();
+  });
+
+  it('opens the space a link asked for before the UI listened', async () => {
+    pendingSpace.mockResolvedValueOnce('sp1');
+    const opened = vi.fn();
+    const off = openSpaceOnClick(store, opened);
+    await flush();
+    // Its row isn't there yet on a cold start: the first sync brings it.
+    expect(opened).not.toHaveBeenCalled();
+
+    runInAction(() => spaces.push(space('sp1', 'idle')));
+    expect(store.ui.route).toEqual({ name: 'space', id: 'sp1' });
+    expect(opened).toHaveBeenCalledOnce();
     off();
   });
 });

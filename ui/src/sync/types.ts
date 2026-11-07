@@ -8,6 +8,7 @@
  */
 import type {
   ChatMessage,
+  CheckTick,
   Draft,
   FileViewedRow,
   Finding,
@@ -30,6 +31,7 @@ export const MODEL_NAMES = [
   'inbox_state',
   'hunk_read',
   'file_viewed',
+  'check_tick',
   'draft',
   'finding',
   'task',
@@ -55,6 +57,7 @@ export interface ModelRows {
   inbox_state: WithId<InboxState>;
   hunk_read: WithId<HunkRead>;
   file_viewed: WithId<FileViewedRow>;
+  check_tick: WithId<CheckTick>;
   draft: WithId<Draft>;
   finding: WithId<Finding>;
   task: WithId<Task>;

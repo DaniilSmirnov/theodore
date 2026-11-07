@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use theodore_domain::PrId;
 
+use crate::DiffSide;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 pub struct FindSymbolRequest {
     pub pr: PrId,
@@ -22,6 +24,10 @@ pub struct FindSymbolRequest {
     pub line: Option<u32>,
     #[serde(default)]
     pub col: Option<u32>,
+    /// The diff side the click was on. `line`/`col` are head-worktree
+    /// positions only: a `Base` click goes by name.
+    #[serde(default)]
+    pub side: Option<DiffSide>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]

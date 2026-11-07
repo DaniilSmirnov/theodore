@@ -121,6 +121,10 @@ mod tests {
             "README.md",
             "LICENSE",
             "Cargo.lock",
+            "app/Models/User.php",
+            "db/schema.sql",
+            "src/Main.scala",
+            "web/index.html",
         ];
         let got = m.detect(&paths);
         let want: Vec<(LanguageId, usize)> = [
@@ -129,7 +133,11 @@ mod tests {
             ("typescript", 2),
             ("c", 1),
             ("cpp", 1),
+            ("html", 1),
             ("markdown", 1),
+            ("php", 1),
+            ("scala", 1),
+            ("sql", 1),
             ("tsx", 1),
         ]
         .into_iter()

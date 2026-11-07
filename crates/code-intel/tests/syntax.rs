@@ -150,6 +150,51 @@ async fn text_search_covers_a_language_without_grammar() {
     assert_eq!(rust.source, Source::Syntax);
 }
 
+/// Files written in the same turn, untracked and never reported: a name
+/// question sees them, through the syntax layer when the language has a
+/// grammar and through the text search when it has none. An ignored file
+/// stays out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_untracked_file_is_found_by_name() {
+    let env = Env::new();
+    let wt = repo(&[
+        ("src/a.rs", "fn rusty() {}\n"),
+        ("main.go", "package main\n"),
+        (".gitignore", "out/\n"),
+    ]);
+    let ci = env.facade(StaticGrammars::without(&["go"]));
+    ci.open(workspace(wt.path(), TrustMode::Trusted))
+        .await
+        .unwrap();
+    indexed(&ci, wt.path()).await;
+    std::fs::write(wt.path().join("src/extra.rs"), "pub fn brand_new_fn() {}\n").unwrap();
+    std::fs::write(
+        wt.path().join("extra.go"),
+        "package main\n\nfunc BrandNew() {}\n",
+    )
+    .unwrap();
+    std::fs::create_dir(wt.path().join("out")).unwrap();
+    std::fs::write(wt.path().join("out/gen.rs"), "pub fn brand_new_fn() {}\n").unwrap();
+
+    let rust = ci
+        .find_symbol(wt.path(), "brand_new_fn", None)
+        .await
+        .unwrap();
+    let paths: Vec<(&str, Source)> = rust
+        .items
+        .iter()
+        .map(|s| (s.path.as_str(), s.source))
+        .collect();
+    assert_eq!(paths, vec![("src/extra.rs", Source::Syntax)]);
+    let go = ci.find_symbol(wt.path(), "BrandNew", None).await.unwrap();
+    let paths: Vec<(&str, Source)> = go
+        .items
+        .iter()
+        .map(|s| (s.path.as_str(), s.source))
+        .collect();
+    assert_eq!(paths, vec![("extra.go", Source::Text)]);
+}
+
 /// Upstream TypeScript tags.scm has no class or function patterns of its
 /// own; the facade prepends JavaScript's (manifest `tags_extends`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -234,6 +279,32 @@ async fn file_changed_reindexes_and_removes() {
     let gone = ci.find_symbol(wt.path(), "fresh", None).await.unwrap();
     assert!(gone.items.is_empty(), "{:?}", gone.items);
     assert_eq!(status_of(&ci, wt.path(), "rust").await.files, 1);
+}
+
+/// The agent's own Edit writes a file nobody reports: a question about
+/// that file hashes it again first, so a symbol's range and body are the
+/// file's as it is now, never the old ranges over the new bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_written_behind_our_back_is_reindexed_before_a_question_about_it() {
+    let env = Env::new();
+    let wt = repo(&[("src/lib.rs", LIB)]);
+    let ci = env.facade(StaticGrammars::all());
+    ci.open(workspace(wt.path(), TrustMode::Trusted))
+        .await
+        .unwrap();
+    indexed(&ci, wt.path()).await;
+    std::fs::write(
+        wt.path().join("src/lib.rs"),
+        format!("// a long explanatory comment\n// and its second line\n{LIB}"),
+    )
+    .unwrap();
+
+    let (sym, body) = ci
+        .symbol_body(wt.path(), "src/lib.rs", "helper")
+        .await
+        .unwrap();
+    assert_eq!(body, "pub fn helper() -> u32 {\n    1\n}");
+    assert_eq!(sym.range.start.line, 9);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

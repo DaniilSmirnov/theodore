@@ -364,6 +364,15 @@ impl GitPort for GitCli {
         self.diff_op(repo, base, head, opts).await
     }
 
+    async fn numstat(
+        &self,
+        repo: &Path,
+        from: &Sha,
+        to: &Sha,
+    ) -> GitResult<Vec<theodore_ports::FileStat>> {
+        self.numstat_op(repo, from, to).await
+    }
+
     async fn show(&self, repo: &Path, rev: &Sha, path: &str) -> GitResult<Option<Vec<u8>>> {
         self.show_op(repo, rev, path).await
     }
@@ -400,8 +409,9 @@ impl GitPort for GitCli {
         repo: &RepoRef,
         branch: &str,
         message: &str,
+        author: &theodore_ports::Identity,
     ) -> GitResult<Sha> {
-        self.commit_and_push_op(worktree, repo, branch, message)
+        self.commit_and_push_op(worktree, repo, branch, message, author)
             .await
     }
 
@@ -411,6 +421,14 @@ impl GitPort for GitCli {
 
     async fn is_repo(&self, path: &Path) -> GitResult<bool> {
         self.is_repo_op(path).await
+    }
+
+    async fn is_tracked(&self, folder: &Path, path: &str) -> GitResult<bool> {
+        self.is_tracked_op(folder, path).await
+    }
+
+    async fn exclude_locally(&self, folder: &Path, pattern: &str) -> GitResult<()> {
+        self.exclude_locally_op(folder, pattern).await
     }
 
     async fn remove_repo(&self, repo: &RepoRef) -> GitResult<()> {
@@ -525,10 +543,24 @@ impl GitPort for GitCli {
         worktree: &Path,
         space: &str,
         tip: &Sha,
+        conflicts: &[String],
         message: &str,
     ) -> GitResult<theodore_ports::SpaceMerge> {
-        self.space_merge_finish_op(worktree, space, tip, message)
+        self.space_merge_finish_op(worktree, space, tip, conflicts, message)
             .await
+    }
+
+    async fn same_tree(&self, repo: &Path, a: &Sha, b: &Sha) -> GitResult<bool> {
+        if a == b {
+            return Ok(true);
+        }
+        let tree = |sha: &Sha| format!("{}^{{tree}}", sha.as_str());
+        Ok(self.resolve_ref_op(repo, &tree(a)).await?
+            == self.resolve_ref_op(repo, &tree(b)).await?)
+    }
+
+    async fn space_exclude(&self, worktree: &Path, paths: &[String]) -> GitResult<()> {
+        self.space_exclude_op(worktree, paths).await
     }
 
     async fn space_merge_abort(&self, worktree: &Path, space: &str, to: &Sha) -> GitResult<()> {

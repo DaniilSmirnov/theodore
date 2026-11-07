@@ -90,6 +90,7 @@ impl FakeSpaces {
             last_status: None,
             exit_code: None,
             error: None,
+            note: None,
         }
     }
 }
@@ -100,6 +101,7 @@ impl SpaceToolsBackend for FakeSpaces {
         self.record(format!("run_check {space} {run}"));
         self.gate()?;
         Ok(CheckOutcome {
+            ran: true,
             passed: false,
             exit_code: Some(1),
             timed_out: false,
@@ -263,6 +265,7 @@ async fn a_space_turn_gets_only_the_space_tools() {
     assert_eq!(
         check,
         json!({
+            "ran": true,
             "passed": false,
             "exit_code": 1,
             "timed_out": false,

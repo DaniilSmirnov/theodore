@@ -1,0 +1,18 @@
+{"type":"system","subtype":"session_state_changed","state":"running","session_id":"S"}
+{"type":"system","subtype":"init","cwd":"/tmp/probe","session_id":"S","parent_tool_use_id":null}
+{"type":"assistant","parent_tool_use_id":null,"session_id":"S","message":{"content":[{"type":"thinking","thinking":"","signature":"x"}]}}
+{"type":"assistant","parent_tool_use_id":null,"session_id":"S","message":{"content":[{"type":"tool_use","id":"toolu_agent","name":"Agent","input":{"description":"Reply with pong","prompt":"Reply with only the word: pong","subagent_type":"general-purpose"},"caller":{"type":"direct"}}]}}
+{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a1","run_id":"r1","task_type":"local_agent","subagent_type":"general-purpose","description":"Reply with pong"}],"session_id":"S"}
+{"type":"system","subtype":"task_started","task_id":"a1","run_id":"r1","tool_use_id":"toolu_agent","description":"Reply with pong","subagent_type":"general-purpose","is_backgrounded":true,"spawn_depth":1,"task_type":"local_agent","prompt":"Reply with only the word: pong","session_id":"S"}
+{"type":"user","parent_tool_use_id":null,"session_id":"S","message":{"role":"user","content":[{"tool_use_id":"toolu_agent","type":"tool_result","content":[{"type":"text","text":"Async agent launched successfully. (This tool result is internal metadata — never quote or paste any part of it, including the agentId below, into a user-facing reply.)\nagentId: a1 (internal ID - do not mention to user.)\nThe agent is working in the background. You will be notified automatically when it completes.\noutput_file: /tmp/probe-tasks/a1.output"}]}]},"tool_use_result":{"isAsync":true,"status":"async_launched","agentId":"a1","description":"Reply with pong","prompt":"Reply with only the word: pong","outputFile":"/tmp/probe-tasks/a1.output","canReadOutputFile":true,"canContinueAgent":true}}
+{"type":"assistant","parent_tool_use_id":"toolu_agent","agent_id":"a1","session_id":"S","message":{"content":[{"type":"text","text":"pong"}]}}
+{"type":"system","subtype":"task_updated","task_id":"a1","run_id":"r1","patch":{"status":"completed","end_time":1},"session_id":"S"}
+{"type":"system","subtype":"task_notification","task_id":"a1","run_id":"r1","tool_use_id":"toolu_agent","status":"completed","output_file":"/tmp/probe-tasks/a1.output","summary":"pong","usage":{"total_tokens":18028,"tool_uses":0,"duration_ms":1178},"session_id":"S"}
+{"type":"system","subtype":"background_tasks_changed","tasks":[],"session_id":"S"}
+{"type":"assistant","parent_tool_use_id":null,"session_id":"S","message":{"content":[{"type":"text","text":"I've started a subagent with the instruction to reply \"pong\". I'll report back when it finishes."}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":2,"stop_reason":"end_turn","result":"I've started a subagent with the instruction to reply \"pong\". I'll report back when it finishes.","session_id":"S","total_cost_usd":0.002,"usage":{"input_tokens":4,"output_tokens":425}}
+{"type":"system","subtype":"init","cwd":"/tmp/probe","session_id":"S","parent_tool_use_id":null}
+{"type":"assistant","parent_tool_use_id":null,"session_id":"S","message":{"content":[{"type":"thinking","thinking":"","signature":"x"}]}}
+{"type":"assistant","parent_tool_use_id":null,"session_id":"S","message":{"content":[{"type":"text","text":"The subagent replied: pong\n\nDone."}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":1,"stop_reason":"end_turn","result":"The subagent replied: pong\n\nDone.","session_id":"S","total_cost_usd":0.001,"usage":{"input_tokens":4,"output_tokens":211}}
+{"type":"system","subtype":"session_state_changed","state":"idle","session_id":"S"}

@@ -283,6 +283,10 @@ pub trait CoreApi: Send + Sync {
     ) -> Result<theodore_contract::MergeSpaceResult, CommandError> {
         Err(not_ready())
     }
+    /// The space page's poll of its PR's checks (one conditional fetch).
+    async fn refresh_space_pr(&self, _space: String) -> Result<(), CommandError> {
+        Err(not_ready())
+    }
     /// Continue after merge: a new branch on the base's fresh tip.
     async fn continue_space(
         &self,

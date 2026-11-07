@@ -86,11 +86,28 @@ async fn clone_fetch_and_push_go_to_the_override() {
 
     let wt = git_cli.worktree(&pr, &sha).await.expect("worktree");
     std::fs::write(wt.path.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+    let me = theodore_ports::Identity {
+        name: "Pat Author".into(),
+        email: "pat@example.com".into(),
+    };
     let pushed = git_cli
-        .commit_and_push(&wt.path, &repo(), "feature", "fix: three")
+        .commit_and_push(&wt.path, &repo(), "feature", "fix: three", &me)
         .await
         .expect("push");
     assert_eq!(git(&bare, &["rev-parse", "refs/heads/feature"]), pushed.0);
+    assert_eq!(
+        git(
+            &bare,
+            &[
+                "log",
+                "-1",
+                "--format=%an <%ae> / %cn <%ce>",
+                "refs/heads/feature"
+            ]
+        ),
+        "Pat Author <pat@example.com> / Pat Author <pat@example.com>",
+        "authored and committed as the user"
+    );
 }
 
 #[tokio::test]

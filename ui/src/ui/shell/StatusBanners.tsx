@@ -1,8 +1,9 @@
 /**
- * What is broken right now, at the top of the main area — one banner at a
+ * What is broken right now, in a strip under the page — one banner at a
  * time, most urgent first. Offline wins over auth, which wins over rate
- * limiting: there is no point telling someone their token is bad while the
- * network itself is down.
+ * limiting, which wins over a host answering with server errors: there is
+ * no point telling someone their token is bad while the network itself is
+ * down. A 502 is not offline: the host answered, it is having trouble.
  */
 import { useEffect, useState } from 'react';
 import { Alert, Button } from '@heroui/react';
@@ -13,7 +14,7 @@ import { useRootStore, useUi } from '../../stores/context';
 import { Spinner } from '../bits';
 import { refreshInbox } from '../../actions';
 
-export type StatusKind = 'offline' | 'auth' | 'rate' | null;
+export type StatusKind = 'offline' | 'auth' | 'rate' | 'trouble' | null;
 
 /** Pure so it is cheap to unit-test: which banner (if any) applies right now. */
 export function statusKind(
@@ -26,12 +27,20 @@ export function statusKind(
   if (host.rateLimitedUntil !== null && host.rateLimitedUntil > now) {
     return 'rate';
   }
+  if (host.serverTrouble) return 'trouble';
   return null;
 }
 
-function formatCountdown(ms: number): string {
-  const mins = Math.ceil(ms / 60_000);
-  if (mins <= 1) return 'under a minute';
+/** Time left until a reset: seconds under two minutes (82 s is "1 min
+ *  22 s", not "2 min"), then whole minutes rounded, then hours. */
+export function formatCountdown(ms: number): string {
+  const secs = Math.max(0, Math.ceil(ms / 1000));
+  if (secs < 60) return `${secs} s`;
+  if (secs < 120) {
+    const rest = secs - 60;
+    return rest ? `1 min ${rest} s` : '1 min';
+  }
+  const mins = Math.round(secs / 60);
   if (mins < 60) return `${mins} min`;
   const hrs = Math.floor(mins / 60);
   const rem = mins % 60;
@@ -59,17 +68,19 @@ export const StatusBanners = observer(function StatusBanners() {
 
   if (kind === 'offline') {
     const pending = store.sync.queue.pending.length;
+    // Whole in the tooltip when the strip is too narrow for it.
+    const offlineText = `Reviews and spaces you’ve opened stay readable; syncing and agents resume when you’re back online. ${
+      pending > 0
+        ? `${pending} ${pending === 1 ? 'write is' : 'writes are'} queued and will go out once reconnected.`
+        : 'Anything you do will be queued and sent automatically.'
+    }`;
     return (
       <Alert status="warning" className="status-banner status-offline">
         <Alert.Indicator />
         <Alert.Content>
           <Alert.Title>Offline</Alert.Title>
-          <Alert.Description>
-            Reviews and spaces you’ve opened stay readable; syncing and agents
-            resume when you’re back online.{' '}
-            {pending > 0
-              ? `${pending} ${pending === 1 ? 'write is' : 'writes are'} queued and will go out once reconnected.`
-              : 'Anything you do will be queued and sent automatically.'}
+          <Alert.Description title={offlineText}>
+            {offlineText}
           </Alert.Description>
         </Alert.Content>
         <Button
@@ -127,6 +138,33 @@ export const StatusBanners = observer(function StatusBanners() {
             fall back to cached data until then.
           </Alert.Description>
         </Alert.Content>
+      </Alert>
+    );
+  }
+
+  if (kind === 'trouble') {
+    const text =
+      'Some requests fail with server errors. Reads fall back to cached data; Theodore keeps retrying.';
+    return (
+      <Alert status="warning" className="status-banner status-trouble">
+        <Alert.Indicator />
+        <Alert.Content>
+          <Alert.Title>The host is having trouble</Alert.Title>
+          <Alert.Description title={text}>{text}</Alert.Description>
+        </Alert.Content>
+        <Button
+          size="sm"
+          variant="tertiary"
+          className="retry-connection"
+          isPending={retrying}
+          onPress={() => {
+            setRetrying(true);
+            void refreshInbox(store).finally(() => setRetrying(false));
+          }}
+        >
+          {retrying && <Spinner />}
+          Retry
+        </Button>
       </Alert>
     );
   }

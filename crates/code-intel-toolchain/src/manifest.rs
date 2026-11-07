@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use theodore_ports::code_intel::{CodeIntelError, CodeIntelResult, LanguageId};
 
 use crate::detect::glob_match;
+use crate::runtime::{KNOWN_RUNTIMES, RuntimeRequirement};
 
 const BUILTIN_LANGUAGES: &str = include_str!("../manifest/languages.yaml");
 const BUILTIN_GRAMMARS: &str = include_str!("../manifest/grammars.json");
@@ -53,8 +54,25 @@ const BUILTIN_GRAMMARS: &str = include_str!("../manifest/grammars.json");
 /// The `grammars.json` schema version this build reads.
 pub const GRAMMARS_SCHEMA: u32 = 1;
 
-/// Placeholder in a server's `launch` argv for the resolved binary.
+/// Placeholder in a server's `launch` argv for the resolved binary. A whole
+/// argument.
 pub const BIN_PLACEHOLDER: &str = "{bin}";
+/// The runtime that passed `requires`. A whole argument; needs `requires`.
+pub const RUNTIME_PLACEHOLDER: &str = "{runtime}";
+/// The directory a download was unpacked into; may sit inside an argument.
+/// Only for a server that is never found on the machine (no `detect`): one
+/// found there has no such directory.
+pub const DIR_PLACEHOLDER: &str = "{dir}";
+/// A writable directory per worktree and trust mode, under the toolchain's
+/// root, never inside the worktree; may sit inside an argument.
+pub const DATA_PLACEHOLDER: &str = "{data}";
+
+const PLACEHOLDERS: &[&str] = &[
+    BIN_PLACEHOLDER,
+    RUNTIME_PLACEHOLDER,
+    DIR_PLACEHOLDER,
+    DATA_PLACEHOLDER,
+];
 
 /// A downloadable file, pinned by hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,7 +150,8 @@ pub struct ServerSpec {
     /// Keyed by platform (`darwin-arm64`, …).
     #[serde(default)]
     pub download: Option<BTreeMap<String, ServerDownload>>,
-    /// argv; [`BIN_PLACEHOLDER`] is replaced by the resolved binary.
+    /// argv; [`BIN_PLACEHOLDER`], [`RUNTIME_PLACEHOLDER`],
+    /// [`DIR_PLACEHOLDER`] and [`DATA_PLACEHOLDER`] are replaced.
     pub launch: Vec<String>,
     #[serde(default)]
     pub init_options: serde_json::Value,
@@ -142,15 +161,40 @@ pub struct ServerSpec {
     /// One server per repo with worktrees as folders (docs §6).
     #[serde(default)]
     pub workspace_folders: bool,
-    /// A runtime the server needs and Theodore does not ship (`"node"`).
+    /// A runtime the server needs and Theodore does not ship; checked by
+    /// running it (`crate::runtime`). Missing or too old: the server is
+    /// skipped, found or downloaded alike, and nothing is downloaded for it.
     #[serde(default)]
-    pub requires: Option<String>,
+    pub requires: Option<RuntimeRequirement>,
+    /// How to get it when Theodore can't (`gem install ruby-lsp`): shown when
+    /// nothing can serve the language.
+    #[serde(default)]
+    pub hint: Option<String>,
+    /// It runs the project's code with no option to turn that off (a build
+    /// tool, a bundler): never started in `TrustMode::Review`, even with
+    /// `code_intel.lsp.review` on (docs §8).
+    #[serde(default)]
+    pub trusted_only: bool,
+    /// How long it may take to start, in place of the default `initialize`
+    /// timeout and the wait for it to warm up: a JVM importing a build takes
+    /// minutes.
+    #[serde(default)]
+    pub start_timeout_secs: Option<u64>,
+    /// Quiet time with no progress in flight before it counts as warmed up,
+    /// for a server that takes a while to announce its work.
+    #[serde(default)]
+    pub ready_settle_secs: Option<u64>,
 }
 
 impl ServerSpec {
     /// This platform's download, if any.
     pub fn download_for(&self, platform: &str) -> Option<&ServerDownload> {
         self.download.as_ref()?.get(platform)
+    }
+
+    /// `launch` has `{data}` somewhere.
+    pub fn uses_data_dir(&self) -> bool {
+        self.launch.iter().any(|a| a.contains(DATA_PLACEHOLDER))
     }
 }
 
@@ -419,6 +463,10 @@ fn validate_servers(raw: Vec<ServerSpec>, warnings: &mut Vec<String>) -> Vec<Ser
             ));
             continue;
         }
+        if let Err(why) = check_launch(&s) {
+            warnings.push(format!("server {name}: {why}, dropped"));
+            continue;
+        }
         s.detect.retain(|argv| {
             let ok = argv
                 .first()
@@ -517,6 +565,50 @@ fn validate_grammars(raw: Vec<GrammarSpec>, warnings: &mut Vec<String>) -> Vec<G
     out
 }
 
+/// The placeholders of `launch` make sense for this server.
+fn check_launch(s: &ServerSpec) -> Result<(), String> {
+    for arg in &s.launch {
+        if let Some(unknown) = unknown_placeholder(arg) {
+            return Err(format!("launch has an unknown placeholder {unknown}"));
+        }
+    }
+    let uses = |p: &str| s.launch.iter().any(|a| a.contains(p));
+    if uses(RUNTIME_PLACEHOLDER) && s.requires.is_none() {
+        return Err(format!("launch has {RUNTIME_PLACEHOLDER} without requires"));
+    }
+    if uses(DIR_PLACEHOLDER) && !s.detect.is_empty() {
+        return Err(format!(
+            "launch has {DIR_PLACEHOLDER}, which a server found by detect does not have"
+        ));
+    }
+    if let Some(r) = &s.requires
+        && !KNOWN_RUNTIMES.contains(&r.runtime.as_str())
+    {
+        return Err(format!("requires an unknown runtime {}", r.runtime));
+    }
+    Ok(())
+}
+
+/// `{word}` in `arg` that is not a placeholder. JSON in an argument
+/// (`{"a": 1}`) is not a word.
+fn unknown_placeholder(arg: &str) -> Option<&str> {
+    let mut rest = arg;
+    while let Some(start) = rest.find('{') {
+        let tail = &rest[start..];
+        let end = tail.find('}')?;
+        let token = &tail[..=end];
+        let word = &token[1..token.len() - 1];
+        if !word.is_empty()
+            && word.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+            && !PLACEHOLDERS.contains(&token)
+        {
+            return Some(token);
+        }
+        rest = &tail[1..];
+    }
+    None
+}
+
 /// A valid artifact has an allowed URL and a sha256; returns the hash in
 /// lowercase.
 fn check_artifact(url: &str, sha256: &str) -> Result<String, String> {
@@ -599,6 +691,33 @@ mod tests {
             "yaml",
             "toml",
             "markdown",
+            "bash",
+            "php",
+            "ruby",
+            "java",
+            "kotlin",
+            "csharp",
+            // text-only: no grammar, no server
+            "scala",
+            "elixir",
+            "dart",
+            "vue",
+            "svelte",
+            "html",
+            "css",
+            "scss",
+            "sql",
+            "objective-c",
+            "perl",
+            "haskell",
+            "ocaml",
+            "clojure",
+            "erlang",
+            "r",
+            "julia",
+            "groovy",
+            "powershell",
+            "solidity",
         ] {
             assert!(m.language(&LanguageId::new(id)).is_some(), "{id}");
         }
@@ -620,6 +739,177 @@ mod tests {
                 Some(LanguageId::new("javascript")),
                 "{id}"
             );
+        }
+    }
+
+    /// Languages with neither a grammar nor a server are still languages
+    /// (their files are searched by name); `prose` ones are the exception.
+    #[test]
+    fn text_only_languages_are_code_unless_prose() {
+        let m = Manifest::builtin();
+        for id in [
+            "scala",
+            "elixir",
+            "dart",
+            "vue",
+            "svelte",
+            "css",
+            "scss",
+            "sql",
+            "objective-c",
+            "perl",
+            "haskell",
+            "ocaml",
+            "clojure",
+            "erlang",
+            "r",
+            "julia",
+            "groovy",
+            "powershell",
+            "solidity",
+            "dockerfile",
+        ] {
+            assert!(!m.language(&LanguageId::new(id)).unwrap().prose, "{id}");
+        }
+        // HTML is markup, not code: the one new language that is prose.
+        assert!(m.language(&LanguageId::new("html")).unwrap().prose);
+        for id in ["json", "yaml", "toml", "markdown"] {
+            assert!(m.language(&LanguageId::new(id)).unwrap().prose, "{id}");
+        }
+    }
+
+    /// A text-only language has no grammar to fetch: asking for it fails at
+    /// once, with no download attempted (no tempdir contents, no network).
+    #[tokio::test]
+    async fn a_text_only_language_never_downloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let tc = crate::Toolchain::new(dir.path());
+        for id in ["scala", "dockerfile", "sql", "html"] {
+            let id = LanguageId::new(id);
+            assert_eq!(
+                tc.grammar_state(&id),
+                theodore_ports::code_intel::InstallState::Unavailable,
+                "{id}"
+            );
+            let e = tc.ensure_grammar(&id).await.unwrap_err().to_string();
+            assert!(e.contains("no grammar in the manifest"), "{id}: {e}");
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// New globs are appended after the old ones: the first match wins, so
+    /// an earlier language keeps every file it had.
+    #[test]
+    fn new_globs_do_not_take_files_from_earlier_languages() {
+        let m = Manifest::builtin();
+        for (path, id) in [
+            ("include/a.h", "c"),
+            ("src/a.hpp", "cpp"),
+            ("build.gradle.kts", "kotlin"),
+            ("Foo.cs", "csharp"),
+            ("a.phtml", "php"),
+            ("Rakefile", "ruby"),
+            ("Foo.scala", "scala"),
+            ("build.sbt", "scala"),
+            ("lib/a.ex", "elixir"),
+            ("test/a.exs", "elixir"),
+            ("lib/main.dart", "dart"),
+            ("ui/App.vue", "vue"),
+            ("ui/App.svelte", "svelte"),
+            ("public/index.html", "html"),
+            ("a/b.css", "css"),
+            ("a/b.scss", "scss"),
+            ("db/001.sql", "sql"),
+            ("ios/AppDelegate.m", "objective-c"),
+            ("ios/Foo.mm", "objective-c"),
+            ("bin/x.pl", "perl"),
+            ("lib/X.pm", "perl"),
+            ("src/Main.hs", "haskell"),
+            ("src/main.ml", "ocaml"),
+            ("src/main.mli", "ocaml"),
+            ("src/core.clj", "clojure"),
+            ("src/core.cljs", "clojure"),
+            ("src/a.erl", "erlang"),
+            ("include/a.hrl", "erlang"),
+            ("analysis.R", "r"),
+            ("analysis.r", "r"),
+            ("src/a.jl", "julia"),
+            ("build.gradle", "groovy"),
+            ("Jenkins.groovy", "groovy"),
+            ("scripts/x.ps1", "powershell"),
+            ("contracts/Token.sol", "solidity"),
+        ] {
+            assert_eq!(
+                m.language_for_path(path).map(|l| l.id.as_str()),
+                Some(id),
+                "{path}"
+            );
+        }
+        // Not code, and no language owns it.
+        assert!(m.language_for_path("LICENSE").is_none());
+        assert!(m.language_for_path("notes.txt").is_none());
+    }
+
+    /// Who may run what: changing one of these is a decision (docs §8).
+    #[test]
+    fn builtin_servers_of_the_jvm_and_scripting_languages() {
+        let (m, _) = Manifest::parse(BUILTIN_LANGUAGES, BUILTIN_GRAMMARS).unwrap();
+        let servers = |id: &str| -> Vec<String> {
+            m.language(&LanguageId::new(id))
+                .unwrap()
+                .servers
+                .iter()
+                .map(|s| s.name.clone())
+                .collect()
+        };
+        assert_eq!(servers("php"), ["intelephense", "phpactor"]);
+        assert_eq!(servers("ruby"), ["ruby-lsp"]);
+        assert_eq!(servers("java"), ["jdtls"]);
+        assert_eq!(servers("kotlin"), ["kotlin-lsp"]);
+        assert_eq!(servers("csharp"), ["csharp-ls"]);
+        assert_eq!(servers("javascript")[0], "tsgo");
+
+        let trusted_only: Vec<&str> = m
+            .servers()
+            .iter()
+            .filter(|s| s.trusted_only)
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(
+            trusted_only,
+            ["phpactor", "ruby-lsp", "kotlin-lsp", "csharp-ls"]
+        );
+
+        let needs = |name: &str| {
+            let r = m.server(name).unwrap().requires.clone().unwrap();
+            format!("{} {}", r.runtime, r.min)
+        };
+        assert_eq!(needs("pyright"), "node 14");
+        assert_eq!(needs("typescript-language-server"), "node 18");
+        assert_eq!(needs("intelephense"), "node 20");
+        assert_eq!(needs("phpactor"), "php 8.2");
+        assert_eq!(needs("ruby-lsp"), "ruby 3");
+        assert_eq!(needs("jdtls"), "java 21");
+        assert_eq!(needs("csharp-ls"), "dotnet-sdk 10");
+        assert!(
+            m.server("kotlin-lsp").unwrap().requires.is_none(),
+            "bundled"
+        );
+
+        // Review options that stop jdtls running a build.
+        let jdtls = m.server("jdtls").unwrap();
+        let review = &jdtls.review_init_options["settings"]["java"];
+        assert_eq!(review["import"]["gradle"]["enabled"], false);
+        assert_eq!(review["import"]["maven"]["enabled"], false);
+        assert_eq!(review["autobuild"]["enabled"], false);
+        assert!(!jdtls.workspace_folders, "one -data per worktree");
+
+        // A detect-only server says how to get it, or Unavailable says
+        // "no download" for a thing that was never going to have one.
+        for s in m.servers() {
+            if s.download.is_none() {
+                assert!(s.hint.is_some(), "{}: detect-only with no hint", s.name);
+            }
         }
     }
 
@@ -691,6 +981,65 @@ languages:
                 .any(|w| w.contains("linux-x64") && w.contains("https"))
         );
         assert!(warnings.iter().any(|w| w.contains("unknown server nobin")));
+    }
+
+    #[test]
+    fn requires_and_launch_placeholders_are_validated() {
+        let yaml = r#"
+servers:
+  - name: ok
+    detect: [["ok"]]
+    launch: ["{runtime}", "{bin}", "--data={data}/x", '--json={"a": 1}']
+    requires: { runtime: java, min: 21 }
+    hint: "brew install ok"
+    trusted_only: true
+    start_timeout_secs: 600
+    ready_settle_secs: 5
+  - name: minor
+    detect: [["minor"]]
+    launch: ["{bin}"]
+    requires: { runtime: php, min: "8.2" }
+  - name: no-requires
+    detect: [["x"]]
+    launch: ["{runtime}", "{bin}"]
+  - name: unknown-runtime
+    detect: [["x"]]
+    launch: ["{bin}"]
+    requires: { runtime: cobol, min: 1 }
+  - name: typo
+    detect: [["x"]]
+    launch: ["{bin}", "{dat}/x"]
+  - name: dir-with-detect
+    detect: [["x"]]
+    launch: ["{bin}", "{dir}/x"]
+languages: []
+"#;
+        let (m, warnings) = Manifest::parse(yaml, r#"{"schema":1,"grammars":[]}"#).unwrap();
+        let ok = m.server("ok").unwrap();
+        assert_eq!(
+            ok.requires.as_ref().unwrap().min,
+            crate::MinVersion {
+                major: 21,
+                minor: 0
+            }
+        );
+        assert_eq!(ok.hint.as_deref(), Some("brew install ok"));
+        assert!(ok.trusted_only);
+        assert!(ok.uses_data_dir());
+        assert_eq!(ok.start_timeout_secs, Some(600));
+        assert_eq!(ok.ready_settle_secs, Some(5));
+        assert_eq!(
+            m.server("minor").unwrap().requires.as_ref().unwrap().min,
+            crate::MinVersion { major: 8, minor: 2 }
+        );
+        for dropped in ["no-requires", "unknown-runtime", "typo", "dir-with-detect"] {
+            assert!(m.server(dropped).is_none(), "{dropped}");
+            assert!(
+                warnings.iter().any(|w| w.contains(dropped)),
+                "{dropped}: {warnings:?}"
+            );
+        }
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
     }
 
     #[test]

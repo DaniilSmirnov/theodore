@@ -104,11 +104,11 @@ export function TerminalToggle({
         variant={open ? 'secondary' : 'ghost'}
         aria-label="Terminal"
         aria-pressed={open}
-        className="space-terminal-toggle"
+        className="space-terminal-toggle btn-collapsible"
         onPress={onToggle}
       >
         <TerminalLine className="size-3.5" />
-        Terminal
+        <span className="btn-label">Terminal</span>
       </Button>
       <Tooltip.Content>Terminal ⌃`</Tooltip.Content>
     </Tooltip>
@@ -122,10 +122,13 @@ export const TerminalDrawer = observer(function TerminalDrawer({
   space,
   open,
   onClose,
+  height,
 }: {
   space: string;
   open: boolean;
   onClose: () => void;
+  /** px: the page caps it by the room the chat leaves (`drawerHeight`). */
+  height: number;
 }) {
   const { terminals, active, setActive, openTab, closeTab } = useSpaceTerminals(
     space,
@@ -133,7 +136,10 @@ export const TerminalDrawer = observer(function TerminalDrawer({
   );
   if (!open) return null;
   return (
-    <section className="space-terminal flex h-[300px] shrink-0 flex-col border-t border-separator">
+    <section
+      className="space-terminal flex shrink-0 flex-col border-t border-separator bg-background"
+      style={{ height }}
+    >
       <div className="flex items-center gap-1 border-b border-separator px-2 py-1">
         {terminals.map((t) => (
           <TerminalTab
@@ -224,6 +230,27 @@ const TerminalTab = observer(function TerminalTab({
   );
 });
 
+/** `color` at `alpha`, as the `rgba()` xterm can parse: the tokens are
+ *  `oklch()`, and it drops a translucent color in any other form. */
+function translucent(color: string, alpha: number): string {
+  const ctx = document.createElement('canvas').getContext('2d');
+  if (!ctx) return `rgba(127, 127, 127, ${alpha})`;
+  ctx.fillStyle = color;
+  ctx.fillRect(0, 0, 1, 1);
+  const [r, g, b] = ctx.getImageData(0, 0, 1, 1).data;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+/** The mono font's stack, resolved: xterm measures a cell with it, and a
+ *  `var()` it can't resolve would measure another font than it draws. */
+function monoFont(): string {
+  return (
+    getComputedStyle(document.documentElement)
+      .getPropertyValue('--font-mono')
+      .trim() || 'ui-monospace, Menlo, monospace'
+  );
+}
+
 /** Reads the app's HeroUI tokens for an `xterm.js` theme that follows
  *  light/dark (`ui/src/styles.css`'s `--background`/`--foreground`/…, set
  *  on `:root`/`.dark`) — no terminal-specific palette of its own. */
@@ -248,8 +275,10 @@ function terminalTheme(): NonNullable<
     foreground,
     cursor: accent,
     cursorAccent: background,
-    selectionBackground: `color-mix(in oklab, ${accent} 35%, transparent)`,
-    black: background,
+    selectionBackground: translucent(accent, 0.35),
+    // ANSI black on a light background: not the background itself, or
+    // text in it disappears.
+    black: muted,
     red: danger,
     green: success,
     yellow: warning,
@@ -291,8 +320,9 @@ const TerminalView = observer(function TerminalView({
     if (!el) return;
     const t = new XTerm({
       cursorBlink: true,
-      fontFamily: 'var(--font-mono)',
+      fontFamily: monoFont(),
       fontSize: 12,
+      lineHeight: 1.3,
       theme: terminalTheme(),
     });
     const f = new FitAddon();
@@ -316,6 +346,15 @@ const TerminalView = observer(function TerminalView({
     const ro = new ResizeObserver(() => f.fit());
     ro.observe(el);
     f.fit();
+    // The web font loads on first use. Cells measured with the fallback are
+    // too wide for it, and the letters come out spread apart: measure again.
+    let live = true;
+    void document.fonts?.load?.('12px "Geist Mono Variable"').then(() => {
+      if (!live) return;
+      t.options.fontFamily = monoFont();
+      t.clearTextureAtlas?.();
+      f.fit();
+    });
 
     const onTheme = () => {
       t.options.theme = terminalTheme();
@@ -323,6 +362,7 @@ const TerminalView = observer(function TerminalView({
     window.addEventListener('theodore-theme', onTheme);
 
     return () => {
+      live = false;
       offData.dispose();
       offResize.dispose();
       ro.disconnect();

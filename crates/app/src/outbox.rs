@@ -211,6 +211,9 @@ async fn process_item(core: &Core, item: OutboxItem) {
         Ok(()) => {
             let id = item.id;
             let _ = tokio::task::spawn_blocking(move || store.outbox_done(id)).await;
+            if let Some(waiter) = core.0.outbox_waiters.lock().await.remove(&id) {
+                let _ = waiter.send(None);
+            }
             // A write got through: the host is reachable and the token
             // good — clear an offline / auth / rate-limit banner now rather
             // than at the next poll.
@@ -235,6 +238,7 @@ async fn process_item(core: &Core, item: OutboxItem) {
                 online: true,
                 rate_limited_until: None,
                 auth_ok: false,
+                server_trouble: false,
             });
         }
         Err(Outcome::Fail(message)) => {
@@ -246,10 +250,16 @@ async fn process_item(core: &Core, item: OutboxItem) {
             );
             let error = message.clone();
             let _ = tokio::task::spawn_blocking(move || store.outbox_fail(id, &error)).await;
-            core.emit(Ephemeral::Toast {
-                level: ToastLevel::Error,
-                text: message,
-            });
+            // A caller still waiting reports it itself (its command fails
+            // with this message): one toast, not two.
+            let waiter = core.0.outbox_waiters.lock().await.remove(&id);
+            match waiter.map(|w| w.send(Some(message.clone()))) {
+                Some(Ok(())) => {}
+                _ => core.emit(Ephemeral::Toast {
+                    level: ToastLevel::Error,
+                    text: message,
+                }),
+            }
         }
     }
 }
@@ -295,10 +305,11 @@ async fn classify_host_error(core: &Core, item: &OutboxItem, err: HostError) -> 
                 online: true,
                 rate_limited_until: Some(reset_at),
                 auth_ok: true,
+                server_trouble: false,
             });
             retry(reset_at, &err)
         }
-        HostError::Network(_) => {
+        HostError::Network(_) | HostError::Server(_) => {
             let now = core.0.deps.clock.now();
             retry(now + backoff_ms(item.attempts), &err)
         }
@@ -324,30 +335,47 @@ async fn do_set_viewed(core: &Core, item: &OutboxItem) -> Result<(), Outcome> {
         .pr_ref(&payload.pr)
         .await
         .ok_or_else(|| Outcome::Fail("pr not found".into()))?;
+    // The item carries no state: it sends what the row says now, so toggles
+    // that rode on it while it waited end on the host as they did locally.
+    let row_id = format!("{}:{}", payload.pr.0, payload.path);
+    let store = core.0.deps.store.clone();
+    let row = tokio::task::spawn_blocking(move || store.get(models::FILE_VIEWED, &row_id))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .flatten()
+        .and_then(|r| serde_json::from_value::<theodore_contract::FileViewedRow>(r.data).ok());
+    let viewed = row.is_none_or(|r| r.state == ViewedState::Viewed);
     match core
         .0
         .deps
         .host
-        .set_viewed(&pr_ref, &payload.path, true)
+        .set_viewed(&pr_ref, &payload.path, viewed)
         .await
     {
         Ok(()) => Ok(()),
         Err(e) => {
             let outcome = classify_host_error(core, item, e).await;
             if matches!(outcome, Outcome::Fail(_)) {
-                compensate_set_viewed(core, &payload).await;
+                compensate_set_viewed(core, &payload, viewed).await;
             }
             Err(outcome)
         }
     }
 }
 
-async fn compensate_set_viewed(core: &Core, payload: &SetViewedPayload) {
+/// Puts the row back the way the host still has it: the opposite of the
+/// state the failed write tried to send.
+async fn compensate_set_viewed(core: &Core, payload: &SetViewedPayload, sent: bool) {
     let row_id = format!("{}:{}", payload.pr.0, payload.path);
     let data = serde_json::to_value(theodore_contract::FileViewedRow {
         pr: payload.pr.clone(),
         path: payload.path.clone(),
-        state: ViewedState::Unviewed,
+        state: if sent {
+            ViewedState::Unviewed
+        } else {
+            ViewedState::Viewed
+        },
     })
     .expect("serializable");
     let action = NewAction {
@@ -367,22 +395,34 @@ async fn do_submit_review(core: &Core, item: &OutboxItem) -> Result<(), Outcome>
         .await
         .ok_or_else(|| Outcome::Fail("pr not found".into()))?;
 
-    // After a timeout, a comment may already have been posted: look it up
-    // by its marker before posting it again (plan §6.7).
-    let mut comments = Vec::with_capacity(payload.comments.len());
-    for c in &payload.comments {
-        if item.attempts > 0 {
-            match core.0.deps.host.find_marker(&pr_ref, &c.marker).await {
-                Ok(Some(_)) => continue,
-                Ok(None) => {}
-                Err(e) => return Err(classify_host_error(core, item, e).await),
-            }
-        }
-        comments.push(ReviewComment {
+    // A comment whose marker is already on the PR was posted before (a
+    // timeout, an earlier submit that kept its draft): never post it
+    // again (plan §6.7). One read of the PR's comments per attempt.
+    let markers: Vec<String> = payload.comments.iter().map(|c| c.marker.clone()).collect();
+    let posted = match core.0.deps.host.find_markers(&pr_ref, &markers).await {
+        Ok(found) => found,
+        Err(e) => return Err(classify_host_error(core, item, e).await),
+    };
+    let comments: Vec<ReviewComment> = payload
+        .comments
+        .iter()
+        .filter(|c| !posted.contains(&c.marker))
+        .map(|c| ReviewComment {
             anchor: c.anchor.clone(),
             body: c.body.clone(),
             marker: c.marker.clone(),
-        });
+        })
+        .collect();
+    // Every comment of a body-less Comment review is on the PR already:
+    // there is nothing left to post, and an empty review is refused.
+    if comments.is_empty()
+        && !payload.comments.is_empty()
+        && payload.body.trim().is_empty()
+        && payload.event == ReviewEvent::Comment
+    {
+        archive_drafts(core, payload.comments.iter().map(|c| c.draft_id.clone())).await;
+        refresh_pr_detail(core, &payload.pr, &pr_ref).await;
+        return Ok(());
     }
 
     let submission = ReviewSubmission {
@@ -456,9 +496,20 @@ async fn do_resolve_thread(core: &Core, item: &OutboxItem) -> Result<(), Outcome
     {
         Ok(()) => {
             refresh_pr_detail(core, &payload.pr, &pr_ref).await;
+            // The host just took it: a fetch that raced the write and still
+            // reads the old state doesn't get to undo it.
+            core.set_thread_resolved(&payload.pr, &payload.thread, payload.resolved)
+                .await;
             Ok(())
         }
-        Err(e) => Err(classify_host_error(core, item, e).await),
+        Err(e) => {
+            let outcome = classify_host_error(core, item, e).await;
+            if matches!(outcome, Outcome::Fail(_)) {
+                core.set_thread_resolved(&payload.pr, &payload.thread, !payload.resolved)
+                    .await;
+            }
+            Err(outcome)
+        }
     }
 }
 
@@ -761,17 +812,15 @@ async fn apply_submitted_review(
     payload: &SubmitReviewPayload,
     submitted: &SubmittedReview,
 ) {
-    let mut actions = Vec::new();
+    // Every draft of the payload is on the PR now, posted by this review or
+    // found by its marker: archive them all, not only those whose thread the
+    // host listed back (a thread read right after the write can miss it,
+    // and a draft left behind went out again with the next submit).
+    let mut actions = draft_archive_actions(payload.comments.iter().map(|c| c.draft_id.clone()));
     for (marker, thread_id) in &submitted.threads {
         let Some(c) = payload.comments.iter().find(|c| &c.marker == marker) else {
             continue;
         };
-        actions.push(NewAction {
-            model: models::DRAFT.into(),
-            model_id: c.draft_id.clone(),
-            action: SyncActionCode::A,
-            data: None,
-        });
         let row = ThreadRow {
             pr: payload.pr.clone(),
             thread: theodore_domain::Thread {
@@ -802,4 +851,18 @@ async fn apply_submitted_review(
         });
     }
     let _ = core.apply(actions).await;
+}
+
+fn draft_archive_actions(ids: impl Iterator<Item = String>) -> Vec<NewAction> {
+    ids.map(|id| NewAction {
+        model: models::DRAFT.into(),
+        model_id: id,
+        action: SyncActionCode::A,
+        data: None,
+    })
+    .collect()
+}
+
+async fn archive_drafts(core: &Core, ids: impl Iterator<Item = String>) {
+    let _ = core.apply(draft_archive_actions(ids)).await;
 }

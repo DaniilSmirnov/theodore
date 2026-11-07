@@ -27,6 +27,11 @@ pub enum GitError {
     Network(String),
     #[error("parse: {0}")]
     Parse(String),
+    /// A commit asked for isn't in the repository (a head force-pushed
+    /// away, a stale last-seen sha): an expected state the caller falls
+    /// back from, not a git failure.
+    #[error("commit {0} not found")]
+    MissingCommit(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("not supported: {0}")]
@@ -85,6 +90,7 @@ impl GitError {
             GitError::Auth(_) => "git.auth",
             GitError::Network(_) => "git.network",
             GitError::Parse(_) => "git.parse",
+            GitError::MissingCommit(_) => "git.commit_not_found",
             GitError::Io(_) => "git.io",
             GitError::Unsupported(_) => "git.unsupported",
             GitError::Refused(_) => "git.refused",
@@ -126,6 +132,14 @@ pub struct Worktree {
 pub struct SpaceCheckpoint {
     pub sha: Sha,
     pub head: Sha,
+}
+
+/// One file's line counts between two commits ([`GitPort::numstat`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStat {
+    pub path: String,
+    pub additions: u32,
+    pub deletions: u32,
 }
 
 /// One local branch of a project (plan "projects"): host projects list
@@ -192,6 +206,12 @@ pub trait GitPort: Send + Sync {
     ) -> GitResult<Revision>;
     /// File contents at `rev`, `None` if absent.
     async fn show(&self, repo: &Path, rev: &Sha, path: &str) -> GitResult<Option<Vec<u8>>>;
+    /// The files that differ between two commits (not their merge base), with
+    /// lines added and removed; a binary file counts as 0 and 0.
+    async fn numstat(&self, repo: &Path, from: &Sha, to: &Sha) -> GitResult<Vec<FileStat>> {
+        let _ = (repo, from, to);
+        Err(GitError::Unsupported("numstat"))
+    }
 
     /// The bare clone of `repo` if one is already on disk, `None` if not.
     /// Unlike `ensure_repo`, never touches the network: opening a PR
@@ -208,18 +228,19 @@ pub trait GitPort: Send + Sync {
         Ok(false)
     }
 
-    /// Stages every change in `worktree`, commits it, and pushes to
-    /// `branch` on `repo`'s remote (plan §4 "Fix target": own or local PR).
-    /// Returns the new head sha. `Unsupported` by default; only a `GitPort`
-    /// backed by a real remote (the git CLI) can push.
+    /// Stages every change in `worktree`, commits it as `author`, and
+    /// pushes to `branch` on `repo`'s remote (plan §4 "Fix target": own or
+    /// local PR). Returns the new head sha. `Unsupported` by default; only a
+    /// `GitPort` backed by a real remote (the git CLI) can push.
     async fn commit_and_push(
         &self,
         worktree: &Path,
         repo: &RepoRef,
         branch: &str,
         message: &str,
+        author: &Identity,
     ) -> GitResult<Sha> {
-        let _ = (worktree, repo, branch, message);
+        let _ = (worktree, repo, branch, message, author);
         Err(GitError::Unsupported("commit_and_push"))
     }
 
@@ -232,6 +253,20 @@ pub trait GitPort: Send + Sync {
     async fn ensure_local_mirror(&self, source: &Path, repo: &RepoRef) -> GitResult<PathBuf> {
         let _ = (source, repo);
         Err(GitError::Unsupported("ensure_local_mirror"))
+    }
+
+    /// Whether git tracks `path` (relative to `folder`), so whoever can
+    /// commit to the repo decides what it holds.
+    async fn is_tracked(&self, folder: &Path, path: &str) -> GitResult<bool> {
+        let _ = (folder, path);
+        Err(GitError::Unsupported("is_tracked"))
+    }
+
+    /// Ignores `pattern` in `folder`'s own `info/exclude`: this checkout
+    /// only, nothing to commit, no file in the working tree changes.
+    async fn exclude_locally(&self, folder: &Path, pattern: &str) -> GitResult<()> {
+        let _ = (folder, pattern);
+        Err(GitError::Unsupported("exclude_locally"))
     }
 
     /// Whether `path` is (inside) a git working copy or bare repository.
@@ -483,6 +518,21 @@ pub trait GitPort: Send + Sync {
         Ok(None)
     }
 
+    /// Whether two commits hold the same tree. By the shas by default (fakes).
+    async fn same_tree(&self, repo: &Path, a: &Sha, b: &Sha) -> GitResult<bool> {
+        let _ = repo;
+        Ok(a == b)
+    }
+
+    /// Keeps `paths` (relative to the worktree) out of every checkpoint: the
+    /// ones git would otherwise pick up, untracked and not ignored, are
+    /// excluded for the cache's worktrees. Tracked and ignored ones are left
+    /// as they are. `Ok` by default (fakes).
+    async fn space_exclude(&self, worktree: &Path, paths: &[String]) -> GitResult<()> {
+        let _ = (worktree, paths);
+        Ok(())
+    }
+
     /// The space's worktree as it is now, as a commit on top of `HEAD`:
     /// staged through a temporary index, so the worktree's own index, its
     /// `HEAD` and every ref stay as they were. `HEAD` itself when nothing
@@ -509,19 +559,21 @@ pub trait GitPort: Send + Sync {
         Err(GitError::Unsupported("space_merge"))
     }
 
-    /// Completes the merge `space_merge` left in progress: once no file it
-    /// listed still has conflict markers, everything is staged and the
-    /// merge commit written as a checkpoint (`Merged`); otherwise
-    /// `Conflicts` with what is left. A merge concluded in the worktree by
-    /// hand is checkpointed as is; `NotMerging` when it was aborted there.
+    /// Completes the merge `space_merge` left in progress: once neither a
+    /// file in `conflicts` (what it listed, staged or not) nor one still
+    /// unmerged has conflict markers, everything is staged and the merge
+    /// commit written as a checkpoint (`Merged`); otherwise `Conflicts` with
+    /// what is left. A merge concluded in the worktree by hand is
+    /// checkpointed as is; `NotMerging` when it was aborted there.
     async fn space_merge_finish(
         &self,
         worktree: &Path,
         space: &str,
         tip: &Sha,
+        conflicts: &[String],
         message: &str,
     ) -> GitResult<SpaceMerge> {
-        let _ = (worktree, space, tip, message);
+        let _ = (worktree, space, tip, conflicts, message);
         Err(GitError::Unsupported("space_merge_finish"))
     }
 

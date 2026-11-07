@@ -11,8 +11,10 @@
 //! ```
 //! In a review run probes run outside the worktree, so a PR's
 //! `rust-toolchain.toml` cannot pick (or install) the toolchain they hit.
+//! A server's runtime is checked first (`crate::runtime`); what it found
+//! reaches the launch as `{runtime}` and in the server's environment.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -20,7 +22,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use theodore_ports::code_intel::{InstallState, TrustMode};
 
-use crate::manifest::{BIN_PLACEHOLDER, ServerSpec};
+use crate::manifest::{
+    BIN_PLACEHOLDER, DATA_PLACEHOLDER, DIR_PLACEHOLDER, RUNTIME_PLACEHOLDER, ServerSpec,
+};
+use crate::runtime::{JavaLookup, Runtime};
 
 /// How long a `--version` / `rustup which` / `xcrun --find` may take.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -44,8 +49,12 @@ pub enum ServerOrigin {
 pub struct ResolvedServer {
     pub name: String,
     pub bin: PathBuf,
-    /// The manifest's `launch` with `{bin}` replaced.
+    /// The manifest's `launch` with its placeholders replaced.
     pub argv: Vec<OsString>,
+    /// Environment for the process: the runtime that passed the check.
+    pub env: Vec<(OsString, OsString)>,
+    /// `{data}`: created when the server is launched. `None`: not used.
+    pub data_dir: Option<PathBuf>,
     pub origin: ServerOrigin,
 }
 
@@ -71,6 +80,11 @@ pub struct LaunchConfig {
     /// merged over them in a review run.
     pub init_options: serde_json::Value,
     pub workspace_folders: bool,
+    pub env: Vec<(OsString, OsString)>,
+    /// How long it may take to start, when longer than the default.
+    pub start_timeout_secs: Option<u64>,
+    /// Quiet time before it counts as warmed up, when not the default.
+    pub ready_settle_secs: Option<u64>,
 }
 
 pub fn launch_config(
@@ -86,17 +100,41 @@ pub fn launch_config(
         argv: resolved.argv.clone(),
         init_options,
         workspace_folders: spec.workspace_folders,
+        env: resolved.env.clone(),
+        start_timeout_secs: spec.start_timeout_secs,
+        ready_settle_secs: spec.ready_settle_secs,
     }
 }
 
-pub(crate) fn launch_argv(spec: &ServerSpec, bin: &Path) -> Vec<OsString> {
+/// What `launch` placeholders stand for.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LaunchVars<'a> {
+    /// `{bin}`.
+    pub bin: Option<&'a Path>,
+    /// `{dir}`: where the download was unpacked.
+    pub dir: Option<&'a Path>,
+    /// `{data}`: writable, per worktree, outside it.
+    pub data: Option<&'a Path>,
+    /// `{runtime}`.
+    pub runtime: Option<&'a Path>,
+}
+
+pub(crate) fn launch_argv(spec: &ServerSpec, vars: LaunchVars<'_>) -> Vec<OsString> {
+    let whole = |p: Option<&Path>| p.map(|p| p.as_os_str().to_owned());
     spec.launch
         .iter()
-        .map(|a| {
-            if a == BIN_PLACEHOLDER {
-                bin.as_os_str().to_owned()
-            } else {
-                OsString::from(a)
+        .map(|a| match a.as_str() {
+            BIN_PLACEHOLDER => whole(vars.bin).unwrap_or_else(|| a.into()),
+            RUNTIME_PLACEHOLDER => whole(vars.runtime).unwrap_or_else(|| a.into()),
+            _ => {
+                // Inside an argument: `-Dosgi.x={dir}/config`.
+                let mut out = a.clone();
+                for (name, value) in [(DIR_PLACEHOLDER, vars.dir), (DATA_PLACEHOLDER, vars.data)] {
+                    if let Some(v) = value {
+                        out = out.replace(name, &v.to_string_lossy());
+                    }
+                }
+                OsString::from(out)
             }
         })
         .collect()
@@ -129,21 +167,55 @@ pub(crate) struct ProbeEnv {
     pub timeout: Duration,
     /// Where probes run in a review run: not the worktree.
     pub neutral_dir: PathBuf,
+    /// Where Java lives besides `PATH`.
+    pub java: JavaLookup,
 }
 
 impl ProbeEnv {
-    fn path_var(&self) -> Option<OsString> {
+    pub(crate) fn path_var(&self) -> Option<OsString> {
         self.path.clone().or_else(|| std::env::var_os("PATH"))
     }
 }
 
-/// The server on the machine, by the manifest's `detect` rules.
+/// The server on the machine, by the manifest's `detect` rules. `runtime` is
+/// what passed its `requires`; `data` is its `{data}`.
 pub(crate) async fn find_system(
     spec: &ServerSpec,
+    runtime: Option<&Runtime>,
+    data: Option<&Path>,
     worktree: &Path,
     trust: TrustMode,
     env: &ProbeEnv,
 ) -> Option<ResolvedServer> {
+    let (path, version) = find_binary(spec, worktree, trust, env).await?;
+    let vars = LaunchVars {
+        bin: Some(&path),
+        data,
+        runtime: runtime.map(|r| r.exe.as_path()),
+        dir: None,
+    };
+    Some(ResolvedServer {
+        name: spec.name.clone(),
+        argv: launch_argv(spec, vars),
+        env: server_env(runtime, env),
+        data_dir: data.map(Path::to_path_buf),
+        bin: path.clone(),
+        origin: ServerOrigin::System { path, version },
+    })
+}
+
+/// A server's environment from the runtime that passed its check.
+pub(crate) fn server_env(runtime: Option<&Runtime>, env: &ProbeEnv) -> Vec<(OsString, OsString)> {
+    let path = env.path_var();
+    runtime.map_or_else(Vec::new, |r| r.env(path.as_deref().map(OsStr::new)))
+}
+
+async fn find_binary(
+    spec: &ServerSpec,
+    worktree: &Path,
+    trust: TrustMode,
+    env: &ProbeEnv,
+) -> Option<(PathBuf, Option<String>)> {
     let cwd = match trust {
         TrustMode::Trusted => worktree,
         TrustMode::Review => env.neutral_dir.as_path(),
@@ -194,7 +266,7 @@ async fn try_candidates(
     trust: TrustMode,
     cwd: &Path,
     env: &ProbeEnv,
-) -> Option<ResolvedServer> {
+) -> Option<(PathBuf, Option<String>)> {
     for (path, args) in candidates {
         if trust == TrustMode::Review && is_inside(&path, worktree) {
             tracing::info!(
@@ -206,12 +278,7 @@ async fn try_candidates(
         let Some(version) = probe(&path, args, cwd, env).await else {
             continue;
         };
-        return Some(ResolvedServer {
-            name: spec.name.clone(),
-            argv: launch_argv(spec, &path),
-            bin: path.clone(),
-            origin: ServerOrigin::System { path, version },
-        });
+        return Some((path, version));
     }
     None
 }
@@ -245,13 +312,13 @@ async fn tool_lookup(tool: &str, args: &[&str], cwd: &Path, env: &ProbeEnv) -> O
     (path.is_absolute() && path.is_file()).then_some(path)
 }
 
-enum Run {
+pub(crate) enum Run {
     Ok(std::process::Output),
     Timeout,
     Failed,
 }
 
-async fn run(program: &Path, args: &[String], cwd: &Path, env: &ProbeEnv) -> Run {
+pub(crate) async fn run(program: &Path, args: &[String], cwd: &Path, env: &ProbeEnv) -> Run {
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
         .current_dir(cwd)
@@ -282,7 +349,7 @@ fn first_line(out: &std::process::Output) -> Option<String> {
     })
 }
 
-fn is_inside(path: &Path, dir: &Path) -> bool {
+pub(crate) fn is_inside(path: &Path, dir: &Path) -> bool {
     let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     canon(path).starts_with(canon(dir))
 }
@@ -325,7 +392,15 @@ workspace_folders: true
         let bin = PathBuf::from("/opt/s/server.js");
         let resolved = ResolvedServer {
             name: "s".into(),
-            argv: launch_argv(&spec, &bin),
+            argv: launch_argv(
+                &spec,
+                LaunchVars {
+                    bin: Some(&bin),
+                    ..LaunchVars::default()
+                },
+            ),
+            env: vec![("PATH".into(), "/opt/node/bin".into())],
+            data_dir: None,
             bin,
             origin: ServerOrigin::Downloaded {
                 version: "1".into(),
@@ -342,7 +417,47 @@ workspace_folders: true
         );
         assert_eq!(review.init_options, json!({"a": 1, "plugins": []}));
         assert!(review.workspace_folders);
+        assert_eq!(review.env, resolved.env);
         let trusted = launch_config(&resolved, &spec, TrustMode::Trusted);
         assert_eq!(trusted.init_options, json!({"a": 1}));
+    }
+
+    #[test]
+    fn launch_placeholders_expand_whole_and_inside_an_argument() {
+        let spec: ServerSpec = serde_yaml::from_str(
+            r#"
+name: s
+launch: ["{runtime}", "-Dcfg={dir}/config", "-jar", "{bin}", "-data", "{data}/ws", "{bin}x"]
+"#,
+        )
+        .unwrap();
+        let (bin, dir, data, rt) = (
+            PathBuf::from("/s/1/l.jar"),
+            PathBuf::from("/s/1"),
+            PathBuf::from("/d/ab"),
+            PathBuf::from("/jdk/bin/java"),
+        );
+        let argv = launch_argv(
+            &spec,
+            LaunchVars {
+                bin: Some(&bin),
+                dir: Some(&dir),
+                data: Some(&data),
+                runtime: Some(&rt),
+            },
+        );
+        let want: Vec<OsString> = [
+            "/jdk/bin/java",
+            "-Dcfg=/s/1/config",
+            "-jar",
+            "/s/1/l.jar",
+            "-data",
+            "/d/ab/ws",
+            "{bin}x",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(argv, want);
     }
 }

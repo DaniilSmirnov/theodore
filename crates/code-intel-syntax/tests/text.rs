@@ -42,7 +42,8 @@ fn text_search_finds_whole_words_and_respects_gitignore() {
         found,
         vec![
             ("src/a.c", Position { line: 1, col: 11 }, false),
-            ("src/a.c", Position { line: 2, col: 5 }, false),
+            // `int compute(int x) {`: a typed signature is a definition.
+            ("src/a.c", Position { line: 2, col: 5 }, true),
             ("src/b.c", Position { line: 1, col: 5 }, false),
             ("src/e.py", Position { line: 1, col: 5 }, true),
         ]

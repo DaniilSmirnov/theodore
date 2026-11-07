@@ -77,6 +77,8 @@ const base = (p: string) => p.split('/').pop() ?? p;
  *  still wide enough to tell "off-pattern" from "also in" ("off…" vs
  *  "also…"), its label cut with an ellipsis instead of wrapping. */
 const BADGE = 'min-w-12 shrink-[100] *:min-w-0 *:truncate';
+/** The core's catch-all of hunks changed since the last grouping. */
+const UNGROUPED = 'ungrouped';
 const circled = (n: number) => '①②③④⑤⑥⑦⑧⑨'[n - 1] ?? String(n);
 const plural = (n: number, one: string, few: string, many: string) =>
   `${n} ${n === 1 ? one : n >= 2 && n <= 4 ? few : many}`;
@@ -764,11 +766,22 @@ const FileTree = observer(function FileTree({
               {f.flags.some((fl) => fl.kind === 'generated') && (
                 <span className="text-muted">gen</span>
               )}
-              {gs.map((g) => (
-                <Chip key={g} size="sm" variant="tertiary">
-                  {circled(numberOf.get(g) ?? 0)}
-                </Chip>
-              ))}
+              {gs.some((g) => g !== UNGROUPED)
+                ? gs.map((g) => (
+                    <Chip key={g} size="sm" variant="tertiary">
+                      {circled(numberOf.get(g) ?? 0)}
+                    </Chip>
+                  ))
+                : numberOf.size > 0 && (
+                    <Chip
+                      size="sm"
+                      variant="tertiary"
+                      className="tree-ungrouped text-muted"
+                      title="Not in a group yet; Regroup places it"
+                    >
+                      ?
+                    </Chip>
+                  )}
             </ListBox.Item>
           );
         })}

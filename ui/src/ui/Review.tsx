@@ -112,6 +112,25 @@ export function layoutFor(width: number): ReviewLayout {
   };
 }
 
+/** The toolbar's submit button, or `null` without one: none on a merged or
+ *  closed PR or a branch review, none on a space's own review that isn't its
+ *  host PR ("Send to agent" takes its place). On your own PR it's "Comment":
+ *  the host won't take your approval. */
+export function submitLabel(o: {
+  finished: boolean;
+  branchReview: boolean;
+  /** The host PR of the space this review is, if it is one. */
+  spacePr: string | null;
+  pr: string;
+  mine: boolean;
+  compact: boolean;
+}): string | null {
+  if (o.finished || o.branchReview) return null;
+  if (o.spacePr !== null && o.spacePr !== o.pr) return null;
+  if (o.mine) return 'Comment';
+  return o.compact ? 'Submit' : 'Submit review';
+}
+
 export const Review = observer(function Review({ pr }: { pr: PrId }) {
   const store = useRootStore();
   const ui = useUi();
@@ -194,10 +213,19 @@ export const Review = observer(function Review({ pr }: { pr: PrId }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pr, summary?.head_sha]);
 
+  // Its commit may be gone (a force-push, a fresh clone): then there's
+  // nothing to compare with, which isn't worth an error — forget it.
+  const forgetBaseline = useCallback(() => {
+    localStorage.removeItem(baselineKeyOf(pr));
+    setBaselineSha(null);
+  }, [pr]);
   const baselineKey = baselineSha ? `${pr}@${baselineSha}` : null;
   const baselineRevision = baselineKey
     ? store.revisions.get(baselineKey, () =>
-        api.getRevision({ pr, head: baselineSha! }),
+        api.getRevision({ pr, head: baselineSha! }, true).catch((e) => {
+          forgetBaseline();
+          throw e;
+        }),
       )
     : null;
   // Memoized so `DiffPane`/`GroupsPane` (both memoized) see the same map
@@ -536,6 +564,14 @@ export const Review = observer(function Review({ pr }: { pr: PrId }) {
   const mySpace = isBuildMode(store)
     ? spaceOfReview(store.models.spaces.all(), pr)
     : undefined;
+  const submit = submitLabel({
+    finished,
+    branchReview,
+    spacePr: mySpace ? (mySpace.pr ?? null) : null,
+    pr,
+    mine,
+    compact,
+  });
   const mergeBlock = !summary
     ? ''
     : local
@@ -611,13 +647,13 @@ export const Review = observer(function Review({ pr }: { pr: PrId }) {
           </Btn>
         )}
         {/* A merged or closed PR takes no more reviews, reviewers or merges. */}
-        {!finished && !branchReview && !mySpace && (
+        {submit && (
           <Btn
             tone="primary"
             className="shrink-0"
             onPress={() => ui.openModal('submit')}
           >
-            {compact ? 'Submit' : 'Submit review'}
+            {submit}
           </Btn>
         )}
         {!local && !finished && FEATURES.hostWrites && (
@@ -631,7 +667,7 @@ export const Review = observer(function Review({ pr }: { pr: PrId }) {
               className="merge-btn shrink-0"
               isIconOnly={compact}
               aria-label="Merge"
-              isDisabled={!FEATURES.hostWrites}
+              isDisabled={!FEATURES.hostWrites || summary?.state === 'draft'}
               onPress={() => setMergeOpen(true)}
             >
               {!compact && 'Merge'}
@@ -639,9 +675,11 @@ export const Review = observer(function Review({ pr }: { pr: PrId }) {
             <Tooltip.Content>
               {!FEATURES.hostWrites
                 ? 'Not available yet'
-                : mergeBlock
-                  ? `Blocked: ${mergeBlock} — you can enable auto-merge`
-                  : 'Merge'}
+                : summary?.state === 'draft'
+                  ? 'Ready for review first'
+                  : mergeBlock
+                    ? `Blocked: ${mergeBlock} — you can enable auto-merge`
+                    : 'Merge'}
             </Tooltip.Content>
           </Tooltip>
         )}
@@ -859,6 +897,7 @@ export const Review = observer(function Review({ pr }: { pr: PrId }) {
                   since={since}
                   sinceOnly={sinceOnly && sinceCount > 0}
                   baselineSha={baselineSha}
+                  onBaselineGone={forgetBaseline}
                   focusHunk={focusHunk}
                   setFocusHunk={setFocusHunk}
                   composer={composer}

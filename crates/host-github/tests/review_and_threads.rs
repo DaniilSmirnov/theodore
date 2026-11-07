@@ -98,6 +98,29 @@ async fn find_marker_scans_threads_for_the_tagged_comment() {
 }
 
 #[tokio::test]
+async fn find_markers_reads_the_threads_once_for_every_marker() {
+    let s = support::servers().await;
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("reviewThreads"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(support::fixture("review_threads_with_marker.json")),
+        )
+        .expect(1)
+        .mount(&s.graphql)
+        .await;
+
+    let found = s
+        .adapter
+        .find_markers(&pr(), &["m1".to_string(), "no-such-marker".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(found, std::collections::HashSet::from(["m1".to_string()]));
+}
+
+#[tokio::test]
 async fn reply_posts_a_thread_reply_and_returns_its_comment_id() {
     let s = support::servers().await;
 

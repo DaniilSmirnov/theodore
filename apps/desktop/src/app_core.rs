@@ -210,6 +210,10 @@ fn issue_err(e: HostError) -> CommandError {
             "network",
             "Couldn't reach GitHub. Check the connection and try again.".to_string(),
         ),
+        HostError::Server(_) => (
+            "network",
+            "GitHub is having trouble right now. Try again in a few minutes.".to_string(),
+        ),
         HostError::Validation(m) => ("invalid", format!("GitHub refused the issue: {m}")),
         other => ("internal", other.to_string()),
     };
@@ -293,13 +297,20 @@ fn err(e: AppError) -> CommandError {
         AppError::Git(theodore_ports::GitError::Unsupported(_)) => "unsupported",
         // The git remote can't be reached: offline, not a git failure.
         AppError::Git(theodore_ports::GitError::Network(_)) | AppError::Offline => "offline",
+        // A stale last-seen sha: the UI forgets it and compares with
+        // nothing instead of toasting git's words.
+        AppError::Git(theodore_ports::GitError::MissingCommit(_)) => "commit_not_found",
         AppError::Git(_) => "git",
         AppError::Host(theodore_ports::HostError::Auth) => "auth",
         AppError::Host(theodore_ports::HostError::RateLimited { .. }) => "rate_limited",
+        // This host can't do that at all (issues on a local folder or a
+        // host without them): the UI says so in place, never a toast.
+        AppError::Host(theodore_ports::HostError::Unsupported(_)) => "host.unsupported",
         AppError::Host(_) => "host",
         AppError::Grouper(_) => "grouping",
         AppError::NotFound(_) => "not_found",
         AppError::Invalid(_) => "invalid",
+        AppError::Refused(_) => "host",
         AppError::Join(_) => "internal",
         AppError::Account(_) => "account",
         // The UI shows the sign-in screen on this code (plan §6.12).
@@ -310,7 +321,7 @@ fn err(e: AppError) -> CommandError {
         AppError::Host(HostError::RateLimited { reset_at }) => {
             rate_limited_message(*reset_at, now_ms())
         }
-        _ => e.to_string(),
+        _ => e.user_message(),
     };
     CommandError {
         code: code.into(),
@@ -1000,6 +1011,9 @@ impl CoreApi for AppCore {
     ) -> Result<theodore_contract::Space, CommandError> {
         self.core.continue_space(&space).await.map_err(err)
     }
+    async fn refresh_space_pr(&self, space: String) -> Result<(), CommandError> {
+        self.core.refresh_space_pr(&space).await.map_err(err)
+    }
     async fn undo_space_turn(
         &self,
         space: String,
@@ -1120,6 +1134,24 @@ mod tests {
         let e = err(AppError::AccountRequired);
         assert_eq!(e.code, "account_required");
         assert_eq!(e.message, "Sign in to your Theodore account to continue");
+    }
+
+    #[test]
+    fn an_unsupported_host_call_has_its_own_code() {
+        // New space's issue picker says "no issues here" on this code
+        // instead of toasting it.
+        let e = err(AppError::Host(HostError::Unsupported("open_issues")));
+        assert_eq!(e.code, "host.unsupported");
+        let other = err(AppError::Host(HostError::Server("502".into())));
+        assert_eq!(other.code, "host");
+    }
+
+    #[test]
+    fn a_missing_commit_has_its_own_code() {
+        let e = err(AppError::Git(theodore_ports::GitError::MissingCommit(
+            "b6cef3e".into(),
+        )));
+        assert_eq!(e.code, "commit_not_found");
     }
 
     #[test]

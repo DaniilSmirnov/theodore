@@ -31,9 +31,10 @@ afterEach(() => {
 });
 
 const delta = (run: string, text: string) =>
-  act(() =>
-    store.ephemeral.handle({ type: 'agent_delta', run, agent: 'claude', text }),
-  );
+  act(() => {
+    store.ephemeral.handle({ type: 'agent_delta', run, agent: 'claude', text });
+    store.ephemeral.flushDeltas();
+  });
 const log = (run: string, line: string) =>
   act(() =>
     store.ephemeral.handle({ type: 'run_log', run, agent: 'claude', line }),

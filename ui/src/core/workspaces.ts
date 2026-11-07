@@ -10,7 +10,7 @@ import type {
   Project,
   RepoRef,
 } from '../gen/contract';
-import type { Route } from '../stores/UiStore';
+import type { ProjectSettingsSection, Route } from '../stores/UiStore';
 
 /** The "All projects" workspace id; every other id is a `Project::id`. */
 export const ALL = 'all';
@@ -179,23 +179,72 @@ const ROUTE_NAMES = new Set([
   'tasks',
   'skills',
   'settings',
+  'project-settings',
   'review',
   'new',
   'space',
 ]);
 
+/** The sections of a project's settings, in menu order. */
+export const PROJECT_SETTINGS_SECTIONS: readonly ProjectSettingsSection[] = [
+  'general',
+  'languages',
+  'config',
+];
+
+export const isProjectSettingsSection = (
+  v: unknown,
+): v is ProjectSettingsSection =>
+  PROJECT_SETTINGS_SECTIONS.includes(v as ProjectSettingsSection);
+
+/** A project's settings, opened on `section`. */
+export function projectSettingsRoute(
+  project: string,
+  section: ProjectSettingsSection = 'general',
+): Route {
+  return { name: 'project-settings', project, section };
+}
+
 /** A route saved by any version, as a route of `ws` today: My PRs
  *  (`mine`) is Pull requests, a project page (`project`) is the
- *  workspace's own home — Pull requests, or Branches for a local folder.
+ *  workspace's own home — Pull requests, or Branches for a local folder;
+ *  the Settings tabs Projects and Languages became each project's own
+ *  settings (this workspace's project, or Settings' first page under All).
  *  `null` for anything unreadable. */
 export function migrateRoute(raw: unknown, ws: WorkspaceId): Route | null {
   if (!raw || typeof raw !== 'object') return null;
-  const r = raw as { name?: unknown; pr?: unknown; id?: unknown };
+  const r = raw as {
+    name?: unknown;
+    pr?: unknown;
+    id?: unknown;
+    page?: unknown;
+    project?: unknown;
+    section?: unknown;
+  };
   const kind: WorkspaceKind =
     ws === ALL ? 'all' : isLocalId(ws) ? 'local' : 'repo';
   if (r.name === 'mine') return fitRoute({ name: 'prs' }, ws, kind);
   if (r.name === 'project') return ws === ALL ? { name: 'prs' } : homeRoute(ws);
   if (typeof r.name !== 'string' || !ROUTE_NAMES.has(r.name)) return null;
+  if (
+    r.name === 'settings' &&
+    (r.page === 'projects' || r.page === 'languages')
+  )
+    return ws === ALL
+      ? { name: 'settings', page: 'agents' }
+      : {
+          name: 'project-settings',
+          project: ws,
+          section: r.page === 'languages' ? 'languages' : 'general',
+        };
+  if (r.name === 'project-settings') {
+    if (typeof r.project !== 'string' || !r.project) return null;
+    return {
+      name: 'project-settings',
+      project: r.project,
+      section: isProjectSettingsSection(r.section) ? r.section : 'general',
+    };
+  }
   if (r.name === 'review' && typeof r.pr !== 'string') return null;
   if ((r.name === 'new' || r.name === 'space') && typeof r.id !== 'string')
     return null;

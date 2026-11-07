@@ -50,6 +50,8 @@ mod offline_tests;
 #[cfg(test)]
 mod projects_tests;
 #[cfg(test)]
+mod reconcile_tests;
+#[cfg(test)]
 mod review_config_tests;
 #[cfg(test)]
 mod ship_tests;

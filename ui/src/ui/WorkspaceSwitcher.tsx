@@ -3,12 +3,16 @@
  * workspace ("All projects" or one project) and opens a menu to switch —
  * one workspace at a time, the way a team switcher works. ⌃0 / ⌃1…9 switch
  * without opening it; the menu shows each workspace's waiting-PR count.
+ * A project's settings open from "Project settings" (under a project);
+ * "Manage projects…" is the list with drag to reorder, a row to open any
+ * project's settings (also under All), and Add project….
  */
 import { openExternal } from '../core/openExternal';
 import {
   ArrowRotateLeft,
   ArrowUpRightFromSquare,
   ChevronDown,
+  Folder,
   Gear,
   House,
   Plus,
@@ -16,7 +20,7 @@ import {
 import { Button, Dropdown, Label } from '@heroui/react';
 import { observer } from 'mobx-react-lite';
 import type { ReactNode } from 'react';
-import { ALL } from '../core/workspaces';
+import { ALL, projectSettingsRoute } from '../core/workspaces';
 import { FEATURES } from '../features';
 import { useRootStore, useUi, useWorkspaces } from '../stores/context';
 import { Spinner } from './bits';
@@ -28,6 +32,7 @@ import { ProjectStatusDot, hostRepoUrl, projectLabel } from './Projects';
 
 const ADD = 'add-project';
 const SETTINGS = 'project-settings';
+const MANAGE = 'manage-projects';
 const REFRESH = 'refresh-project';
 const OPEN_HOST = 'open-on-host';
 
@@ -136,8 +141,9 @@ export const WorkspaceSwitcher = observer(function WorkspaceSwitcher() {
           onAction={(k) => {
             const key = String(k);
             if (key === ADD) ui.openModal('add-project');
-            else if (key === SETTINGS)
-              ui.go({ name: 'settings', page: 'projects' });
+            else if (key === MANAGE) ui.openModal('manage-projects');
+            else if (key === SETTINGS && active)
+              ui.go(projectSettingsRoute(active.id));
             else if (key === REFRESH && active)
               void refreshProjectTracked(store, active.id);
             else if (key === OPEN_HOST && hostUrl) openExternal(hostUrl);
@@ -203,14 +209,12 @@ export const WorkspaceSwitcher = observer(function WorkspaceSwitcher() {
               isDisabled={!FEATURES.projects}
               check={false}
             />
-            {!active && (
-              <Item
-                id={SETTINGS}
-                icon={<Gear />}
-                label="Project settings"
-                check={false}
-              />
-            )}
+            <Item
+              id={MANAGE}
+              icon={<Folder />}
+              label="Manage projects…"
+              check={false}
+            />
           </Dropdown.Section>
         </Dropdown.Menu>
       </Dropdown.Popover>

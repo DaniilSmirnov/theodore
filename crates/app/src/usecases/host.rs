@@ -20,8 +20,9 @@ const CLIENT_ID_ENV: &str = "THEODORE_GITHUB_CLIENT_ID";
 const BUILT_IN_CLIENT_ID: Option<&str> = option_env!("THEODORE_GITHUB_CLIENT_ID");
 const CLIENT_ID_SETTING: &str = "host.github.client_id";
 /// Requested once, at `login_start`: enough to read PRs, threads and
-/// checks, and to resolve team reviewers.
-const DEVICE_FLOW_SCOPE: &str = "repo read:org";
+/// checks, to resolve team reviewers, and (`workflow`) for a space to push
+/// changes under `.github/workflows/`, which GitHub refuses without it.
+const DEVICE_FLOW_SCOPE: &str = "repo read:org workflow";
 
 /// `device_code` plus the poll interval, alive between `login_start` and
 /// the login finishing (plan "login"). Lives in `Core`'s `Inner::login`

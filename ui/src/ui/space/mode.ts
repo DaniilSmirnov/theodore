@@ -1,8 +1,13 @@
 /** Build mode against the live store: on/off, Labs visibility, and the
  *  "turn done" notices. No React, so `RootStore` can start the watcher. */
-import { reaction } from 'mobx';
+import { reaction, when } from 'mobx';
 import type { PrId, Space } from '../../gen/contract';
-import { OPEN_SPACE_EVENT, notifySpace, setBadge } from '../../core/native';
+import {
+  OPEN_SPACE_EVENT,
+  notifySpace,
+  setBadge,
+  takePendingSpace,
+} from '../../core/native';
 import { getTransport } from '../../core/transport';
 import { FEATURES } from '../../features';
 import type { RootStore } from '../../stores/RootStore';
@@ -38,21 +43,39 @@ export function openSpaceOnClick(
   opened: () => void = () => {},
 ): () => void {
   let off: (() => void) | null = null;
+  let offPending: (() => void) | null = null;
   let cancelled = false;
+  const open = (id: string) => {
+    store.ui.go({ name: 'space', id });
+    opened();
+  };
   void getTransport()
     .listen<string>(OPEN_SPACE_EVENT, (id) => {
       if (!store.models.spaces.get(id) || !isBuildMode(store)) return;
-      store.ui.go({ name: 'space', id });
-      opened();
+      open(id);
     })
     .then((un) => {
-      if (cancelled) un();
-      else off = un;
+      if (cancelled) {
+        un();
+        return null;
+      }
+      off = un;
+      return takePendingSpace();
+    })
+    .then((id) => {
+      if (!id || cancelled) return;
+      // A link that launched the app: its row comes with the first sync.
+      offPending = when(
+        () => !!store.models.spaces.get(id) && isBuildMode(store),
+        () => open(id),
+        { timeout: 60_000, onError: () => {} },
+      );
     })
     .catch(() => {});
   return () => {
     cancelled = true;
     off?.();
+    offPending?.();
   };
 }
 

@@ -177,11 +177,12 @@ impl Core {
             // checks the PR out afresh); the stored patch is the fix.
             ensure_patch_applied(&worktree, &patch).await?;
             let message = format!("fix: {} ({})", task.title, patch.by.as_str());
+            let author = self.pr_commit_author(&task.pr, &pr_ref.repo).await?;
             let sha = self
                 .0
                 .deps
                 .git
-                .commit_and_push(&worktree, &pr_ref.repo, &branch, &message)
+                .commit_and_push(&worktree, &pr_ref.repo, &branch, &message, &author)
                 .await?;
             Fix {
                 status: FixStatus::Applied,

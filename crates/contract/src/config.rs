@@ -126,6 +126,11 @@ pub struct SpaceSetup {
     pub notes: Vec<String>,
     #[serde(default)]
     pub finished_at: Option<Millis>,
+    /// A Retry took the command from the space's own worktree: the repo
+    /// layer of `setup`, and of the trust prompt while it waits, is the
+    /// worktree's file (docs/config.md §2 "Setup").
+    #[serde(default)]
+    pub from_worktree: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]

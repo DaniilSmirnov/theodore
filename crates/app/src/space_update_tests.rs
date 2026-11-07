@@ -36,7 +36,11 @@ fn widget() -> RepoRef {
 }
 
 async fn host_project(f: &Fixtures) -> (Core, Receivers, Project) {
-    let (core, recv) = Core::start(f.deps());
+    host_project_with(f, f.deps()).await
+}
+
+async fn host_project_with(f: &Fixtures, deps: crate::Deps) -> (Core, Receivers, Project) {
+    let (core, recv) = Core::start(deps);
     tokio::time::sleep(Duration::from_millis(30)).await;
     let project = Project {
         id: "github:acme/widget".into(),
@@ -180,6 +184,70 @@ async fn a_clean_update_moves_the_space_onto_the_new_base() {
     );
 }
 
+/// Update from base, its completion by hand and its abort rewrite the
+/// worktree outside a turn: the files they moved are reindexed.
+#[tokio::test]
+async fn an_update_completed_or_aborted_reindexes_the_files_it_moved() {
+    use crate::code_intel_tests::{diffs_touch, reindexed};
+    let f = fixtures();
+    let (core, _recv, project) = host_project_with(&f, f.deps_with_code()).await;
+    // No goal: no turn, so nothing else reindexes meanwhile.
+    let s = core
+        .create_space(CreateSpaceRequest {
+            project: project.id.clone(),
+            goal: String::new(),
+            name: None,
+            branch: None,
+            base: None,
+            agent: None,
+            model: None,
+            start_from: None,
+        })
+        .await
+        .unwrap();
+    let root = s.worktree.clone();
+    wait_until(|| {
+        f.code_intel
+            .calls()
+            .iter()
+            .any(|c| c.starts_with(&format!("open {root}")))
+    })
+    .await;
+
+    // Clean.
+    base_moves(&f);
+    diffs_touch(&f, "src/merged.ts");
+    core.update_space_from_base(&s.id).await.unwrap();
+    wait_until(|| reindexed(&f, &root, "src/merged.ts") == 1).await;
+
+    // Conflicts the agent's turn leaves, then Abort.
+    f.git.set_resolve("main", Sha::new("base333"));
+    f.git.set_resolve("base333", Sha::new("base333"));
+    for _ in 0..2 {
+        f.git
+            .push_merge_result(SpaceMerge::Conflicts(vec!["a.txt".into()]));
+    }
+    f.agents.push_script(done("Tried."));
+    core.update_space_from_base(&s.id).await.unwrap();
+    idle(&f, &s.id).await;
+    diffs_touch(&f, "src/aborted.ts");
+    core.abort_space_update(&s.id).await.unwrap();
+    wait_until(|| reindexed(&f, &root, "src/aborted.ts") == 1).await;
+
+    // Conflicts resolved by hand, then Complete.
+    for _ in 0..2 {
+        f.git
+            .push_merge_result(SpaceMerge::Conflicts(vec!["a.txt".into()]));
+    }
+    f.agents.push_script(done("Tried."));
+    core.update_space_from_base(&s.id).await.unwrap();
+    idle(&f, &s.id).await;
+    diffs_touch(&f, "src/completed.ts");
+    let s = core.update_space_from_base(&s.id).await.unwrap();
+    assert_eq!(s.base_sha, Sha::new("base333"));
+    wait_until(|| reindexed(&f, &root, "src/completed.ts") == 1).await;
+}
+
 #[tokio::test]
 async fn conflicts_go_to_the_agent_and_theodore_commits_the_merge() {
     let f = fixtures();
@@ -288,6 +356,32 @@ async fn conflicts_left_keep_it_resolving_until_completed_or_aborted() {
     assert_eq!(s.agent_session, None);
     let err = core.abort_space_update(&s.id).await.unwrap_err();
     assert!(err.to_string().contains("no update from base"), "{err}");
+}
+
+/// Abort while the agent still resolves: its turn stops, then the merge is
+/// aborted. No Stop first.
+#[tokio::test]
+async fn abort_stops_the_resolving_turn_first() {
+    let f = fixtures();
+    let (core, _recv, project) = host_project(&f).await;
+    let s = one_turn(&f, &core, &project).await;
+    base_moves(&f);
+    f.git
+        .push_merge_result(SpaceMerge::Conflicts(vec!["a.txt".into()]));
+    f.git
+        .push_merge_result(SpaceMerge::Conflicts(vec!["a.txt".into()]));
+    f.agents.hang_next_run();
+    core.update_space_from_base(&s.id).await.unwrap();
+    wait_until(|| space(&f, &s.id).status == SpaceStatus::Running).await;
+
+    let s = core.abort_space_update(&s.id).await.unwrap();
+    assert_eq!(s.status, SpaceStatus::Idle);
+    assert_eq!(s.updating, None);
+    assert_eq!(s.head_sha, Sha::new("turn111"));
+    assert_eq!(
+        merge_calls(&f).last().unwrap(),
+        &("abort", Sha::new("turn111"))
+    );
 }
 
 #[tokio::test]
@@ -438,4 +532,102 @@ async fn back_to_here_over_an_update_restores_the_base_and_waits_for_it() {
     assert_eq!(s.head_sha, Sha::new("turn111"));
     assert_eq!(s.base_sha, Sha::new("base000"));
     assert!(s.turn_log[1..].iter().all(|t| t.undone));
+}
+
+/// One more finished turn at `head`.
+async fn next_turn(f: &Fixtures, core: &Core, s: &Space, head: &str) -> Space {
+    f.agents.push_script(done("done"));
+    f.git.push_checkpoint(Sha::new(head));
+    core.space_send(theodore_contract::SpaceSendRequest {
+        space: s.id.clone(),
+        text: "more".into(),
+        agent: None,
+        model: None,
+        mode: None,
+        attachments: None,
+    })
+    .await
+    .unwrap();
+    idle(f, &s.id).await
+}
+
+/// A clean update has no turn of its own: going back over it would put the
+/// old tree on the new base, and the next ship would revert the base's
+/// commits.
+#[tokio::test]
+async fn back_to_here_stops_at_a_clean_update() {
+    let f = fixtures();
+    let (core, _recv, project) = host_project(&f).await;
+    let s = one_turn(&f, &core, &project).await;
+    let s = next_turn(&f, &core, &s, "turn222").await;
+    base_moves(&f);
+    let s = core.update_space_from_base(&s.id).await.unwrap();
+    let s = next_turn(&f, &core, &s, "turn333").await;
+
+    let err = core
+        .rewind_space(theodore_contract::RewindSpaceRequest {
+            space: s.id.clone(),
+            reply: s.turn_log[0].reply.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("can't go back past"), "{err}");
+    assert!(f.git.resets.lock().unwrap().is_empty(), "nothing moved");
+    let now = space(&f, &s.id);
+    assert_eq!(now.head_sha, Sha::new("turn333"));
+    assert!(now.turn_log.iter().all(|t| !t.undone));
+
+    // Back to the turn right before the update: only the later one goes,
+    // to the merge it started from.
+    let s = core
+        .rewind_space(theodore_contract::RewindSpaceRequest {
+            space: s.id.clone(),
+            reply: s.turn_log[1].reply.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(s.head_sha, Sha::new("merged-base222"));
+    assert_eq!(s.base_sha, Sha::new("base222"));
+}
+
+/// Files with markers left wait for the agent; the turn's error and the
+/// messages behind it wait for you.
+#[tokio::test]
+async fn conflicts_left_after_a_turn_hold_the_queue() {
+    let f = fixtures();
+    let (core, _recv, project) = host_project(&f).await;
+    let s = one_turn(&f, &core, &project).await;
+    base_moves(&f);
+    f.git
+        .push_merge_result(SpaceMerge::Conflicts(vec!["a.txt".into()]));
+    f.git
+        .push_merge_result(SpaceMerge::Conflicts(vec!["a.txt".into()]));
+    f.agents.push_script(done("Not yet."));
+    let go = f.agents.pause_next_run();
+    core.update_space_from_base(&s.id).await.unwrap();
+    assert_eq!(space(&f, &s.id).status, SpaceStatus::Running);
+    wait_until(|| f.agents.requests().len() == 2).await;
+    core.space_send(theodore_contract::SpaceSendRequest {
+        space: s.id.clone(),
+        text: "next".into(),
+        agent: None,
+        model: None,
+        mode: None,
+        attachments: None,
+    })
+    .await
+    .unwrap();
+    go.send(()).unwrap();
+    let s = idle(&f, &s.id).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(f.agents.requests().len(), 2, "the queue waits for you");
+    let s = space(&f, &s.id);
+    assert_eq!(s.status, SpaceStatus::Failed);
+    assert!(
+        s.error
+            .as_deref()
+            .is_some_and(|e| e.contains("conflicts left in a.txt")),
+        "{:?}",
+        s.error
+    );
 }

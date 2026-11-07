@@ -30,6 +30,8 @@ const BATCH_DELAY: Duration = Duration::from_millis(16);
 const BATCH_BYTES: usize = 64 * 1024;
 /// How long `kill` waits after SIGTERM before SIGKILL.
 const KILL_GRACE: Duration = Duration::from_secs(5);
+/// How long `kill` gives the shell to hang up its jobs and exit on its own.
+const HANGUP_GRACE: Duration = Duration::from_millis(500);
 
 /// Runs shells under a real PTY.
 #[derive(Debug, Clone, Default)]
@@ -256,6 +258,15 @@ async fn coalesce(mut rx: mpsc::Receiver<Vec<u8>>, tx: mpsc::Sender<TerminalEven
 
 /// Waits for the shell to exit, killing its group on cancel; always ends in
 /// exactly one `Exit` event.
+async fn hang_up(pid: u32) {
+    let _ = tokio::process::Command::new("kill")
+        .args(["-HUP", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+}
+
 async fn supervise(
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     pid: Option<u32>,
@@ -272,14 +283,29 @@ async fn supervise(
     let code = tokio::select! {
         r = &mut done_rx => r.ok().flatten(),
         _ = cancel.cancelled() => {
-            if let Some(pid) = pid {
-                terminate_group(pid, KILL_GRACE).await;
+            // A hangup first, as closing a terminal window sends: the shell
+            // passes it to its background jobs, which have process groups of
+            // their own and so outlive `terminate_group`.
+            let hung_up = match pid {
+                Some(pid) => {
+                    hang_up(pid).await;
+                    tokio::time::timeout(HANGUP_GRACE, &mut done_rx).await.ok()
+                }
+                None => None,
+            };
+            match hung_up {
+                Some(r) => r.ok().flatten(),
+                None => {
+                    if let Some(pid) = pid {
+                        terminate_group(pid, KILL_GRACE).await;
+                    }
+                    tokio::time::timeout(Duration::from_secs(5), done_rx)
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .flatten()
+                }
             }
-            tokio::time::timeout(Duration::from_secs(5), done_rx)
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .flatten()
         }
     };
     let _ = tx
@@ -368,6 +394,43 @@ mod tests {
             }
         };
         assert!(exit.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn kill_takes_the_shells_background_jobs_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("job.pid");
+        let mut handle = PtyRunner::new().spawn(spec()).await;
+        handle
+            .input
+            .send(format!("sleep 61 & echo $! > {}\n", file.display()).into_bytes())
+            .unwrap();
+        let mut pid = String::new();
+        for _ in 0..200 {
+            pid = std::fs::read_to_string(&file).unwrap_or_default();
+            if pid.ends_with('\n') {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let pid = pid.trim().to_string();
+        let alive = || {
+            std::process::Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        assert!(alive(), "the job runs: {pid:?}");
+        handle.kill.cancel();
+        while handle.events.recv().await.is_some() {}
+        for _ in 0..100 {
+            if !alive() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("job {pid} outlived its terminal");
     }
 
     #[tokio::test]

@@ -182,13 +182,15 @@ export type PrTone =
   'problem' | 'pending' | 'ready' | 'draft' | 'open' | 'merged' | 'closed';
 
 /** Where a PR stands, in one word and one tone — what the status mark and
- *  the status chip both show. A problem wins over everything else. */
+ *  the status chip both show. Draft comes first (it isn't up for merging
+ *  yet, whatever else is wrong), then a problem over everything else. */
 export function prStatus(p: PrSummary): { tone: PrTone; label: string } {
   if (p.state === 'merged') return { tone: 'merged', label: 'Merged' };
   if (p.state === 'closed') return { tone: 'closed', label: 'Closed' };
   const problems = prProblems(p);
+  if (p.state === 'draft')
+    return { tone: 'draft', label: ['Draft', ...problems].join(' · ') };
   if (problems.length) return { tone: 'problem', label: problems.join(' · ') };
-  if (p.state === 'draft') return { tone: 'draft', label: 'Draft' };
   if (p.checks === 'pending')
     return { tone: 'pending', label: 'Checks running' };
   // Same rule as the "Ready to merge" group in Mine: every gate passes.

@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
   TARGET_MAX,
+  parseToolLine,
+  readableTool,
   runningLine,
   summarizeTools,
   times,
+  toolResultOk,
+  toolRow,
   usedLine,
 } from './toolSummary';
 
@@ -99,6 +103,77 @@ describe('summarizeTools', () => {
       'read the PR',
       'run the check',
     ]);
+  });
+});
+
+describe('raw tool ids', () => {
+  it('read by the tool name, never the id', () => {
+    const s = summarizeTools([
+      'tool: mcp__github__create_issue',
+      'tool: linear__list_teams · acme',
+    ]);
+    expect(s.totals.map((t) => t.tool)).toEqual(['create issue', 'list teams']);
+    expect(usedLine(s)).toBe('Used create issue, list teams');
+    expect(runningLine(s.latest!)).toBe('List teams · acme…');
+  });
+
+  it('leave a name without a server, and a phrase, as they are', () => {
+    expect(readableTool('Bash')).toBe('Bash');
+    expect(readableTool('read_file')).toBe('read_file');
+    expect(readableTool('read the PR')).toBe('read the PR');
+  });
+});
+
+describe('toolRow', () => {
+  it('reads the agents own tools by kind and verb', () => {
+    expect(toolRow('Read')).toEqual({ kind: 'read', label: 'Read' });
+    expect(toolRow('Edit')).toEqual({ kind: 'edit', label: 'Edit' });
+    expect(toolRow('Bash')).toEqual({ kind: 'run', label: 'Run' });
+    expect(toolRow('shell')).toEqual({ kind: 'run', label: 'Run' });
+    expect(toolRow('Grep')).toEqual({ kind: 'search', label: 'Search' });
+  });
+
+  it("reads Theodore's phrases by what they do", () => {
+    expect(toolRow('read the diff')).toEqual({
+      kind: 'read',
+      label: 'Read the diff',
+    });
+    expect(toolRow('rename a symbol').kind).toBe('edit');
+    expect(toolRow('run the check').kind).toBe('run');
+    expect(toolRow('find references').kind).toBe('search');
+    expect(toolRow('ask you')).toEqual({ kind: 'other', label: 'Ask you' });
+    expect(toolRow('ship the change')).toEqual({
+      kind: 'other',
+      label: 'Ship the change',
+    });
+  });
+
+  it('reads an unknown MCP tool by its name', () => {
+    expect(toolRow('mcp__github__create_issue')).toEqual({
+      kind: 'mcp',
+      label: 'Create issue',
+    });
+    expect(toolRow('github__create_issue').kind).toBe('mcp');
+    expect(toolRow('Agent').kind).toBe('agent');
+    expect(toolRow('testTool').label).toBe('TestTool');
+    // Not a property of the table's prototype.
+    expect(toolRow('constructor').label).toBe('Constructor');
+  });
+});
+
+describe('log lines', () => {
+  it('parses a call with its whole target', () => {
+    const long = 'x'.repeat(TARGET_MAX * 2);
+    expect(parseToolLine(`tool: Bash · ${long}`)).toEqual({
+      tool: 'Bash',
+      target: long,
+    });
+    expect(parseToolLine('stalled')).toBeNull();
+  });
+
+  it('tells results from other lines', () => {
+    expect(toolResultOk('tool result ok=false')).toBe(false);
+    expect(toolResultOk('tool: Bash')).toBeNull();
   });
 });
 

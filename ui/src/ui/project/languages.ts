@@ -18,6 +18,7 @@ import type {
   CodeInstallProgress,
   CodeIntelStatus,
   CodeLanguage,
+  CodeLsp,
   CodeLspScope,
   CodeLspToggle,
   CodeServerState,
@@ -45,11 +46,54 @@ const NAMES: Record<string, string> = {
   toml: 'TOML',
   markdown: 'Markdown',
   dockerfile: 'Dockerfile',
+  bash: 'Bash',
+  zig: 'Zig',
+  lua: 'Lua',
+  terraform: 'Terraform',
+  php: 'PHP',
+  ruby: 'Ruby',
+  java: 'Java',
+  kotlin: 'Kotlin',
+  csharp: 'C#',
+  scala: 'Scala',
+  elixir: 'Elixir',
+  dart: 'Dart',
+  vue: 'Vue',
+  svelte: 'Svelte',
+  html: 'HTML',
+  css: 'CSS',
+  scss: 'SCSS',
+  sql: 'SQL',
+  'objective-c': 'Objective-C',
+  perl: 'Perl',
+  haskell: 'Haskell',
+  ocaml: 'OCaml',
+  clojure: 'Clojure',
+  erlang: 'Erlang',
+  r: 'R',
+  julia: 'Julia',
+  groovy: 'Groovy',
+  powershell: 'PowerShell',
+  solidity: 'Solidity',
 };
 
 /** A manifest id (`cpp`) as people write it (`C++`). */
 export function languageName(id: string): string {
   return NAMES[id] ?? (id ? id[0]!.toUpperCase() + id.slice(1) : id);
+}
+
+const RUNTIME_NAMES: Record<string, string> = {
+  node: 'Node.js',
+  java: 'Java',
+  ruby: 'Ruby',
+  php: 'PHP',
+  dotnet: '.NET',
+  'dotnet-sdk': '.NET SDK',
+};
+
+/** A manifest runtime id (`dotnet-sdk`) as people write it (`.NET SDK`). */
+export function runtimeName(id: string): string {
+  return RUNTIME_NAMES[id] ?? id;
 }
 
 export type InstallTone =
@@ -58,7 +102,7 @@ export type InstallTone =
 export interface InstallView {
   label: string;
   tone: InstallTone;
-  /** A path, or why it failed. */
+  /** A path, why it failed, what was found, or how to get it. */
   detail: string | null;
   downloading: boolean;
 }
@@ -68,7 +112,12 @@ function versionLabel(v: string): string {
   return /^\d+\.\d/.test(v) ? `v${v}` : v;
 }
 
-export function installView(i: CodeInstall): InstallView {
+/** `hint`: how to get a server Theodore can't download (`gem install
+ *  ruby-lsp`); without one, "no download" is all there is to say. */
+export function installView(
+  i: CodeInstall,
+  hint: string | null = null,
+): InstallView {
   switch (i.state) {
     case 'system':
       return {
@@ -102,7 +151,21 @@ export function installView(i: CodeInstall): InstallView {
       return {
         label: 'Unavailable',
         tone: 'default',
-        detail: 'No download for this Mac',
+        detail: hint ?? 'No download for this Mac',
+        downloading: false,
+      };
+    case 'needs_runtime':
+      return {
+        label: `Needs ${runtimeName(i.runtime)} ${i.min}+`,
+        tone: 'warning',
+        detail: i.found ? `Found ${i.found}` : null,
+        downloading: false,
+      };
+    case 'trusted_only':
+      return {
+        label: 'Spaces only',
+        tone: 'default',
+        detail: 'Runs the project’s build, so it does not start for reviews',
         downloading: false,
       };
     case 'declined':
@@ -122,15 +185,35 @@ export function installView(i: CodeInstall): InstallView {
   }
 }
 
-export const SERVER_STATE: Record<
+const SERVER_STATE: Record<
   CodeServerState,
   { label: string; tone: InstallTone }
 > = {
+  off: { label: 'Off', tone: 'default' },
   not_running: { label: 'Not running', tone: 'default' },
   warming: { label: 'Warming up', tone: 'accent' },
   ready: { label: 'Ready', tone: 'success' },
   failed: { label: 'Failed', tone: 'danger' },
 };
+
+/** The run chip. `off` names the switch that keeps the server off: with no
+ *  space open, the worktree read is the project's checkout (or a PR's),
+ *  served like a review, so the spaces switch alone doesn't start it. */
+export function runView(
+  state: CodeServerState,
+  lsp: CodeLsp,
+): { label: string; tone: InstallTone; title: string | null } {
+  if (state === 'off' && lsp.review.on !== lsp.spaces.on) {
+    return lsp.spaces.on
+      ? {
+          label: 'Off for reviews',
+          tone: 'default',
+          title: 'Language servers start in this project’s spaces',
+        }
+      : { label: 'Off in spaces', tone: 'default', title: null };
+  }
+  return { ...SERVER_STATE[state], title: null };
+}
 
 /** Something that `code_intel_install` could still fetch. */
 const FETCHABLE: CodeInstall['state'][] = ['missing', 'declined', 'failed'];
@@ -290,6 +373,14 @@ export const INSTALL_POLICY_TEXT: Record<CodeInstallPolicy, string> = {
 /** The install suggestion's line (docs/code-intel.md §5.1). */
 export function suggestText(language: string, server: string): string {
   return `${languageName(language)}: download ${server} for exact references?`;
+}
+
+/** One suggestion for several languages at once. */
+export function suggestManyText(languages: string[]): string {
+  const names = languages.map(languageName);
+  const last = names.pop();
+  const list = names.length > 0 ? `${names.join(', ')} and ${last}` : last;
+  return `${list}: download language servers for exact references?`;
 }
 
 // ── the model ─────────────────────────────────────────────────────────────

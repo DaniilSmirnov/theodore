@@ -92,8 +92,11 @@ fn main() {
 
     // A fixture run (dev, e2e) never reaches a real host; the release feed
     // would only add a failed check to its log on every launch.
-    let auto_update = cfg.fixtures.is_none();
-    run(api, is_sandbox, auto_update, move |events| {
+    let auto_update =
+        cfg.fixtures.is_none() && theodore_desktop::updater::self_updates(build_info::BUILD_ENV);
+    // Only a real install is moved: not a sandbox or fixture run.
+    let offer_move = remote.then(|| cfg.data_dir.clone());
+    run(api, is_sandbox, auto_update, offer_move, move |events| {
         let mut sync = receivers.sync;
         let mut ephemeral = receivers.ephemeral;
         let ev = events.clone();

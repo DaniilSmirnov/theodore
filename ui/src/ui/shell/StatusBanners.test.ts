@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { HostStatus } from '../../stores/EphemeralStore';
-import { statusKind } from './StatusBanners';
+import { formatCountdown, statusKind } from './StatusBanners';
 
 const host = (overrides: Partial<HostStatus> = {}): HostStatus => ({
   online: true,
   rateLimitedUntil: null,
   authOk: true,
+  serverTrouble: false,
   ...overrides,
 });
 
@@ -55,5 +56,41 @@ describe('statusKind', () => {
     expect(
       statusKind('online', host({ rateLimitedUntil: now - 1 }), now),
     ).toBeNull();
+  });
+});
+
+describe('a host answering with server errors', () => {
+  it('is trouble, not offline', () => {
+    expect(
+      statusKind('online', host({ serverTrouble: true }), Date.now()),
+    ).toBe('trouble');
+  });
+
+  it('gives way to offline and to a rate limit', () => {
+    const now = Date.now();
+    expect(
+      statusKind('online', host({ serverTrouble: true, online: false }), now),
+    ).toBe('offline');
+    expect(
+      statusKind(
+        'online',
+        host({ serverTrouble: true, rateLimitedUntil: now + 1000 }),
+        now,
+      ),
+    ).toBe('rate');
+  });
+});
+
+describe('formatCountdown', () => {
+  it('says seconds under two minutes', () => {
+    expect(formatCountdown(82_000)).toBe('1 min 22 s');
+    expect(formatCountdown(45_000)).toBe('45 s');
+    expect(formatCountdown(60_000)).toBe('1 min');
+  });
+
+  it('rounds minutes, not up', () => {
+    expect(formatCountdown(150_000)).toBe('3 min');
+    expect(formatCountdown(140_000)).toBe('2 min');
+    expect(formatCountdown(3_900_000)).toBe('1h 5m');
   });
 });

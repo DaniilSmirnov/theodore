@@ -56,7 +56,7 @@
 #
 # No tags query upstream, falls back to our own
 # (crates/code-intel-toolchain/queries/<id>-tags.scm):
-#   json, yaml, toml, bash, markdown. markdown_inline has no definitions or
+#   json, yaml, toml, bash, markdown, kotlin. markdown_inline has no definitions or
 #   references of its own (it's emphasis/links inside a block markdown
 #   already tagged) and is skipped — no markdown_inline-tags.scm.
 #
@@ -268,4 +268,99 @@ version = "0.25.1"
 [[grammar.languages]]
 id = "bash"
 symbol = "tree_sitter_bash"
+src = "src"
+
+[[grammar]]
+package = "tree-sitter-php"
+repo = "https://github.com/tree-sitter/tree-sitter-php.git"
+tag = "v0.25.1"
+rev = "58d5643086ae60e93a3746cca648363ee97c8761"
+version = "0.25.1"
+tags_query = "queries/tags.scm"
+# Upstream's query has no enums (PHP 8.1) and no nullsafe calls
+# (`$a?->run()`) — see the comment at the top of php-tags.scm. Appended:
+# its classes, interfaces, traits, functions, methods and calls stay.
+tags_query_local = "crates/code-intel-toolchain/queries/php-tags.scm"
+tags_query_local_mode = "append"
+
+# The package ships two grammars, `php` (files with `<?php` and inline HTML)
+# and `php_only` (no HTML). Only `php` is listed: `*.php` files are `php`,
+# and a `php_only` entry would be a grammar id the manifest has no language
+# for (an "unknown language" warning when CI generates grammars.json).
+[[grammar.languages]]
+id = "php"
+symbol = "tree_sitter_php"
+src = "php/src"
+
+[[grammar]]
+package = "tree-sitter-ruby"
+repo = "https://github.com/tree-sitter/tree-sitter-ruby.git"
+tag = "v0.23.1"
+rev = "71bd32fb7607035768799732addba884a37a6210"
+version = "0.23.1"
+# Upstream's query covers methods, singleton methods, classes, modules and
+# calls (a bare identifier or constant counts as a call reference).
+tags_query = "queries/tags.scm"
+
+[[grammar.languages]]
+id = "ruby"
+symbol = "tree_sitter_ruby"
+src = "src"
+
+[[grammar]]
+package = "tree-sitter-java"
+repo = "https://github.com/tree-sitter/tree-sitter-java.git"
+tag = "v0.23.5"
+rev = "94703d5a6bed02b98e438d7cad1136c01a60ba2c"
+version = "0.23.5"
+tags_query = "queries/tags.scm"
+# Upstream's query has no enums, records or annotation types — see
+# java-tags.scm. Appended: classes, interfaces, methods and calls stay.
+tags_query_local = "crates/code-intel-toolchain/queries/java-tags.scm"
+tags_query_local_mode = "append"
+
+[[grammar.languages]]
+id = "java"
+symbol = "tree_sitter_java"
+src = "src"
+
+# tree-sitter-grammars/tree-sitter-kotlin (v1.1.0), not
+# fwcd/tree-sitter-kotlin: both commit the generated src/parser.c at their
+# tags (so neither needs the tree-sitter CLI) and both are ABI 14, but
+# v1.1.0 (Jan 2025) is newer than fwcd's last tag, 0.3.8 (Aug 2024).
+# Neither ships a tags.scm.
+[[grammar]]
+package = "tree-sitter-kotlin"
+repo = "https://github.com/tree-sitter-grammars/tree-sitter-kotlin.git"
+tag = "v1.1.0"
+rev = "77dd60ea0a9003ce062c9728a513ffe1aaff8c82"
+version = "1.1.0"
+# No tags.scm upstream: falls back to
+# crates/code-intel-toolchain/queries/kotlin-tags.scm (classes, interfaces,
+# objects, functions, properties, type aliases, calls).
+
+[[grammar.languages]]
+id = "kotlin"
+symbol = "tree_sitter_kotlin"
+src = "src"
+
+[[grammar]]
+package = "tree-sitter-c-sharp"
+repo = "https://github.com/tree-sitter/tree-sitter-c-sharp.git"
+tag = "v0.23.5"
+rev = "cac6d5fb595f5811a076336682d5d595ac1c9e85"
+version = "0.23.5"
+# Upstream's queries/tags.scm is not usable as shipped: it ends with a
+# `@module` capture that tree-sitter-tags rejects, so the whole query fails
+# to compile. `tags_query` is therefore not set; our own csharp-tags.scm
+# replaces it (upstream's valid patterns, minus the bad one, plus structs,
+# enums, records, properties, local functions, file-scoped namespaces and
+# plain calls — see the comment at the top of that file).
+tags_query_local = "crates/code-intel-toolchain/queries/csharp-tags.scm"
+tags_query_local_mode = "replace"
+
+# The exported C symbol is `tree_sitter_c_sharp`, the manifest id `csharp`.
+[[grammar.languages]]
+id = "csharp"
+symbol = "tree_sitter_c_sharp"
 src = "src"

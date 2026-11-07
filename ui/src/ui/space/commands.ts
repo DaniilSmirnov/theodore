@@ -187,7 +187,7 @@ export function checksByReply(
 }
 
 /** Each reply's turn run id, as the core names it (`space:<id>:<message>`):
- *  the key its tool calls are logged under for this session. */
+ *  tells a turn whose reply is stored from one still being written. */
 export function runsByReply(
   space: string,
   log: readonly SpaceTurn[] | undefined,

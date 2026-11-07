@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { setTransport } from '../core/transport';
 import { FakeTransport } from '../test/fakeTransport';
 import type {
@@ -7,6 +7,7 @@ import type {
   WireAction,
   WireRow,
 } from '../gen/contract';
+import { reaction } from 'mobx';
 import { SyncClient } from './SyncClient';
 
 let transport: FakeTransport;
@@ -15,6 +16,9 @@ beforeEach(() => {
   transport = new FakeTransport();
   setTransport(transport);
 });
+
+/** Lets chained frame handling run to the end. */
+const settle = () => new Promise((r) => setTimeout(r, 5));
 
 const row = (model: string, id: string, data: unknown): WireRow => ({
   model,
@@ -183,6 +187,44 @@ describe('SyncClient', () => {
     expect(client.isPrLoaded('pr1')).toBe(true);
   });
 
+  it('never shows an empty pool while it resyncs', async () => {
+    // An empty pool while online reads as "the active project is gone",
+    // which drops that workspace's saved tabs (RootStore).
+    const project = row('project', 'p1', { id: 'p1' });
+    transport.queueResult('bootstrap', {
+      last_sync_id: 0,
+      rows: [project],
+    } satisfies Bootstrap);
+    const client = new SyncClient();
+    await client.start();
+    const seen: boolean[] = [];
+    const stop = reaction(
+      () => !!client.pool.get('project', 'p1'),
+      (has) => seen.push(has),
+    );
+
+    transport.queueResult('catch_up', {
+      from_sync_id: 0,
+      last_sync_id: 10,
+      actions: [],
+      resync_required: true,
+    } satisfies SyncFrame);
+    transport.queueResult('bootstrap', {
+      last_sync_id: 10,
+      rows: [project],
+    } satisfies Bootstrap);
+    transport.emit('sync', {
+      from_sync_id: 3,
+      last_sync_id: 4,
+      actions: [],
+      resync_required: false,
+    });
+    await settle();
+    stop();
+    expect(seen).not.toContain(false);
+    expect(client.pool.get('project', 'p1')).toBeDefined();
+  });
+
   it('ignores a stale/duplicate frame', async () => {
     transport.queueResult('bootstrap', {
       last_sync_id: 10,
@@ -260,5 +302,199 @@ describe('SyncClient', () => {
     );
     expect(prBootstraps).toHaveLength(1);
     expect(client.isPrLoaded('pr1')).toBe(true);
+  });
+
+  // A scoped bootstrap's id is the global log's position, so jumping to it
+  // would drop any undelivered frame at or below it, whatever its scope.
+  it('keeps an undelivered frame at or below a scoped bootstrap id', async () => {
+    transport.queueResult('bootstrap', {
+      last_sync_id: 5,
+      rows: [],
+    } satisfies Bootstrap);
+    const client = new SyncClient();
+    await client.start();
+
+    transport.queueResult('bootstrap', {
+      last_sync_id: 6,
+      rows: [row('draft', 'd1', { id: 'd1' })],
+    } satisfies Bootstrap);
+    const missed = action(6, 'task', 't1', 'I', { title: 'other scope' });
+    transport.queueResult('catch_up', {
+      from_sync_id: 5,
+      last_sync_id: 6,
+      actions: [missed],
+    } satisfies SyncFrame);
+    await client.openPr('pr1');
+
+    expect(client.pool.get('task', 't1')).toMatchObject({
+      title: 'other scope',
+    });
+    expect(client.lastSyncId).toBe(6);
+
+    // The frame itself, arriving late, is now a duplicate.
+    const put = vi.spyOn(client.pool, 'put');
+    transport.emit('sync', {
+      from_sync_id: 5,
+      last_sync_id: 6,
+      actions: [missed],
+    } satisfies SyncFrame);
+    await settle();
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it('replays frames a slower scoped bootstrap would overwrite', async () => {
+    transport.queueResult('bootstrap', {
+      last_sync_id: 5,
+      rows: [],
+    } satisfies Bootstrap);
+    const client = new SyncClient();
+    await client.start();
+
+    // Read at 5, answered only after frame 6 landed.
+    let answer!: (b: Bootstrap) => void;
+    transport.onCall(
+      'bootstrap',
+      () => new Promise<Bootstrap>((res) => (answer = res)),
+    );
+    const opening = client.openPr('pr1');
+    await settle();
+
+    const newer = action(6, 'draft', 'd1', 'U', { body: 'newer' });
+    transport.emit('sync', {
+      from_sync_id: 5,
+      last_sync_id: 6,
+      actions: [newer],
+    } satisfies SyncFrame);
+    await settle();
+
+    transport.queueResult('catch_up', {
+      from_sync_id: 5,
+      last_sync_id: 6,
+      actions: [newer],
+    } satisfies SyncFrame);
+    answer({ last_sync_id: 5, rows: [row('draft', 'd1', { body: 'older' })] });
+    await opening;
+
+    expect(client.pool.get('draft', 'd1')).toMatchObject({ body: 'newer' });
+    expect(client.lastSyncId).toBe(6);
+    expect(transport.calls.at(-1)).toMatchObject({
+      cmd: 'catch_up',
+      args: { since: 5 },
+    });
+  });
+
+  it('skips catch_up when a scoped bootstrap stands where we stand', async () => {
+    transport.queueResult('bootstrap', {
+      last_sync_id: 5,
+      rows: [],
+    } satisfies Bootstrap);
+    const client = new SyncClient();
+    await client.start();
+
+    transport.queueResult('bootstrap', {
+      last_sync_id: 5,
+      rows: [row('draft', 'd1', { id: 'd1' })],
+    } satisfies Bootstrap);
+    await client.openPr('pr1');
+
+    expect(transport.calls.some((c) => c.cmd === 'catch_up')).toBe(false);
+    expect(client.pool.get('draft', 'd1')).toBeDefined();
+  });
+
+  it('applies a frame arriving during a scoped bootstrap, and replays it after', async () => {
+    transport.queueResult('bootstrap', {
+      last_sync_id: 5,
+      rows: [],
+    } satisfies Bootstrap);
+    const client = new SyncClient();
+    await client.start();
+
+    transport.queueResult('bootstrap', {
+      last_sync_id: 6,
+      rows: [row('task', 't1', { title: 'six' })],
+    } satisfies Bootstrap);
+    const seven = action(7, 'task', 't1', 'U', { title: 'seven' });
+    transport.queueResult(
+      'catch_up',
+      {
+        from_sync_id: 5,
+        last_sync_id: 6,
+        actions: [action(6, 'task', 't1', 'I', { title: 'six' })],
+      } satisfies SyncFrame,
+      {
+        from_sync_id: 6,
+        last_sync_id: 7,
+        actions: [seven],
+      } satisfies SyncFrame,
+    );
+    const opening = client.openPr('pr1');
+    transport.emit('sync', {
+      from_sync_id: 6,
+      last_sync_id: 7,
+      actions: [seven],
+    } satisfies SyncFrame);
+    await opening;
+    await settle();
+
+    expect(client.pool.get('task', 't1')).toMatchObject({ title: 'seven' });
+    expect(client.lastSyncId).toBe(7);
+  });
+
+  it('keeps fetching when catch_up answers one batch of a longer gap', async () => {
+    transport.queueResult('bootstrap', {
+      last_sync_id: 0,
+      rows: [],
+    } satisfies Bootstrap);
+    const client = new SyncClient();
+    await client.start();
+
+    transport.queueResult(
+      'catch_up',
+      {
+        from_sync_id: 0,
+        last_sync_id: 2,
+        actions: [action(2, 'task', 't1', 'I', { title: 'first batch' })],
+      } satisfies SyncFrame,
+      {
+        from_sync_id: 2,
+        last_sync_id: 4,
+        actions: [action(4, 'task', 't2', 'I', { title: 'second batch' })],
+      } satisfies SyncFrame,
+    );
+    transport.emit('sync', {
+      from_sync_id: 4,
+      last_sync_id: 5,
+      actions: [action(5, 'task', 't3', 'I', { title: 'live' })],
+    } satisfies SyncFrame);
+    await settle();
+
+    expect(client.pool.get('task', 't2')).toBeDefined();
+    expect(client.pool.get('task', 't3')).toBeDefined();
+    expect(client.lastSyncId).toBe(5);
+  });
+
+  it('openPr rejects, unloaded, when its catch_up fails, and later frames still apply', async () => {
+    transport.queueResult('bootstrap', {
+      last_sync_id: 5,
+      rows: [],
+    } satisfies Bootstrap);
+    const client = new SyncClient();
+    await client.start();
+
+    transport.queueResult('bootstrap', {
+      last_sync_id: 6,
+      rows: [],
+    } satisfies Bootstrap);
+    transport.queueResult('catch_up', new Error('ipc'));
+    await expect(client.openPr('pr1')).rejects.toThrow('ipc');
+    expect(client.isPrLoaded('pr1')).toBe(false);
+
+    transport.emit('sync', {
+      from_sync_id: 5,
+      last_sync_id: 6,
+      actions: [action(6, 'task', 't1', 'I', { title: 'next' })],
+    } satisfies SyncFrame);
+    await settle();
+    expect(client.pool.get('task', 't1')).toBeDefined();
   });
 });

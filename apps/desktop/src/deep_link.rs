@@ -11,7 +11,8 @@
 //!   ─▶ on_open_url ─▶ core.account_sign_in_callback ─▶ state check, exchange
 //!        └─ handled ─▶ main window to the front
 //! PR body ─▶ theodore[-<env>]://space/<id> ─▶ main window to the front
-//!   ─▶ emit `open-space` <id> ─▶ the UI opens the space
+//!   ├─ the UI listens ─▶ emit `open-space` <id> ─▶ the UI opens the space
+//!   └─ cold start: no listener yet ─▶ kept ─▶ `take_pending_space` once it does
 //! ```
 //!
 //! Only an app bundle can receive the scheme; a dev run or a bare binary
@@ -19,15 +20,51 @@
 //! even when bundled: it has no scheme of its own.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_deep_link::DeepLinkExt;
 use theodore_runtime::identity;
 use url::Url;
 
 use crate::CoreApi;
 use crate::build_info;
+
+/// A space link that came before the UI listens for `open-space`: an event
+/// nobody listens to is gone, and a link that launches the app always does.
+#[derive(Default)]
+pub struct SpaceLinks(Mutex<LinkState>);
+
+#[derive(Default)]
+struct LinkState {
+    ui_listens: bool,
+    pending: Option<String>,
+}
+
+impl SpaceLinks {
+    fn state(&self) -> std::sync::MutexGuard<'_, LinkState> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Brings the window forward and opens `space`, now or once the UI asks.
+    pub fn open(&self, space: &str, window: &impl crate::notify::SpaceWindow) {
+        window.focus();
+        let mut state = self.state();
+        if state.ui_listens {
+            drop(state);
+            window.open_space(space);
+        } else {
+            state.pending = Some(space.to_string());
+        }
+    }
+
+    /// The UI listens from now on; what it missed, if anything.
+    pub fn ui_listens(&self) -> Option<String> {
+        let mut state = self.state();
+        state.ui_listens = true;
+        state.pending.take()
+    }
+}
 
 /// This build's scheme; `None` for a dev build.
 pub fn scheme() -> Option<String> {
@@ -83,10 +120,8 @@ fn open<R: Runtime>(app: &AppHandle<R>, core: Arc<dyn CoreApi>, url: Url) {
         return;
     }
     if let Some(space) = space_route(&url) {
-        use crate::notify::SpaceWindow;
         let window = crate::notify::MainWindow(app.clone());
-        window.focus();
-        window.open_space(&space);
+        app.state::<SpaceLinks>().open(&space, &window);
         return;
     }
     let app = app.clone();
@@ -116,6 +151,39 @@ pub fn space_route(url: &Url) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct FakeWindow(Mutex<Vec<String>>);
+
+    impl crate::notify::SpaceWindow for &'static FakeWindow {
+        fn focus(&self) {
+            self.0.lock().unwrap().push("focus".into());
+        }
+        fn open_space(&self, space: &str) {
+            self.0.lock().unwrap().push(format!("open {space}"));
+        }
+    }
+
+    #[test]
+    fn a_link_before_the_ui_listens_waits_for_it() {
+        let window: &'static FakeWindow = Box::leak(Box::default());
+        let links = SpaceLinks::default();
+
+        // A cold start: nothing listens yet, so nothing is emitted into the void.
+        links.open("first", &window);
+        links.open("second", &window);
+        assert_eq!(*window.0.lock().unwrap(), ["focus", "focus"]);
+        assert_eq!(links.ui_listens().as_deref(), Some("second"), "the latest");
+        assert_eq!(links.ui_listens(), None, "once");
+
+        // From then on: an event, as for a click on a notification.
+        links.open("third", &window);
+        assert_eq!(
+            *window.0.lock().unwrap(),
+            ["focus", "focus", "focus", "open third"]
+        );
+        assert_eq!(links.ui_listens(), None);
+    }
 
     #[test]
     fn a_space_link_routes_to_its_space() {

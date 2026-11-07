@@ -186,27 +186,13 @@ pub fn git_snapshot(
             files.insert(path.to_string(), sha.to_string());
         }
     }
-    let status = git(
-        root,
-        &[
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--no-renames",
-        ],
-    )?;
-    for rec in status.split(|b| *b == 0).filter(|r| r.len() > 3) {
-        // `XY <path>`
-        let Ok(path) = std::str::from_utf8(&rec[3..]) else {
-            continue;
-        };
-        match file_entry(root, path, &|_| None)? {
+    for path in dirty_paths(root)? {
+        match file_entry(root, &path, &|_| None)? {
             Some(e) => {
                 files.insert(e.path, e.blob_sha);
             }
             None => {
-                files.remove(path);
+                files.remove(&path);
             }
         }
     }
@@ -220,6 +206,27 @@ pub fn git_snapshot(
         .collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Snapshot::new(root, entries))
+}
+
+/// Paths `git status` lists in the worktree at `root`: modified, deleted
+/// and untracked ones, ignored ones left out. Blocks on `git`.
+pub fn dirty_paths(root: &Path) -> Result<Vec<String>> {
+    let status = git(
+        root,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+        ],
+    )?;
+    Ok(status
+        .split(|b| *b == 0)
+        .filter(|r| r.len() > 3)
+        // `XY <path>`
+        .filter_map(|rec| std::str::from_utf8(&rec[3..]).ok().map(str::to_string))
+        .collect())
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>> {

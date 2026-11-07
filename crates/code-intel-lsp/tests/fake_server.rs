@@ -31,6 +31,8 @@ fn config(env: &[(&str, &str)]) -> LaunchConfig {
         init_options: json!({"fake": {"a": 1, "nested": {"key": "v"}}, "top": true}),
         workspace_folders: false,
         language_ids: vec![(LanguageId::new("rust"), "rust".into(), vec!["rs".into()])],
+        start_timeout_secs: None,
+        ready_settle_secs: None,
     }
 }
 
@@ -147,6 +149,105 @@ async fn ready_after_max_wait_when_indexing_never_ends() {
         ServerState::Ready
     );
     assert!(t0.elapsed() >= Duration::from_millis(400));
+}
+
+/// A JVM importing a build answers `initialize` late. The session's default
+/// gives up on it; the server's own `start_timeout_secs` does not.
+#[tokio::test]
+async fn a_server_may_ask_for_a_longer_start() {
+    let wt = worktree();
+    let opts = SessionOptions {
+        init_timeout: Duration::from_millis(200),
+        ..options()
+    };
+    let slow = config(&[("FAKE_LSP_INIT_DELAY_MS", "700")]);
+
+    let s = LspSession::start(wt.path(), slow.clone(), opts.clone()).unwrap();
+    assert_eq!(
+        s.wait_ready(Duration::from_secs(5)).await,
+        ServerState::Failed,
+        "the default gives up"
+    );
+
+    let cfg = LaunchConfig {
+        start_timeout_secs: Some(10),
+        ..slow
+    };
+    let s = LspSession::start(wt.path(), cfg, opts).unwrap();
+    assert_eq!(
+        s.wait_ready(Duration::from_secs(5)).await,
+        ServerState::Ready
+    );
+    s.shutdown().await;
+}
+
+/// `start_timeout_secs` caps the warm-up too: an import that outlasts the
+/// session's default is still `Warming`, not `Ready` with empty answers.
+#[tokio::test]
+async fn the_start_timeout_also_replaces_the_wait_for_ready() {
+    let wt = worktree();
+    let opts = SessionOptions {
+        ready_max_wait: Duration::from_millis(100),
+        ..options()
+    };
+    let cfg = LaunchConfig {
+        start_timeout_secs: Some(10),
+        ..config(&[("FAKE_LSP_PROGRESS_MS", "600")])
+    };
+    let t0 = Instant::now();
+    let s = LspSession::start(wt.path(), cfg, opts).unwrap();
+    assert_eq!(
+        s.wait_ready(Duration::from_secs(5)).await,
+        ServerState::Ready
+    );
+    assert!(
+        t0.elapsed() >= Duration::from_millis(600),
+        "{:?}",
+        t0.elapsed()
+    );
+    s.shutdown().await;
+}
+
+/// A server that announces its work late: the default settle calls it ready
+/// first; its own `ready_settle_secs` waits for the announcement, then for
+/// the work.
+#[tokio::test]
+async fn a_late_announcement_needs_a_longer_settle() {
+    let wt = worktree();
+    let late = config(&[
+        ("FAKE_LSP_PROGRESS_DELAY_MS", "400"),
+        ("FAKE_LSP_PROGRESS_MS", "800"),
+    ]);
+
+    let t0 = Instant::now();
+    let s = LspSession::start(wt.path(), late.clone(), options()).unwrap();
+    assert_eq!(
+        s.wait_ready(Duration::from_secs(5)).await,
+        ServerState::Ready
+    );
+    assert!(
+        t0.elapsed() < Duration::from_millis(400),
+        "ready before the work began: {:?}",
+        t0.elapsed()
+    );
+    s.shutdown().await;
+
+    let cfg = LaunchConfig {
+        ready_settle_secs: Some(1),
+        ..late
+    };
+    let t0 = Instant::now();
+    let s = LspSession::start(wt.path(), cfg, options()).unwrap();
+    assert_eq!(
+        s.wait_ready(Duration::from_secs(5)).await,
+        ServerState::Ready
+    );
+    assert!(
+        t0.elapsed() >= Duration::from_millis(1200),
+        "ready once the work ended: {:?}",
+        t0.elapsed()
+    );
+    s.shutdown().await;
 }
 
 #[tokio::test]
@@ -307,6 +408,46 @@ async fn diagnostics_cache_follows_file_changes() {
     assert_eq!(report(&s, root).await["watched"], json!(1));
 }
 
+/// Diagnostics asked right after an edit are about the edited text: the
+/// change reaches the server first (an edit nobody reported, or one
+/// `file_changed` announced), then a pull asks again, or the client waits
+/// for the server to publish the new version.
+#[tokio::test]
+async fn diagnostics_right_after_an_edit_describe_the_new_text() {
+    let push: &[(&str, &str)] = &[("FAKE_LSP_PUBLISH_DELAY_MS", "300")];
+    let pull: &[(&str, &str)] = &[("FAKE_LSP_PULL", "1")];
+    for (how, env) in [("push", push), ("pull", pull)] {
+        let wt = worktree();
+        let root = wt.path();
+        let s = start(root, env).await;
+        let lib = "src/lib.rs";
+        assert_eq!(
+            s.diagnostics(root, Some(lib)).await.unwrap().len(),
+            1,
+            "{how}"
+        );
+
+        // Fixed by the agent's own Edit: nobody tells the session.
+        std::fs::write(root.join(lib), LIB.replace("bad()", "ok()")).unwrap();
+        assert_eq!(
+            s.diagnostics(root, Some(lib)).await.unwrap(),
+            vec![],
+            "{how}"
+        );
+
+        // Broken by a symbol edit, which reports it.
+        std::fs::write(root.join(lib), LIB.replace("target();", "bad(); bad();")).unwrap();
+        s.file_changed(root, lib).await.unwrap();
+        assert_eq!(
+            s.diagnostics(root, Some(lib)).await.unwrap().len(),
+            3,
+            "{how}"
+        );
+        assert_eq!(s.diagnostics(root, None).await.unwrap().len(), 3, "{how}");
+        s.shutdown().await;
+    }
+}
+
 #[tokio::test]
 async fn pull_diagnostics_when_the_server_offers_them() {
     let wt = worktree();
@@ -340,6 +481,7 @@ async fn rename_handles_document_changes_and_changes() {
             path: path.into(),
             range: range(line, start, start + 6),
             new_text: "aim".into(),
+            expect: Some("target".into()),
         };
         assert_eq!(
             edits,
@@ -353,6 +495,46 @@ async fn rename_handles_document_changes_and_changes() {
         );
         s.shutdown().await;
     }
+}
+
+/// The agent's own Edit writes a file the server has open without
+/// telling anyone: the next request reads it again, so the rename's
+/// positions are the file as it is now, and each edit says what it
+/// replaces.
+#[tokio::test]
+async fn a_file_edited_behind_the_servers_back_is_read_again_before_a_rename() {
+    let wt = worktree();
+    let root = wt.path();
+    let s = start(root, &[]).await;
+    let target = Position { line: 4, col: 4 };
+    s.references(root, "src/lib.rs", target, true)
+        .await
+        .unwrap();
+    s.document_symbols(root, "src/other.rs").await.unwrap();
+    let lib = format!("// a long explanatory comment\n// and its second line\n{LIB}");
+    std::fs::write(root.join("src/lib.rs"), &lib).unwrap();
+
+    let call = col(LIB, 5, "target");
+    let edits = s
+        .rename(root, "src/lib.rs", Position { line: 7, col: call }, "aim")
+        .await
+        .unwrap();
+    let other = col(OTHER, 2, "target");
+    let edit = |path: &str, line, start| TextEdit {
+        path: path.into(),
+        range: range(line, start, start + 6),
+        new_text: "aim".into(),
+        expect: Some("target".into()),
+    };
+    assert_eq!(
+        edits,
+        vec![
+            edit("src/lib.rs", 7, call),
+            edit("src/lib.rs", 6, 4),
+            edit("src/other.rs", 2, other),
+        ]
+    );
+    s.shutdown().await;
 }
 
 #[tokio::test]

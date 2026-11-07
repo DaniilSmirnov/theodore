@@ -202,6 +202,25 @@ export type ChatMessage = {
 	attachments?: Attachment[],
 	/**  A space message waiting for its turn (docs/spaces.md §8). */
 	queued?: QueuedSend | null,
+	/**
+	 *  A space reply's turn, in order (docs/spaces.md §3); empty elsewhere
+	 *  and on older rows. Never part of a prompt.
+	 */
+	activity?: TurnStep[],
+	/**  How long a space reply's turn ran. */
+	duration_ms?: number | null,
+	/**
+	 *  What a space reply's turn changed, from git between its checkpoints.
+	 *  At most 200; empty when it changed nothing or git couldn't tell.
+	 */
+	changed_files?: TurnFile[],
+	/**  The model a space reply's turn asked for; none: the CLI's default. */
+	model?: string | null,
+	/**
+	 *  A space reply with no final text: `text` is the text steps in
+	 *  `activity` joined, and only those show, in the order they came.
+	 */
+	text_in_steps?: boolean,
 };
 
 export type Check = {
@@ -222,6 +241,18 @@ export type CheckConfigRequest = {
 export type CheckRollup = "none" | "pending" | "pass" | "fail";
 
 export type CheckStatus = "pending" | "pass" | "fail" | "skipped";
+
+/**
+ *  One ticked item of a group's "What to check" list, kept like a read mark
+ *  so it survives a tab switch or a restart. `scope` names the group within
+ *  a revision (`<base>:<head>:<group id>`): a regroup or a push starts the
+ *  list over. `item` is the item's key within the group.
+ */
+export type CheckTick = {
+	pr: PrId,
+	scope: string,
+	item: string,
+};
 
 /**
  *  One UI error or event, forwarded to the core's log. The core rate-limits
@@ -274,8 +305,21 @@ export type CodeInstall =
 { state: "system"; path: string; version: string | null } |
 /**  Downloaded by Theodore. */
 { state: "installed"; version: string } |
-/**  No download for this platform. */
+/**  No download for this platform, and not on this machine. */
 { state: "unavailable" } |
+/**
+ *  Needs a runtime that is missing or too old; nothing is downloaded
+ *  for a server that can't run.
+ */
+{ state: "needs_runtime";
+/**  `java`, `node`, `ruby`, `php`, `dotnet`, `dotnet-sdk`. */
+runtime: string;
+/**  The oldest that works: `21`, `8.2`. */
+min: string;
+/**  What is on this machine, if one ran. */
+found: string | null } |
+/**  Runs the project's code, so it serves spaces and never a review. */
+{ state: "trusted_only" } |
 /**  You said no to the install suggestion. */
 { state: "declined" } | { state: "failed"; error: string };
 
@@ -359,9 +403,13 @@ export type CodeServer = {
 	name: string,
 	install: CodeInstall,
 	state: CodeServerState,
+	/**  How to get it when Theodore can't: `gem install ruby-lsp`. */
+	hint: string | null,
 };
 
-export type CodeServerState = "not_running" | "warming" | "ready" | "failed";
+export type CodeServerState =
+/**  The project's switch keeps language servers off here. */
+"off" | "not_running" | "warming" | "ready" | "failed";
 
 export type CommandError = {
 	code: string,
@@ -615,13 +663,32 @@ export type EffectiveConfig = {
 
 export type Ephemeral = { type: "agent_delta"; run: string; agent: AgentId; text: string } | { type: "run_log"; run: string; agent: AgentId; line: string } |
 /**
+ *  A new row of a run's timeline: a tool call, thinking, or a subagent's
+ *  text. The run's own text comes as `AgentDelta`.
+ */
+{ type: "run_step"; run: string; step: TurnStep } |
+/**  The tool call `id` of `run` ended, or (`ok` none) learned its summary. */
+{ type: "run_step_done"; run: string; id: string; ok: boolean | null; summary: string | null;
+/**
+ *  The call was a subagent launched in the background: its result
+ *  only says it started.
+ */
+background?: boolean } |
+/**  The next `AgentDelta` of `run` starts a new text row. */
+{ type: "run_text_break"; run: string } |
+/**
  *  No output for `agents.stall_after_ms` while `run` is still alive.
  *  The run keeps going (this isn't terminal) — the UI offers Retry
  *  (cancel + resend) or Cancel instead of waiting silently.
  */
 { type: "run_stalled"; run: string; agent: AgentId } | { type: "toast"; level: ToastLevel; text: string } |
 /**  Grouping of a PR started or finished (no sync row until it's done). */
-{ type: "grouping"; pr: PrId; running: boolean; error: string | null } | { type: "host_status"; online: boolean; rate_limited_until: number | null; auth_ok: boolean } |
+{ type: "grouping"; pr: PrId; running: boolean; error: string | null } | { type: "host_status"; online: boolean; rate_limited_until: number | null; auth_ok: boolean;
+/**
+ *  Reachable, but answering with server errors (5xx): the host is
+ *  having trouble, which is not being offline.
+ */
+server_trouble?: boolean } |
 /**  The Theodore account signed in, signed out, or its session ended. */
 { type: "account_status"; status: AccountStatus } |
 /**
@@ -724,6 +791,11 @@ export type FindSymbolRequest = {
 	 */
 	line?: number | null,
 	col?: number | null,
+	/**
+	 *  The diff side the click was on. `line`/`col` are head-worktree
+	 *  positions only: a `Base` click goes by name.
+	 */
+	side?: DiffSide | null,
 };
 
 export type Finding = {
@@ -1213,8 +1285,8 @@ export type Project = {
 };
 
 /**
- *  New space's "From an issue" picker: the project's own open issues
- *  assigned to the viewer (`HostAdapter::my_open_issues`).
+ *  New space's "From an issue" picker: the project's open issues, the
+ *  viewer's own first (`HostAdapter::open_issues`).
  */
 export type ProjectIssuesRequest = {
 	project: string,
@@ -1701,6 +1773,14 @@ export type Space = {
 	created_at: number,
 	updated_at: number,
 	/**
+	 *  When the space last had something for you: a turn ended or failed
+	 *  (a plan is ready when its turn ends), or a question came. The ●
+	 *  compares this, not `updated_at`, which other writes bump too. Always
+	 *  written with `updated_at`, which the page's seen mark stores. `None`
+	 *  on spaces with no such event since it was added.
+	 */
+	attention_at?: number | null,
+	/**
 	 *  A short chat title the chat agent proposed from the goal, shown
 	 *  instead of its raw first line (`ui/src/ui/space/spaces.ts`'s
 	 *  `defaultTitle`); `None` until that run lands or when it failed.
@@ -2021,6 +2101,12 @@ export type SpaceSetup = {
 	/**  Files not copied, commands skipped, … */
 	notes?: string[],
 	finished_at?: number | null,
+	/**
+	 *  A Retry took the command from the space's own worktree: the repo
+	 *  layer of `setup`, and of the trust prompt while it waits, is the
+	 *  worktree's file (docs/config.md §2 "Setup").
+	 */
+	from_worktree?: boolean,
 };
 
 export type SpaceSetupRequest = {
@@ -2356,6 +2442,50 @@ export type TriageRequest = {
 	pr: PrId,
 	action: TriageAction,
 };
+
+/**  A file a space turn changed (`ChatMessage::changed_files`). */
+export type TurnFile = {
+	path: string,
+	additions: number,
+	deletions: number,
+};
+
+/**
+ *  One thing an agent did in a space turn, kept on the reply in the order it
+ *  happened (`ChatMessage::activity`).
+ */
+export type TurnStep =
+/**  What it wrote on the way; the reply's own text isn't repeated here. */
+{ kind: "text"; text: string;
+/**  The `Agent`/`Task` call whose subagent wrote it. */
+parent?: string | null } | { kind: "thinking"; text: string; parent?: string | null } | { kind: "tool";
+/**  Its label: `Bash`, or what Theodore's own tools do (`ship the change`). */
+name: string;
+/**  The command or file it was about. */
+target: string | null;
+/**  `None`: no result came (the turn ended first). */
+ok: boolean | null;
+/**  The call's id, for its result and its subagent's steps to find. */
+id?: string | null;
+/**  The `Agent`/`Task` call whose subagent made this call. */
+parent?: string | null;
+/**
+ *  What the agent said it is: a command's or a subagent's description,
+ *  a search's pattern, the question asked. Capped.
+ */
+detail?: string | null;
+/**
+ *  What its result says: `120 lines`, `5 matches`, a subagent's
+ *  report. Capped.
+ */
+summary?: string | null;
+/**  Lines an edit adds and removes, from its input. */
+added?: number | null; removed?: number | null;
+/**
+ *  A subagent launched in the background: its result only says it
+ *  started, its report (`summary`) comes later, or never.
+ */
+background?: boolean };
 
 /**
  *  A product event the UI reports (`track_ui`). Typed like the core's own:

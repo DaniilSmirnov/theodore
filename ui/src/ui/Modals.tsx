@@ -17,6 +17,7 @@ import { useRootStore, useUi } from '../stores/context';
 import { AgentTag, K, Shell } from './bits';
 import { AssignMenu, CommandMenu, SnoozeMenu } from './Palette';
 import { AddProjectModal } from './Projects';
+import { ManageProjectsModal } from './project/ManageProjects';
 import { isBuildMode } from './space/mode';
 import { NewSpaceModal } from './space/SpacePage';
 import { ReportProblemModal } from './ReportProblem';
@@ -36,7 +37,14 @@ const SubmitReviewModal = observer(function SubmitReviewModal() {
   const [sending, setSending] = useState(false);
   if (ui.route.name !== 'review') return null;
   const pr = ui.route.pr;
-  const local = store.models.prSummaries.get(pr)?.pr.repo.host === 'local';
+  const summary = store.models.prSummaries.get(pr);
+  const local = summary?.pr.repo.host === 'local';
+  // Your own PR takes no verdict from you on the host: Comment only.
+  const viewer = store.ephemeral.viewer?.login;
+  const mine = !!viewer && viewer === summary?.author?.login;
+  const events = mine
+    ? EVENT_OPTS.filter(([v]) => v === 'COMMENT')
+    : EVENT_OPTS;
   const drafts = store.models.drafts.byPr(pr);
   const reads = new Set(store.models.hunkReads.byPr(pr).map((r) => r.hunk));
   // This PR's groups only — `groups.all()` spans every open PR.
@@ -79,7 +87,7 @@ const SubmitReviewModal = observer(function SubmitReviewModal() {
           orientation="horizontal"
           aria-label="Verdict"
         >
-          {EVENT_OPTS.map(([v, t, d]) => (
+          {events.map(([v, t, d]) => (
             <Radio
               key={v}
               value={v}
@@ -155,13 +163,16 @@ const SubmitReviewModal = observer(function SubmitReviewModal() {
           isDisabled={sending}
           onPress={() => {
             setSending(true);
+            // Core waits for the host briefly: on to the next PR once it
+            // has the review (or it's queued), but a refusal keeps you
+            // here, where its toast (api.ts) makes sense.
             void submitReview(store, pr, local ? 'COMMENT' : event, body.trim())
-              .catch(() => {
-                // toasted by api.ts
+              .then(() => {
+                ui.closeModal();
+                ui.goBack();
               })
+              .catch(() => ui.closeModal())
               .finally(() => setSending(false));
-            ui.closeModal();
-            ui.goBack();
           }}
         >
           {sending ? 'Sending…' : local ? 'Done' : 'Submit'}
@@ -317,6 +328,8 @@ export const Modals = observer(function Modals() {
       return <HelpModal />;
     case 'add-project':
       return <AddProjectModal />;
+    case 'manage-projects':
+      return <ManageProjectsModal />;
     case 'new-space':
       return isBuildMode(store) ? <NewSpaceModal /> : null;
     case 'sign-in':

@@ -65,6 +65,11 @@ export function modelAccessors(pool: ObjectPool) {
       for (const r of pool.all('file_viewed')) add(groupKey(r.pr, r.path), r);
     }),
   );
+  const checkTickIdx = lazy(() =>
+    groupedIndex<ModelRows['check_tick']>((add) => {
+      for (const r of pool.all('check_tick')) add(groupKey(r.pr, r.scope), r);
+    }),
+  );
   // Reading order as last shown, per PR, and the groups opened this
   // session: a grouping that streams in and reorders itself when it
   // finishes doesn't move a group the user opened or started reading.
@@ -106,6 +111,12 @@ export function modelAccessors(pool: ObjectPool) {
       ...scoped('hunk_read'),
       isRead: (pr: string, hunk: string) =>
         hunkReadIdx(groupKey(pr, hunk)).length > 0,
+    },
+    checkTicks: {
+      ...scoped('check_tick'),
+      /** The item keys ticked in one group's "What to check" list. */
+      ticked: (pr: string, scope: string): ReadonlySet<string> =>
+        new Set(checkTickIdx(groupKey(pr, scope)).map((r) => r.item)),
     },
     fileViews: {
       ...scoped('file_viewed'),

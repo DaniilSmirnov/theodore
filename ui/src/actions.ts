@@ -82,6 +82,34 @@ export function setFileViewed(
   ]);
 }
 
+/** Ticks (or unticks) items of a group's "What to check" list: one
+ *  `check_tick` row per ticked item, so ticks outlive the pane like read
+ *  marks do. `scope` is `<base>:<head>:<group id>`. */
+export function setCheckTicked(
+  store: RootStore,
+  pr: PrId,
+  scope: string,
+  items: readonly string[],
+  ticked: boolean,
+): void {
+  const ops = items.flatMap((item) => {
+    const id = `${pr}:${scope}:${item}`;
+    const exists = !!store.models.checkTicks.get(id);
+    if (ticked === exists) return [];
+    return [
+      ticked
+        ? {
+            op: 'create' as const,
+            model: 'check_tick',
+            id,
+            data: { pr, scope, item },
+          }
+        : { op: 'delete' as const, model: 'check_tick', id },
+    ];
+  });
+  if (ops.length) void store.sync.queue.transact(ops);
+}
+
 // ── review: threads, drafts ─────────────────────────────────────────────────
 
 export function addDraft(
@@ -290,7 +318,7 @@ const AGENT_IDS: readonly AgentId[] = ['claude', 'codex', 'gemini'];
 /** The agent a chat question with no agent picked goes to — the
  *  `agents.chat` setting, else core's default. A label, not a choice:
  *  core resolves the real one (repo scope, disabled agents). */
-function chatAgentGuess(store: RootStore): AgentId {
+export function chatAgentGuess(store: RootStore): AgentId {
   const v = store.models.settings.get(settingId('user', 'agents.chat'))?.value;
   return AGENT_IDS.find((a) => a === v) ?? 'claude';
 }
@@ -734,6 +762,8 @@ export async function removeProject(
 ): Promise<void> {
   try {
     await api.removeProject(id);
+    // Its settings tabs first: they'd point at a project that's gone.
+    store.ui.closeProjectSettings(id);
     store.workspaces.forget(id);
   } catch {
     // toasted by api.ts

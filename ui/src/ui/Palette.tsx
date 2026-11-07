@@ -55,7 +55,7 @@ import { api } from '../core/api';
 import { FEATURES } from '../features';
 import { useRootStore, useUi } from '../stores/context';
 import { toggleTheme } from '../stores/UiStore';
-import { ALL } from '../core/workspaces';
+import { ALL, projectSettingsRoute } from '../core/workspaces';
 import { Avatar, K } from './bits';
 import { projectLabel } from './Projects';
 import { refreshProjectTracked } from './project/freshness';
@@ -611,11 +611,27 @@ export const CommandMenu = observer(function CommandMenu() {
       run: () => ui.go({ name: 'settings', page: 'account' }),
     },
     ...workspaceItems,
+    ...(ws.active
+      ? [
+          {
+            group: 'Go to',
+            label: `Project settings — ${projectLabel(ws.active)}`,
+            icon: <Gear />,
+            run: () => ui.go(projectSettingsRoute(ws.active!.id)),
+          },
+        ]
+      : []),
     {
       group: 'General',
       label: 'Add project…',
       icon: <FolderPlus />,
       run: () => ui.openModal('add-project'),
+    },
+    {
+      group: 'General',
+      label: 'Manage projects… — reorder, open a project’s settings',
+      icon: <Folder />,
+      run: () => ui.openModal('manage-projects'),
     },
     {
       group: 'General',
