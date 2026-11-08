@@ -1,3 +1,5 @@
+/** The submit review modal: what it lists, what it sends, and that it moves
+ *  on to the next PR only once the host has the review. */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { PrSummary } from '../gen/contract';
 import { setTransport } from '../core/transport';
@@ -8,9 +10,10 @@ import { anchor, draft, PR_ID } from '../test/factories';
 import { FakeTransport } from '../test/fakeTransport';
 import { Modals } from './Modals';
 
-globalThis.CSS ??= {
-  escape: (s: string) => s.replace(/[^\w-]/g, '\\$&'),
-} as unknown as typeof CSS;
+// jsdom has no `CSS.escape`; an open react-aria modal calls it.
+(globalThis as { CSS?: { escape?: (s: string) => string } }).CSS ??= {};
+globalThis.CSS.escape ??= (s: string) =>
+  s.replace(/[^a-zA-Z0-9_-]/g, (c) => `\\${c}`);
 
 const summary = (host: 'github' | 'local'): PrSummary => ({
   pr: {
@@ -42,6 +45,7 @@ describe('Submit review modal', () => {
 
   async function open(host: 'github' | 'local' = 'github') {
     store.sync.pool.put('pr', PR_ID, summary(host));
+    store.ui.go({ name: 'inbox' });
     store.ui.go({ name: 'review', pr: PR_ID });
     store.ui.openModal('submit');
     m = await mount(
@@ -136,12 +140,12 @@ describe('Submit review modal', () => {
     });
   });
 
-  it('closes the modal and leaves the review on submit', async () => {
+  it('moves on to where you came from once the review landed', async () => {
     await open();
     await click(btn('Submit'));
     await settle();
     expect(store.ui.modal).toBeNull();
-    expect(store.ui.route.name).not.toBe('review');
+    expect(store.ui.route.name).toBe('inbox');
   });
 
   it('local mode: no verdict picker, always COMMENT, button says Done', async () => {
@@ -165,10 +169,16 @@ describe('Submit review modal', () => {
     expect(submits()).toHaveLength(0);
   });
 
-  it('stays open on a failed submit, keeping drafts, comment and verdict', async () => {
+  it.each([
+    ['a transport error', new Error('boom')],
+    [
+      'a host refusal',
+      { code: 'host', message: 'Can not approve your own pull request' },
+    ],
+  ])('stays open on %s, keeping drafts, comment and verdict', async (_n, e) => {
     store.sync.pool.put('draft', 'd1', draft({ id: 'd1' }));
     transport.onCall('submit_review', () => {
-      throw new Error('boom');
+      throw e;
     });
     await open();
     await click(radio('Approve'));
@@ -200,6 +210,6 @@ describe('Submit review modal', () => {
     release();
     await settle();
     expect(store.ui.modal).toBeNull();
-    expect(store.ui.route.name).not.toBe('review');
+    expect(store.ui.route.name).toBe('inbox');
   });
 });
