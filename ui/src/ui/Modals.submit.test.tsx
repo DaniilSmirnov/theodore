@@ -1,7 +1,10 @@
 /** The submit review modal: what it lists, what it sends, and that it moves
- *  on to the next PR only once the host has the review. */
+ *  on to the next PR only once the host has the review. A refusal keeps it
+ *  open, with what you typed, next to the host's toast. */
+import { runInAction } from 'mobx';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { PrSummary } from '../gen/contract';
+import { setCommandFailureHandler } from '../core/api';
 import { setTransport } from '../core/transport';
 import { RootStore } from '../stores/RootStore';
 import { RootStoreProvider } from '../stores/context';
@@ -74,6 +77,7 @@ describe('Submit review modal', () => {
   });
 
   afterEach(() => {
+    setCommandFailureHandler(() => {});
     m?.unmount();
     document.body.innerHTML = '';
   });
@@ -140,6 +144,21 @@ describe('Submit review modal', () => {
     });
   });
 
+  it('your own PR offers only Comment, and sends it', async () => {
+    runInAction(() => {
+      store.ephemeral.viewer = { login: 'me', name: null, avatar_url: null };
+    });
+    await open();
+    expect(radio('Comment')).toBeDefined();
+    expect(radio('Approve')).toBeUndefined();
+    expect(radio('Request changes')).toBeUndefined();
+    await click(btn('Submit'));
+    await settle();
+    expect(submits()[0]!.args).toEqual({
+      req: { pr: PR_ID, event: 'COMMENT', body: '' },
+    });
+  });
+
   it('moves on to where you came from once the review landed', async () => {
     await open();
     await click(btn('Submit'));
@@ -191,6 +210,27 @@ describe('Submit review modal', () => {
     expect(store.ui.route).toEqual({ name: 'review', pr: PR_ID });
     expect(document.querySelector('textarea')?.value).toBe('my verdict');
     expect(btn('Submit')?.hasAttribute('disabled')).toBe(false);
+  });
+
+  it("a host refusal shows the host's sentence", async () => {
+    // As `RootStore.start()` wires it: a rejected command becomes a toast.
+    setCommandFailureHandler((f) =>
+      store.ephemeral.handle({
+        type: 'toast',
+        level: 'error',
+        text: f.message,
+      }),
+    );
+    transport.onCall('submit_review', () => {
+      throw { code: 'host', message: 'Can not approve your own pull request' };
+    });
+    await open();
+    await click(btn('Submit'));
+    await settle();
+    expect(store.ephemeral.toasts.map((t) => t.text)).toEqual([
+      'Can not approve your own pull request',
+    ]);
+    expect(store.ui.modal).not.toBeNull();
   });
 
   it('shows Sending… and stays open until the host answers', async () => {
