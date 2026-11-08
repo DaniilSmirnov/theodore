@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { InterdiffEntry } from '../../gen/contract';
+import { interdiffEntry } from '../../test/factories';
 import { interdiffByHunk, interdiffView } from './interdiff';
 
 const entry = (
@@ -62,5 +63,80 @@ describe('interdiffView', () => {
       previous: [{ text: '1', marks: [[0, 1]] }],
       now: [{ text: '2', marks: [[0, 1]] }],
     });
+  });
+});
+
+describe('interdiff edge cases', () => {
+  const words = (...w: [string, string][]) =>
+    w.map(([kind, text]) => ({ kind: kind as 'ctx' | 'add' | 'del', text }));
+
+  it('marks a multi-line deletion per line and starts marks at 0 on later lines', () => {
+    const view = interdiffView(
+      interdiffEntry({ words: words(['ctx', 'a '], ['del', 'x\ny']) }),
+    );
+    expect(view?.previous).toEqual([
+      { text: 'a x', marks: [[2, 3]] },
+      { text: 'y', marks: [[0, 1]] },
+    ]);
+    // The other side drops the deleted text entirely.
+    expect(view?.now).toEqual([{ text: 'a ', marks: [] }]);
+  });
+
+  it('shows identical unmarked lines on both sides for context-only words', () => {
+    const view = interdiffView(
+      interdiffEntry({ words: words(['ctx', 'one\ntwo']) }),
+    );
+    const plain = [
+      { text: 'one', marks: [] },
+      { text: 'two', marks: [] },
+    ];
+    expect(view).toEqual({ previous: plain, now: plain });
+  });
+
+  it('keeps a trailing newline as a final empty line, and a bare newline does not mark', () => {
+    const view = interdiffView(
+      interdiffEntry({ words: words(['add', 'new\n']) }),
+    );
+    expect(view?.now).toEqual([
+      { text: 'new', marks: [[0, 3]] },
+      { text: '', marks: [] },
+    ]);
+    expect(view?.previous).toEqual([{ text: '', marks: [] }]);
+  });
+
+  it('ignores an empty-text span instead of creating a zero-width mark', () => {
+    const view = interdiffView(
+      interdiffEntry({ words: words(['ctx', 'a'], ['add', ''], ['ctx', 'b']) }),
+    );
+    expect(view?.now).toEqual([{ text: 'ab', marks: [] }]);
+  });
+
+  it('marks adjacent same-side spans separately', () => {
+    const view = interdiffView(
+      interdiffEntry({ words: words(['add', 'ab'], ['add', 'cd']) }),
+    );
+    expect(view?.now).toEqual([
+      {
+        text: 'abcd',
+        marks: [
+          [0, 2],
+          [2, 4],
+        ],
+      },
+    ]);
+  });
+
+  it('interdiffByHunk keeps the last entry when a hunk id repeats', () => {
+    const a = interdiffEntry({ hunk: 'h', path: 'a.ts' });
+    const b = interdiffEntry({ hunk: 'h', path: 'b.ts' });
+    expect(interdiffByHunk([a, b]).get('h')?.path).toBe('b.ts');
+  });
+
+  it('a vanished entry is indexed by its own hunk id and gives no view', () => {
+    const v = interdiffEntry({ hunk: 'old', class: 'vanished' });
+    const map = interdiffByHunk([v]);
+    expect(map.get('old')).toBe(v);
+    expect(interdiffView(map.get('old'))).toBeNull();
+    expect(interdiffView(map.get('current'))).toBeNull();
   });
 });
