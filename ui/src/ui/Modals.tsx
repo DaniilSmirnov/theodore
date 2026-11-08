@@ -163,16 +163,17 @@ const SubmitReviewModal = observer(function SubmitReviewModal() {
           isDisabled={sending}
           onPress={() => {
             setSending(true);
-            // Core waits for the host briefly: on to the next PR once it
-            // has the review (or it's queued), but a refusal keeps you
-            // here, where its toast (api.ts) makes sense.
+            // Close only once the host accepted it: on a failure the modal
+            // stays open (the toast comes from api.ts) so the overall
+            // comment and verdict aren't lost.
             void submitReview(store, pr, local ? 'COMMENT' : event, body.trim())
               .then(() => {
                 ui.closeModal();
                 ui.goBack();
               })
-              .catch(() => ui.closeModal())
-              .finally(() => setSending(false));
+              .catch(() => {
+                setSending(false);
+              });
           }}
         >
           {sending ? 'Sending…' : local ? 'Done' : 'Submit'}
